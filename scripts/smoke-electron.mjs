@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -49,7 +50,7 @@ function evaluate(webSocketUrl, expression) {
       socket.send(JSON.stringify({
         id: 1,
         method: "Runtime.evaluate",
-        params: { expression, returnByValue: true },
+        params: { expression, returnByValue: true, awaitPromise: true },
       }));
     });
     socket.addEventListener("message", (event) => {
@@ -57,7 +58,9 @@ function evaluate(webSocketUrl, expression) {
       if (message.id !== 1) return;
       clearTimeout(timer);
       socket.close();
-      if (message.error) reject(new Error(JSON.stringify(message.error)));
+      if (message.error || message.result.exceptionDetails) {
+        reject(new Error(JSON.stringify(message.error ?? message.result.exceptionDetails)));
+      }
       else resolve(message.result.result.value);
     });
     socket.addEventListener("error", () => {
@@ -81,6 +84,17 @@ async function waitForStartup(webSocketUrl) {
   return state;
 }
 
+async function waitForText(webSocketUrl, expected) {
+  const deadline = Date.now() + 3_000;
+  let bodyText = "";
+  while (Date.now() < deadline) {
+    bodyText = await evaluate(webSocketUrl, "document.body.innerText");
+    if (bodyText.includes(expected)) return bodyText;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return bodyText;
+}
+
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const electronExecutable = path.join(
   projectRoot,
@@ -90,13 +104,42 @@ const electronExecutable = path.join(
   process.platform === "win32" ? "electron.exe" : "electron",
 );
 const profile = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-smoke-"));
+const testApplicationDirectory = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-app-"));
 const port = await reservePort();
+let receivedModelRequest;
+const modelServer = createServer((request, response) => {
+  const chunks = [];
+  request.on("data", (chunk) => chunks.push(chunk));
+  request.on("end", () => {
+    receivedModelRequest = {
+      url: request.url,
+      authorization: request.headers.authorization,
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+    };
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({
+      id: "chatcmpl-smoke",
+      choices: [{ message: { role: "assistant", content: "OK" } }],
+    }));
+  });
+});
+await new Promise((resolve) => modelServer.listen(0, "127.0.0.1", resolve));
+const modelAddress = modelServer.address();
+if (!modelAddress || typeof modelAddress === "string") {
+  throw new Error("Local model server did not expose a port.");
+}
+const modelBaseUrl = `http://127.0.0.1:${modelAddress.port}/v1`;
 const child = spawn(
   electronExecutable,
   [".", `--remote-debugging-port=${port}`, "--headless", "--disable-gpu", `--user-data-dir=${profile}`],
   {
     cwd: projectRoot,
-    env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: "true", VITE_DEV_SERVER_URL: "" },
+    env: {
+      ...process.env,
+      ELECTRON_DISABLE_SECURITY_WARNINGS: "true",
+      PDFMUSE_TEST_APPLICATION_DIRECTORY: testApplicationDirectory,
+      VITE_DEV_SERVER_URL: "",
+    },
     stdio: ["ignore", "pipe", "pipe"],
   },
 );
@@ -110,6 +153,57 @@ try {
   const state = await waitForStartup(page.webSocketDebuggerUrl);
   assert.equal(state.apiType, "object", `preload API is ${state.apiType}`);
   assert.match(state.text, /选择 PDF/, "the startup screen is blank");
+  const modelConnection = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.getModelConnection()`,
+  );
+  assert.equal(typeof modelConnection.baseUrl, "string", "model base URL is unavailable");
+  assert.equal(typeof modelConnection.model, "string", "model name is unavailable");
+  assert.equal(typeof modelConnection.hasApiKey, "boolean", "API key state is unavailable");
+  assert.equal("apiKey" in modelConnection, false, "preload exposed the saved API key");
+  const savedConnection = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.saveModelConnection(${JSON.stringify({
+      baseUrl: modelBaseUrl,
+      model: "smoke-chat-model",
+      apiKey: "smoke-secret",
+    })})`,
+  );
+  assert.equal(savedConnection.ok, true, "model connection could not be saved through IPC");
+  assert.equal(savedConnection.connection.hasApiKey, true, "saved API key state is unavailable");
+  assert.equal("apiKey" in savedConnection.connection, false, "save IPC exposed the API key");
+  const testedConnection = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.testModelConnection(${JSON.stringify({
+      baseUrl: modelBaseUrl,
+      model: "smoke-chat-model",
+    })})`,
+  );
+  assert.equal(testedConnection.ok, true, "local model connection test failed through IPC");
+  assert.deepEqual(receivedModelRequest, {
+    url: "/v1/chat/completions",
+    authorization: "Bearer smoke-secret",
+    body: {
+      model: "smoke-chat-model",
+      messages: [{ role: "user", content: "请回复 OK" }],
+      max_tokens: 1,
+      stream: false,
+    },
+  });
+  const storedConfig = JSON.parse(await readFile(
+    path.join(testApplicationDirectory, "data", "config.json"),
+    "utf8",
+  ));
+  assert.equal(storedConfig.version, 1, "stored config has no explicit version");
+  assert.equal(storedConfig.chat.apiKey, "smoke-secret", "Main did not persist the API key");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `document.querySelector('[aria-label="模型与阅读设置"]')?.click()`,
+  );
+  const settingsText = await waitForText(page.webSocketDebuggerUrl, "保存配置");
+  assert.match(settingsText, /测试连接/, "model connection test command is unavailable");
+  assert.match(settingsText, /API 密钥/, "API key editor is unavailable");
+  assert.match(settingsText, /尚未安装 OCR 工作进程资源/, "startup warnings are unavailable in settings");
   console.log("Electron smoke test passed: startup UI and preload API are available.");
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
@@ -120,5 +214,11 @@ try {
   if (process.platform === "win32" && child.pid) {
     spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
   }
-  await rm(profile, { recursive: true, force: true });
+  await new Promise((resolve, reject) => {
+    modelServer.close((error) => error ? reject(error) : resolve());
+  });
+  await Promise.all([
+    rm(profile, { recursive: true, force: true }),
+    rm(testApplicationDirectory, { recursive: true, force: true }),
+  ]);
 }

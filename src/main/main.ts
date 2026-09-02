@@ -5,12 +5,20 @@ import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 
 import { preflightDataHome } from "./data-home.js";
-import type { OpenedPdfBook, StartupPreflight } from "../shared/contracts.js";
+import { createModelConnectionModule } from "./model-connection.js";
+import type {
+  OpenedPdfBook,
+  SaveModelConnectionInput,
+  StartupPreflight,
+  TestModelConnectionInput,
+} from "../shared/contracts.js";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 let startupPreflight: StartupPreflight;
 
 function applicationDirectory() {
+  const testDirectory = process.env.PDFMUSE_TEST_APPLICATION_DIRECTORY;
+  if (!app.isPackaged && testDirectory) return path.resolve(testDirectory);
   return app.isPackaged ? path.dirname(process.execPath) : app.getAppPath();
 }
 
@@ -47,6 +55,18 @@ app.whenReady().then(async () => {
   startupPreflight = await preflightDataHome(applicationDirectory());
 
   ipcMain.handle("app:get-startup-preflight", () => startupPreflight);
+  if (startupPreflight.ok) {
+    const modelConnection = createModelConnectionModule(startupPreflight.dataHome);
+    ipcMain.handle("model-connection:get", () => modelConnection.get());
+    ipcMain.handle(
+      "model-connection:save",
+      (_event, input: SaveModelConnectionInput) => modelConnection.save(input),
+    );
+    ipcMain.handle(
+      "model-connection:test",
+      (_event, input: TestModelConnectionInput) => modelConnection.test(input),
+    );
+  }
   ipcMain.handle("pdf:choose", async (): Promise<OpenedPdfBook | null> => {
     const result = await dialog.showOpenDialog({
       title: "打开 PDF 书籍",

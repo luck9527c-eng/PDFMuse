@@ -3,12 +3,18 @@ import {
   access,
   mkdir,
   readFile,
+  rename,
   statfs,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
 
+import {
+  EMPTY_APP_CONFIG,
+  parseAppConfig,
+  writeAppConfig,
+} from "./config-store.js";
 import type { StartupPreflight } from "../shared/contracts.js";
 
 const MINIMUM_FREE_BYTES = 256 * 1024 * 1024;
@@ -44,6 +50,7 @@ async function hasOcrResources(applicationDirectory: string) {
 
 export async function preflightDataHome(applicationDirectory: string): Promise<StartupPreflight> {
   const dataHome = path.join(applicationDirectory, "data");
+  const warnings: string[] = [];
 
   try {
     await verifyWritable(applicationDirectory);
@@ -71,18 +78,18 @@ export async function preflightDataHome(applicationDirectory: string): Promise<S
   const configPath = path.join(dataHome, "config.json");
   try {
     const config = await readFile(configPath, "utf8");
-    JSON.parse(config);
+    const parsed = parseAppConfig(config, { allowLegacyVersion: true });
+    if (parsed.migrated) await writeAppConfig(configPath, parsed.config);
   } catch (error) {
     const missing = (error as NodeJS.ErrnoException).code === "ENOENT";
-    if (!missing) {
-      return {
-        ok: false,
-        dataHome,
-        code: "INVALID_CONFIG",
-        message: "现有的 data/config.json 不是有效的 JSON 文件。",
-      };
+    if (missing) {
+      await writeAppConfig(configPath, EMPTY_APP_CONFIG);
+    } else {
+      const backupName = `config.invalid-${Date.now()}-${process.pid}.json`;
+      await rename(configPath, path.join(dataHome, backupName));
+      await writeAppConfig(configPath, EMPTY_APP_CONFIG);
+      warnings.push(`损坏的配置文件已备份为 ${backupName}，请重新配置模型连接。`);
     }
-    await writeFile(configPath, "{}\n", { encoding: "utf8", flag: "wx" });
   }
 
   const disk = await statfs(dataHome);
@@ -103,9 +110,9 @@ export async function preflightDataHome(applicationDirectory: string): Promise<S
     if (error.code !== "EEXIST") throw error;
   });
 
-  const warnings = (await hasOcrResources(applicationDirectory))
-    ? []
-    : ["尚未安装 OCR 工作进程资源。"];
+  if (!(await hasOcrResources(applicationDirectory))) {
+    warnings.push("尚未安装 OCR 工作进程资源。");
+  }
 
   return { ok: true, dataHome, warnings };
 }

@@ -1,4 +1,3 @@
-import * as Dialog from "@radix-ui/react-dialog";
 import * as Tooltip from "@radix-ui/react-tooltip";
 import {
   BookOpen,
@@ -19,7 +18,6 @@ import {
   Plus,
   Search,
   Send,
-  Settings,
   Sparkles,
   X,
 } from "lucide-react";
@@ -27,6 +25,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { OpenedPdfBook, StartupPreflight } from "../shared/contracts";
 import { IconButton } from "./components/IconButton";
+import { SettingsDialog } from "./components/SettingsDialog";
 import { PdfViewer, type OutlineNode, type PdfViewerHandle, type ViewerState } from "./pdf/PdfViewer";
 
 type Passage = { text: string; x: number; y: number };
@@ -58,18 +57,20 @@ function OutlineTree({ nodes, onGoToPage }: { nodes: OutlineNode[]; onGoToPage(p
   );
 }
 
-function EmptyLibrary({ onOpen }: { onOpen(): void }) {
+function EmptyLibrary({ onOpen, warnings }: { onOpen(): void; warnings: string[] }) {
   return (
-    <main className="empty-library">
-      <div className="empty-brand"><span>PM</span><strong>PDFMuse</strong></div>
-      <section className="empty-content">
-        <div className="empty-icon"><BookOpen size={30} /></div>
-        <h1>打开一本 PDF 书籍</h1>
-        <p>阅读位置、对话与后续索引都会保存在程序旁的数据目录。</p>
-        <button className="primary-command" onClick={onOpen}><FilePlus2 size={17} />选择 PDF</button>
-      </section>
-      <div className="empty-footer"><Library size={14} /> 打开第一本书后，它会出现在书库中</div>
-    </main>
+    <Tooltip.Provider>
+      <main className="empty-library">
+        <div className="empty-brand"><span>PM</span><strong>PDFMuse</strong><div className="empty-brand-actions"><SettingsDialog warnings={warnings} /></div></div>
+        <section className="empty-content">
+          <div className="empty-icon"><BookOpen size={30} /></div>
+          <h1>打开一本 PDF 书籍</h1>
+          <p>阅读位置、对话与后续索引都会保存在程序旁的数据目录。</p>
+          <button className="primary-command" onClick={onOpen}><FilePlus2 size={17} />选择 PDF</button>
+        </section>
+        <div className="empty-footer"><Library size={14} /> 打开第一本书后，它会出现在书库中</div>
+      </main>
+    </Tooltip.Provider>
   );
 }
 
@@ -186,7 +187,7 @@ export function App() {
       </main>
     );
   }
-  if (!book) return <EmptyLibrary onOpen={openBook} />;
+  if (!book) return <EmptyLibrary onOpen={openBook} warnings={preflight.warnings} />;
 
   return (
     <Tooltip.Provider>
@@ -200,7 +201,7 @@ export function App() {
           </div>
           <div className="top-actions">
             <span className="data-home-status" title={preflight.dataHome}><span />数据目录</span>
-            <SettingsDialog />
+            <SettingsDialog warnings={preflight.warnings} />
             <IconButton label={rightOpen ? "收起 AI 助手" : "展开 AI 助手"} onClick={() => setRightOpen((value) => !value)}><PanelRightClose /></IconButton>
           </div>
         </header>
@@ -276,21 +277,5 @@ export function App() {
         )}
       </div>
     </Tooltip.Provider>
-  );
-}
-
-function SettingsDialog() {
-  return (
-    <Dialog.Root>
-      <Dialog.Trigger asChild><IconButton label="模型与阅读设置"><Settings /></IconButton></Dialog.Trigger>
-      <Dialog.Portal>
-        <Dialog.Overlay className="dialog-overlay" />
-        <Dialog.Content className="settings-dialog">
-          <div className="dialog-heading"><div><Dialog.Title>模型连接</Dialog.Title><Dialog.Description>对话模型与嵌入模型分开配置，凭据保存在数据目录。</Dialog.Description></div><Dialog.Close asChild><IconButton label="关闭设置"><X /></IconButton></Dialog.Close></div>
-          <section className="settings-section"><h3>对话模型</h3><label>接口地址<input placeholder="https://api.example.com/v1" /></label><label>模型名称<input placeholder="模型名称" /></label><label>API 密钥<input type="password" placeholder="sk-..." /></label><button className="secondary-command" disabled>阶段 2 接入连接测试</button></section>
-          <section className="settings-section"><h3>嵌入模型</h3><label>接口地址<input placeholder="https://api.example.com/v1" /></label><label>模型名称<input placeholder="嵌入模型名称" /></label></section>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
   );
 }

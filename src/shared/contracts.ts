@@ -23,7 +23,58 @@ export type OpenedPdfBook = {
   bytes: Uint8Array;
 };
 
+export type ModelConnectionState = {
+  baseUrl: string;
+  model: string;
+  hasApiKey: boolean;
+};
+
+export type SaveModelConnectionInput = {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+};
+
+export type SaveModelConnectionResult =
+  | {
+      ok: true;
+      connection: ModelConnectionState;
+    }
+  | {
+      ok: false;
+      code: "VALIDATION_ERROR";
+      message: string;
+    };
+
+export type TestModelConnectionInput = {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+};
+
+export type TestModelConnectionResult =
+  | {
+      ok: true;
+      model: string;
+      message: string;
+    }
+  | {
+      ok: false;
+      code:
+        | "VALIDATION_ERROR"
+        | "AUTHENTICATION_ERROR"
+        | "NETWORK_ERROR"
+        | "TIMEOUT"
+        | "INVALID_RESPONSE";
+      message: string;
+    };
+
 export interface PDFMuseApi {
   getStartupPreflight(): Promise<StartupPreflight>;
   choosePdfBook(): Promise<OpenedPdfBook | null>;
+  getModelConnection(): Promise<ModelConnectionState>;
+  saveModelConnection(input: SaveModelConnectionInput): Promise<SaveModelConnectionResult>;
+  testModelConnection(input: TestModelConnectionInput): Promise<TestModelConnectionResult>;
 }
