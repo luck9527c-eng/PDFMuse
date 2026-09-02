@@ -1,4 +1,5 @@
 import * as Tooltip from "@radix-ui/react-tooltip";
+import * as Dialog from "@radix-ui/react-dialog";
 import {
   BookOpen,
   Bot,
@@ -11,6 +12,7 @@ import {
   FilePlus2,
   Focus,
   Library,
+  LockKeyhole,
   MessageSquareText,
   Minus,
   PanelLeftClose,
@@ -22,7 +24,7 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 
 import type {
   LibraryBook,
@@ -45,7 +47,32 @@ const browserPreflight: StartupPreflight = {
   warnings: ["桌面文件访问仅在 Electron 中启用。"],
 };
 
-function OutlineTree({ nodes, onGoToPage }: { nodes: OutlineNode[]; onGoToPage(page: number): void }) {
+function flattenOutline(nodes: OutlineNode[]): OutlineNode[] {
+  return nodes.flatMap((node) => [node, ...flattenOutline(node.children)]);
+}
+
+function findOutlinePath(nodes: OutlineNode[], targetId: string): string[] {
+  for (const node of nodes) {
+    if (node.id === targetId) return [node.id];
+    const childPath = findOutlinePath(node.children, targetId);
+    if (childPath.length > 0) return [node.id, ...childPath];
+  }
+  return [];
+}
+
+function OutlineTree({
+  nodes,
+  activeId,
+  expanded,
+  onToggle,
+  onGoToPage,
+}: {
+  nodes: OutlineNode[];
+  activeId?: string;
+  expanded: Set<string>;
+  onToggle(id: string): void;
+  onGoToPage(page: number): void;
+}) {
   if (nodes.length === 0) {
     return <p className="outline-empty">此 PDF 书籍没有内置目录。后续 OCR 阶段将补全章节。</p>;
   }
@@ -54,14 +81,121 @@ function OutlineTree({ nodes, onGoToPage }: { nodes: OutlineNode[]; onGoToPage(p
     <div className="outline-tree">
       {nodes.map((node) => (
         <div className="outline-group" key={node.id}>
-          <button className="outline-item" disabled={!node.page} onClick={() => node.page && onGoToPage(node.page)}>
-            <span>{node.label}</span>
-            {node.page && <span className="outline-page">{node.page}</span>}
-          </button>
-          {node.children.length > 0 && <OutlineTree nodes={node.children} onGoToPage={onGoToPage} />}
+          <div className={`outline-row ${node.id === activeId ? "current" : ""}`} data-outline-id={node.id}>
+            {node.children.length > 0 ? (
+              <button className="outline-toggle" aria-label={expanded.has(node.id) ? "折叠章节" : "展开章节"} onClick={() => onToggle(node.id)}>
+                {expanded.has(node.id) ? <ChevronDown /> : <ChevronRight />}
+              </button>
+            ) : <span className="outline-spacer" />}
+            <button className="outline-item" disabled={!node.page} onClick={() => node.page && onGoToPage(node.page)}>
+              <span>{node.label}</span>
+              {node.page && <span className="outline-page">{node.page}</span>}
+            </button>
+          </div>
+          {node.children.length > 0 && expanded.has(node.id) && (
+            <OutlineTree nodes={node.children} activeId={activeId} expanded={expanded} onToggle={onToggle} onGoToPage={onGoToPage} />
+          )}
         </div>
       ))}
     </div>
+  );
+}
+
+function OutlinePanel({ nodes, page, onGoToPage }: { nodes: OutlineNode[]; page: number; onGoToPage(page: number): void }) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const activeId = useMemo(() => {
+    let active: OutlineNode | undefined;
+    for (const node of flattenOutline(nodes)) {
+      if (node.page !== undefined && node.page <= page && (!active?.page || node.page >= active.page)) active = node;
+    }
+    return active?.id;
+  }, [nodes, page]);
+
+  useEffect(() => {
+    setExpanded(new Set(flattenOutline(nodes).filter((node) => node.children.length > 0).map((node) => node.id)));
+  }, [nodes]);
+
+  useEffect(() => {
+    if (!activeId) return;
+    setExpanded((current) => new Set([...current, ...findOutlinePath(nodes, activeId)]));
+    requestAnimationFrame(() => {
+      rootRef.current?.querySelector(`[data-outline-id="${activeId}"]`)?.scrollIntoView({ block: "nearest" });
+    });
+  }, [activeId, nodes]);
+
+  return (
+    <div className="outline-panel" ref={rootRef}>
+      <OutlineTree
+        nodes={nodes}
+        activeId={activeId}
+        expanded={expanded}
+        onToggle={(id) => setExpanded((current) => {
+          const next = new Set(current);
+          if (next.has(id)) next.delete(id); else next.add(id);
+          return next;
+        })}
+        onGoToPage={onGoToPage}
+      />
+    </div>
+  );
+}
+
+function PdfThumbnail({ page, current, load, onOpen }: { page: number; current: boolean; load(): Promise<string | undefined>; onOpen(): void }) {
+  const itemRef = useRef<HTMLButtonElement>(null);
+  const [source, setSource] = useState<string>();
+  useEffect(() => {
+    const item = itemRef.current;
+    if (!item || source) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      void load().then(setSource);
+    }, { rootMargin: "180px" });
+    observer.observe(item);
+    return () => observer.disconnect();
+  }, [load, source]);
+  useEffect(() => {
+    if (current) itemRef.current?.scrollIntoView({ block: "nearest" });
+  }, [current]);
+  return (
+    <button ref={itemRef} className={`pdf-thumbnail ${current ? "current" : ""}`} aria-current={current ? "page" : undefined} onClick={onOpen}>
+      <span className="thumbnail-page">{source ? <img src={source} alt={`第 ${page} 页缩略图`} /> : <span>正在载入</span>}</span>
+      <strong>第 {page} 页</strong>
+    </button>
+  );
+}
+
+type PasswordRequest = Extract<OpenPdfBookResult, { ok: false; code: "PASSWORD_REQUIRED" }>;
+
+function PasswordDialog({ request, onCancel, onUnlock }: { request?: PasswordRequest; onCancel(): void; onUnlock(password: string, remember: boolean): Promise<void> }) {
+  const [password, setPassword] = useState("");
+  const [remember, setRemember] = useState(false);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => setPassword(""), [request?.challengeId]);
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!password || busy) return;
+    setBusy(true);
+    try { await onUnlock(password, remember); } finally { setBusy(false); }
+  };
+  return (
+    <Dialog.Root open={Boolean(request)} onOpenChange={(open) => { if (!open && !busy) onCancel(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="password-overlay" />
+        <Dialog.Content className="password-dialog" aria-describedby="pdf-password-description">
+          <div className="password-mark"><LockKeyhole /></div>
+          <Dialog.Title>打开加密 PDF</Dialog.Title>
+          <Dialog.Description id="pdf-password-description">{request?.message}</Dialog.Description>
+          <form onSubmit={(event) => void submit(event)}>
+            <label>PDF 密码<input autoFocus type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+            <label className="remember-password"><input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />记住这本书的密码</label>
+            <p>记住后，密码会以明文保存在 PDFMuse 便携数据目录中。复制程序目录也会复制此密码。</p>
+            <div className="password-actions"><button type="button" className="secondary-command" disabled={busy} onClick={onCancel}>取消</button><button className="primary-command" disabled={!password || busy}>{busy ? "正在验证..." : "解锁"}</button></div>
+          </form>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
 
@@ -231,10 +365,16 @@ export function App() {
     scrollTop: 0,
     zoomMode: "page-width",
     outline: [],
+    findCurrent: 0,
+    findTotal: 0,
   });
   const [viewerError, setViewerError] = useState("");
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
+  const [leftWidth, setLeftWidth] = useState(244);
+  const [rightWidth, setRightWidth] = useState(360);
+  const [sidebarView, setSidebarView] = useState<"outline" | "thumbnails">("outline");
+  const [passwordRequest, setPasswordRequest] = useState<PasswordRequest>();
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState("");
   const [passage, setPassage] = useState<Passage>();
@@ -328,6 +468,8 @@ export function App() {
       scrollTop: openedBook.readingState.scrollTop,
       zoomMode: openedBook.readingState.zoomMode,
       outline: [],
+      findCurrent: 0,
+      findTotal: 0,
     });
     setLeftOpen(openedBook.readingState.leftSidebarOpen);
     setRightOpen(openedBook.readingState.rightSidebarOpen);
@@ -339,13 +481,54 @@ export function App() {
   }, []);
 
   const handleOpenResult = useCallback((result: OpenPdfBookResult, attemptedBookId?: string) => {
-    if (result.ok) activateBook(result.book);
+    if (result.ok) {
+      setPasswordRequest(undefined);
+      activateBook(result.book);
+    }
     else {
+      if (result.code === "PASSWORD_REQUIRED") {
+        setPasswordRequest(result);
+        return;
+      }
       setLibraryError(result.message);
       const canRelocate = result.code === "FILE_UNAVAILABLE" || result.code === "CONTENT_CHANGED";
       setUnavailableBookId(canRelocate ? result.bookId ?? attemptedBookId : undefined);
     }
   }, [activateBook]);
+
+  const unlockPdf = useCallback(async (password: string, remember: boolean) => {
+    if (!window.pdfMuse || !passwordRequest) return;
+    try {
+      handleOpenResult(await window.pdfMuse.unlockPdfBook(passwordRequest.challengeId, password, remember));
+    } catch {
+      setLibraryError("无法验证 PDF 密码，请重试。");
+      setPasswordRequest(undefined);
+    }
+  }, [handleOpenResult, passwordRequest]);
+
+  const beginSidebarResize = useCallback((side: "left" | "right", event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = side === "left" ? leftWidth : rightWidth;
+    const otherWidth = side === "left" ? (rightOpen ? rightWidth : 0) : (leftOpen ? leftWidth : 0);
+    const move = (pointerEvent: PointerEvent) => {
+      const delta = pointerEvent.clientX - startX;
+      const desired = side === "left" ? startWidth + delta : startWidth - delta;
+      const minimum = side === "left" ? 180 : 280;
+      const configuredMaximum = side === "left" ? 360 : 480;
+      const maximum = Math.max(minimum, Math.min(configuredMaximum, window.innerWidth - otherWidth - 420));
+      const next = Math.min(maximum, Math.max(minimum, desired));
+      if (side === "left") setLeftWidth(next); else setRightWidth(next);
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      document.body.classList.remove("resizing-sidebar");
+    };
+    document.body.classList.add("resizing-sidebar");
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop, { once: true });
+  }, [leftOpen, leftWidth, rightOpen, rightWidth]);
 
   useEffect(() => {
     if (!preflight?.ok || startupRestoreStartedRef.current) return;
@@ -501,12 +684,15 @@ export function App() {
   }
   if (!startupReady) return <div className="boot-state">正在恢复最近阅读...</div>;
   if (!book) {
-    return <LibraryView books={libraryBooks} error={libraryError} loading={libraryLoading} unavailableBookId={unavailableBookId} warnings={preflight.warnings} onChoose={openBook} onDropFile={openDroppedBook} onOpenBook={openLibraryBook} onRelocate={relocateLibraryBook} />;
+    return <><LibraryView books={libraryBooks} error={libraryError} loading={libraryLoading} unavailableBookId={unavailableBookId} warnings={preflight.warnings} onChoose={openBook} onDropFile={openDroppedBook} onOpenBook={openLibraryBook} onRelocate={relocateLibraryBook} /><PasswordDialog request={passwordRequest} onCancel={() => setPasswordRequest(undefined)} onUnlock={unlockPdf} /></>;
   }
 
   return (
     <Tooltip.Provider>
-      <div className={`workspace ${leftOpen ? "left-open" : ""} ${rightOpen ? "right-open" : ""}`}>
+      <div
+        className={`workspace ${leftOpen ? "left-open" : ""} ${rightOpen ? "right-open" : ""}`}
+        style={{ "--left-width": `${leftWidth}px`, "--right-width": `${rightWidth}px` } as CSSProperties}
+      >
         <header className="topbar">
           <div className="brand"><span className="brand-mark">PM</span><strong>PDFMuse</strong></div>
           <div className="document-bar">
@@ -524,12 +710,23 @@ export function App() {
 
         {leftOpen && (
           <aside className="left-sidebar">
-            <div className="book-summary">
-              <div className="mini-cover">PDF<br />MUSE</div>
-              <div><strong>{book.name}</strong><span>第 {viewerState.page} / {viewerState.pages || "-"} 页</span></div>
+            <div className="left-sidebar-content">
+              <div className="book-summary">
+                <div className="mini-cover">PDF<br />MUSE</div>
+                <div><strong>{book.name}</strong><span>第 {viewerState.page} / {viewerState.pages || "-"} 页</span></div>
+              </div>
+              <div className="sidebar-tabs"><button className={sidebarView === "outline" ? "active" : ""} onClick={() => setSidebarView("outline")}>目录</button><button className={sidebarView === "thumbnails" ? "active" : ""} onClick={() => setSidebarView("thumbnails")}>缩略图</button></div>
+              {sidebarView === "outline" ? (
+                <OutlinePanel nodes={viewerState.outline} page={viewerState.page} onGoToPage={(page) => viewerRef.current?.goToPage(page)} />
+              ) : (
+                <div className="thumbnail-list">
+                  {Array.from({ length: viewerState.pages }, (_, index) => index + 1).map((page) => (
+                    <PdfThumbnail key={page} page={page} current={page === viewerState.page} load={() => viewerRef.current?.getThumbnail(page) ?? Promise.resolve(undefined)} onOpen={() => viewerRef.current?.goToPage(page)} />
+                  ))}
+                </div>
+              )}
             </div>
-            <div className="sidebar-tabs"><button className="active">目录</button><button disabled>缩略图</button></div>
-            <OutlineTree nodes={viewerState.outline} onGoToPage={(page) => viewerRef.current?.goToPage(page)} />
+            <div className="sidebar-resize-handle left" role="separator" aria-label="调整左侧栏宽度" aria-orientation="vertical" onPointerDown={(event) => beginSidebarResize("left", event)} />
           </aside>
         )}
 
@@ -557,6 +754,7 @@ export function App() {
             <form className="find-bar" onSubmit={(event) => { event.preventDefault(); viewerRef.current?.find(findQuery); }}>
               <Search size={15} />
               <input autoFocus value={findQuery} onChange={(event) => setFindQuery(event.target.value)} placeholder="查找文字" />
+              <span className="find-count">{viewerState.findTotal > 0 ? `${viewerState.findCurrent} / ${viewerState.findTotal}` : "0 / 0"}</span>
               <IconButton type="button" label="上一个结果" onClick={() => viewerRef.current?.find(findQuery, true)}><ChevronLeft /></IconButton>
               <IconButton type="submit" label="下一个结果"><ChevronRight /></IconButton>
               <IconButton type="button" label="关闭查找" onClick={() => { viewerRef.current?.find(""); setFindQuery(""); setFindOpen(false); }}><X /></IconButton>
@@ -567,6 +765,7 @@ export function App() {
 
         {rightOpen && (
           <aside className="assistant-panel">
+            <div className="sidebar-resize-handle right" role="separator" aria-label="调整右侧栏宽度" aria-orientation="vertical" onPointerDown={(event) => beginSidebarResize("right", event)} />
             <header className="assistant-header"><div><span className="assistant-title"><Sparkles size={16} />AI 助手</span><span className="assistant-context">本书对话 · 当前 PDF 书籍</span></div></header>
             <div className="conversation">
               {messages.length === 0 ? (
@@ -597,6 +796,7 @@ export function App() {
             <button onClick={() => { void navigator.clipboard.writeText(passage.text); setPassage(undefined); }}><Copy size={14} />复制</button>
           </div>
         )}
+        <PasswordDialog request={passwordRequest} onCancel={() => setPasswordRequest(undefined)} onUnlock={unlockPdf} />
       </div>
     </Tooltip.Provider>
   );

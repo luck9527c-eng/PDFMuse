@@ -77,6 +77,12 @@ app.whenReady().then(async () => {
     ipcMain.handle("library:open-path", (_event, filePath: unknown) => library.openPath(filePath));
     ipcMain.handle("library:open-recent", () => library.openRecent());
     ipcMain.handle("library:open-known", (_event, bookId: unknown) => library.openKnown(bookId));
+    ipcMain.handle(
+      "library:unlock",
+      (_event, challengeId: unknown, password: unknown, rememberPassword: unknown) => (
+        library.unlock(challengeId, password, rememberPassword)
+      ),
+    );
     ipcMain.handle("library:relocate", async (_event, bookId: unknown) => {
       const result = await dialog.showOpenDialog({
         title: "重新定位 PDF 原文件",

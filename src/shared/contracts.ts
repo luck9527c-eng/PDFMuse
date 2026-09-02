@@ -25,6 +25,7 @@ export type OpenedPdfBook = {
   currentPage: number;
   readingState: ReadingState;
   bytes: Uint8Array;
+  password?: string;
 };
 
 export type ReadingZoomMode = "page-width" | "page-fit" | "custom";
@@ -57,6 +58,13 @@ export type OpenPdfBookResult =
       ok: false;
       code: "INVALID_FILE_TYPE" | "FILE_UNAVAILABLE" | "INVALID_PDF" | "CONTENT_CHANGED";
       message: string;
+      bookId?: string;
+    }
+  | {
+      ok: false;
+      code: "PASSWORD_REQUIRED";
+      message: string;
+      challengeId: string;
       bookId?: string;
     };
 
@@ -170,6 +178,7 @@ export interface PDFMuseApi {
   openRecentLibraryBook(): Promise<OpenPdfBookResult | null>;
   openLibraryBook(bookId: string): Promise<OpenPdfBookResult>;
   relocateLibraryBook(bookId: string): Promise<OpenPdfBookResult | null>;
+  unlockPdfBook(challengeId: string, password: string, rememberPassword: boolean): Promise<OpenPdfBookResult>;
   updateLibraryBookState(bookId: string, state: ReadingState): Promise<void>;
   getModelConnection(): Promise<ModelConnectionState>;
   saveModelConnection(input: SaveModelConnectionInput): Promise<SaveModelConnectionResult>;

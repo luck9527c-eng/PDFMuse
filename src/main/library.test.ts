@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createLibraryModule } from "./library.js";
@@ -9,6 +10,7 @@ import { createLibraryModule } from "./library.js";
 const workspaces: string[] = [];
 const fixturePath = path.resolve("data", "qa-sample.pdf");
 const multiPageFixturePath = path.resolve("src", "main", "fixtures", "three-page.pdf");
+const encryptedFixturePath = path.resolve("src", "main", "fixtures", "encrypted.pdf");
 
 async function createWorkspace() {
   const workspace = await mkdtemp(path.join(tmpdir(), "pdfmuse-library-"));
@@ -205,6 +207,58 @@ describe("Library Module", () => {
           rightSidebarOpen: true,
         },
       },
+    });
+    library.close();
+  });
+
+  it("错误密码不写入书库，正确密码可以选择不保存", async () => {
+    const { workspace, dataHome } = await createWorkspace();
+    const sourcePath = path.join(workspace, "加密书籍.pdf");
+    await copyFile(encryptedFixturePath, sourcePath);
+    const library = createLibraryModule(dataHome);
+
+    const challenged = await library.openPath(sourcePath);
+    expect(challenged).toMatchObject({ ok: false, code: "PASSWORD_REQUIRED" });
+    if (challenged.ok || challenged.code !== "PASSWORD_REQUIRED") throw new Error("没有创建密码请求");
+
+    await expect(library.unlock(challenged.challengeId, "wrong", true)).resolves.toMatchObject({
+      ok: false,
+      code: "PASSWORD_REQUIRED",
+      challengeId: challenged.challengeId,
+      message: "密码错误，请重新输入。",
+    });
+    expect(library.list()).toEqual([]);
+
+    const opened = await library.unlock(challenged.challengeId, "muse-test", false);
+    expect(opened).toMatchObject({
+      ok: true,
+      book: { name: "PDFMuse Navigation Fixture", pageCount: 3, password: "muse-test" },
+    });
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    expect(database.prepare("SELECT saved_password FROM library_books").get()).toEqual({ saved_password: null });
+    database.close();
+    library.close();
+  });
+
+  it("记住正确密码后可在重启时自动解锁", async () => {
+    const { workspace, dataHome } = await createWorkspace();
+    const sourcePath = path.join(workspace, "记住密码.pdf");
+    await copyFile(encryptedFixturePath, sourcePath);
+    let library = createLibraryModule(dataHome);
+    const challenged = await library.openPath(sourcePath);
+    if (challenged.ok || challenged.code !== "PASSWORD_REQUIRED") throw new Error("没有创建密码请求");
+    const opened = await library.unlock(challenged.challengeId, "muse-test", true);
+    if (!opened.ok) throw new Error(opened.message);
+    library.close();
+
+    library = createLibraryModule(dataHome);
+    await expect(library.openRecent()).resolves.toMatchObject({
+      ok: true,
+      book: { id: opened.book.id, password: "muse-test", pageCount: 3 },
+    });
+    await expect(library.openPath(sourcePath)).resolves.toMatchObject({
+      ok: true,
+      book: { id: opened.book.id, password: "muse-test" },
     });
     library.close();
   });

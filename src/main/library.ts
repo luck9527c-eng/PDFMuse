@@ -1,9 +1,13 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+import {
+  getDocument,
+  PasswordException,
+  PasswordResponses,
+} from "pdfjs-dist/legacy/build/pdf.mjs";
 
 import type {
   LibraryBook,
@@ -25,12 +29,14 @@ type BookRow = {
   zoom_scale: number;
   left_sidebar_open: number;
   right_sidebar_open: number;
+  saved_password: string | null;
   updated_at: string;
 };
 
 const readingColumns = `
   id, title, file_name, current_path, page_count, current_page,
-  scroll_top, zoom_mode, zoom_scale, left_sidebar_open, right_sidebar_open, updated_at
+  scroll_top, zoom_mode, zoom_scale, left_sidebar_open, right_sidebar_open,
+  updated_at, saved_password
 `;
 
 function toLibraryBook(row: BookRow): LibraryBook {
@@ -50,11 +56,19 @@ function fingerprint(bytes: Uint8Array) {
 }
 
 function failure(
-  code: Extract<OpenPdfBookResult, { ok: false }>["code"],
+  code: Exclude<Extract<OpenPdfBookResult, { ok: false }>["code"], "PASSWORD_REQUIRED">,
   message: string,
   bookId?: string,
 ): OpenPdfBookResult {
   return { ok: false, code, message, ...(bookId ? { bookId } : {}) };
+}
+
+function passwordFailure(
+  message: string,
+  challengeId: string,
+  bookId?: string,
+): OpenPdfBookResult {
+  return { ok: false, code: "PASSWORD_REQUIRED", message, challengeId, ...(bookId ? { bookId } : {}) };
 }
 
 function toReadingState(row: BookRow): ReadingState {
@@ -83,8 +97,8 @@ function isReadingState(value: unknown): value is ReadingState {
     && typeof state.rightSidebarOpen === "boolean";
 }
 
-async function inspectPdf(bytes: Uint8Array, fallbackTitle: string) {
-  const loadingTask = getDocument({ data: bytes.slice() });
+async function inspectPdf(bytes: Uint8Array, fallbackTitle: string, password?: string) {
+  const loadingTask = getDocument({ data: bytes.slice(), ...(password ? { password } : {}) });
   try {
     const document = await loadingTask.promise;
     const metadata = await document.getMetadata().catch(() => undefined);
@@ -120,6 +134,7 @@ export function createLibraryModule(dataHome: string) {
       zoom_scale REAL NOT NULL DEFAULT 100 CHECK (zoom_scale > 0),
       left_sidebar_open INTEGER NOT NULL DEFAULT 1 CHECK (left_sidebar_open IN (0, 1)),
       right_sidebar_open INTEGER NOT NULL DEFAULT 1 CHECK (right_sidebar_open IN (0, 1)),
+      saved_password TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -135,12 +150,13 @@ export function createLibraryModule(dataHome: string) {
     ["zoom_scale", "ALTER TABLE library_books ADD COLUMN zoom_scale REAL NOT NULL DEFAULT 100"],
     ["left_sidebar_open", "ALTER TABLE library_books ADD COLUMN left_sidebar_open INTEGER NOT NULL DEFAULT 1"],
     ["right_sidebar_open", "ALTER TABLE library_books ADD COLUMN right_sidebar_open INTEGER NOT NULL DEFAULT 1"],
+    ["saved_password", "ALTER TABLE library_books ADD COLUMN saved_password TEXT"],
   ] as const;
   for (const [column, statement] of migrations) {
     if (!existingColumns.has(column)) database.exec(statement);
   }
   const schemaVersion = database.prepare("PRAGMA user_version").get() as { user_version: number };
-  if (schemaVersion.user_version < 2) database.exec("PRAGMA user_version = 2;");
+  if (schemaVersion.user_version < 3) database.exec("PRAGMA user_version = 3;");
 
   const listStatement = database.prepare(`
     SELECT id, title, file_name, current_path, page_count, current_page, updated_at
@@ -183,12 +199,40 @@ export function createLibraryModule(dataHome: string) {
         updated_at = ?
     WHERE id = ?
   `);
+  const savePasswordStatement = database.prepare(`
+    UPDATE library_books SET saved_password = ? WHERE id = ?
+  `);
+  type PendingOpen = {
+    filePath: string;
+    bytes: Uint8Array;
+    expectedFingerprint?: string;
+    relocate: boolean;
+    expiresAt: number;
+  };
+  const passwordChallenges = new Map<string, PendingOpen>();
+
+  function createPasswordChallenge(open: Omit<PendingOpen, "expiresAt">) {
+    const now = Date.now();
+    for (const [id, pending] of passwordChallenges) {
+      if (pending.expiresAt <= now) passwordChallenges.delete(id);
+    }
+    while (passwordChallenges.size >= 8) {
+      const oldestId = passwordChallenges.keys().next().value;
+      if (typeof oldestId !== "string") break;
+      passwordChallenges.delete(oldestId);
+    }
+    const challengeId = randomUUID();
+    passwordChallenges.set(challengeId, { ...open, expiresAt: now + 5 * 60_000 });
+    return challengeId;
+  }
 
   async function openBytes(
     filePath: string,
     bytes: Uint8Array,
     expectedFingerprint?: string,
     relocate = false,
+    password?: string,
+    challengeId?: string,
   ): Promise<OpenPdfBookResult> {
     const contentFingerprint = fingerprint(bytes);
     if (expectedFingerprint && contentFingerprint !== expectedFingerprint) {
@@ -200,13 +244,33 @@ export function createLibraryModule(dataHome: string) {
     }
 
     const fileName = path.basename(filePath);
+    const knownBook = findStatement.get(contentFingerprint) as BookRow | undefined;
+    const effectivePassword = password ?? knownBook?.saved_password ?? undefined;
     let pdf: Awaited<ReturnType<typeof inspectPdf>>;
     try {
-      pdf = await inspectPdf(bytes, path.basename(fileName, path.extname(fileName)));
-    } catch {
+      pdf = await inspectPdf(bytes, path.basename(fileName, path.extname(fileName)), effectivePassword);
+    } catch (error) {
+      if (error instanceof PasswordException || (
+        typeof error === "object" && error !== null && "name" in error && error.name === "PasswordException"
+      )) {
+        const code = "code" in (error as object) ? (error as { code?: number }).code : undefined;
+        const pendingChallengeId = challengeId ?? createPasswordChallenge({
+          filePath,
+          bytes,
+          expectedFingerprint,
+          relocate,
+        });
+        return passwordFailure(
+          code === PasswordResponses.INCORRECT_PASSWORD
+            ? "密码错误，请重新输入。"
+            : "此 PDF 书籍受密码保护，请输入密码后继续。",
+          pendingChallengeId,
+          expectedFingerprint,
+        );
+      }
       return failure(
         "INVALID_PDF",
-        "无法解析此 PDF 文件。文件可能已损坏、受密码保护或不是有效的 PDF。",
+        "无法解析此 PDF 文件。文件可能已损坏或不是有效的 PDF。",
       );
     }
 
@@ -236,6 +300,7 @@ export function createLibraryModule(dataHome: string) {
       currentPage: row.current_page,
       readingState: toReadingState(row),
       bytes,
+      ...(effectivePassword ? { password: effectivePassword } : {}),
     };
     return { ok: true, book: opened };
   }
@@ -271,7 +336,7 @@ export function createLibraryModule(dataHome: string) {
       } catch {
         return failure("FILE_UNAVAILABLE", "PDF 原文件暂时不可用，书库记录已保留。你可以重新定位原文件。", bookId);
       }
-      return openBytes(row.current_path, bytes, row.id);
+      return openBytes(row.current_path, bytes, row.id, false, row.saved_password ?? undefined);
     },
 
     async openRecent(): Promise<OpenPdfBookResult | null> {
@@ -286,7 +351,8 @@ export function createLibraryModule(dataHome: string) {
       if (typeof inputPath !== "string" || path.extname(inputPath).toLowerCase() !== ".pdf") {
         return failure("INVALID_FILE_TYPE", "请选择对应的 PDF 原文件。", bookId);
       }
-      if (!findStatement.get(bookId)) {
+      const knownBook = findStatement.get(bookId) as BookRow | undefined;
+      if (!knownBook) {
         return failure("FILE_UNAVAILABLE", "书库中没有找到此 PDF 书籍。", bookId);
       }
       const filePath = path.resolve(inputPath);
@@ -296,7 +362,38 @@ export function createLibraryModule(dataHome: string) {
       } catch {
         return failure("FILE_UNAVAILABLE", "无法读取所选 PDF 文件，请检查它是否可访问。", bookId);
       }
-      return openBytes(filePath, bytes, bookId, true);
+      return openBytes(filePath, bytes, bookId, true, knownBook.saved_password ?? undefined);
+    },
+
+    async unlock(
+      challengeId: unknown,
+      password: unknown,
+      rememberPassword: unknown,
+    ): Promise<OpenPdfBookResult> {
+      if (typeof challengeId !== "string" || typeof password !== "string" || password.length === 0
+        || password.length > 1024 || typeof rememberPassword !== "boolean") {
+        return failure("INVALID_PDF", "密码请求无效，请重新打开此 PDF 书籍。");
+      }
+      const pending = passwordChallenges.get(challengeId);
+      if (!pending || pending.expiresAt <= Date.now()) {
+        passwordChallenges.delete(challengeId);
+        return failure("INVALID_PDF", "密码请求已过期，请重新打开此 PDF 书籍。");
+      }
+      const result = await openBytes(
+        pending.filePath,
+        pending.bytes,
+        pending.expectedFingerprint,
+        pending.relocate,
+        password,
+        challengeId,
+      );
+      if (!result.ok) {
+        if (result.code !== "PASSWORD_REQUIRED") passwordChallenges.delete(challengeId);
+        return result;
+      }
+      passwordChallenges.delete(challengeId);
+      if (rememberPassword) savePasswordStatement.run(password, result.book.id);
+      return result;
     },
 
     updateReadingState(bookId: unknown, state: unknown) {
@@ -317,6 +414,7 @@ export function createLibraryModule(dataHome: string) {
     },
 
     close() {
+      passwordChallenges.clear();
       database.close();
     },
   };

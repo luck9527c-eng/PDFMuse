@@ -15,6 +15,9 @@ const api: PDFMuseApi = {
   openRecentLibraryBook: () => ipcRenderer.invoke("library:open-recent"),
   openLibraryBook: (bookId) => ipcRenderer.invoke("library:open-known", bookId),
   relocateLibraryBook: (bookId) => ipcRenderer.invoke("library:relocate", bookId),
+  unlockPdfBook: (challengeId, password, rememberPassword) => (
+    ipcRenderer.invoke("library:unlock", challengeId, password, rememberPassword)
+  ),
   updateLibraryBookState: (bookId, state) => ipcRenderer.invoke("library:update-state", bookId, state),
   getModelConnection: () => ipcRenderer.invoke("model-connection:get"),
   saveModelConnection: (input) => ipcRenderer.invoke("model-connection:save", input),

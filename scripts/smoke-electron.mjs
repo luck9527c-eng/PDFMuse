@@ -195,7 +195,9 @@ const testApplicationDirectory = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-a
 const damagedPdfPath = path.join(testApplicationDirectory, "damaged.pdf");
 await writeFile(damagedPdfPath, "%PDF-1.7\ninvalid");
 const fixturePath = path.join(testApplicationDirectory, "smoke-book.pdf");
-await copyFile(path.join(projectRoot, "src", "main", "fixtures", "three-page.pdf"), fixturePath);
+await copyFile(path.join(projectRoot, "src", "main", "fixtures", "navigation.pdf"), fixturePath);
+const encryptedFixturePath = path.join(testApplicationDirectory, "encrypted-book.pdf");
+await copyFile(path.join(projectRoot, "src", "main", "fixtures", "encrypted.pdf"), encryptedFixturePath);
 let receivedModelRequest;
 let receivedEmbeddingRequest;
 const modelServer = createServer((request, response) => {
@@ -279,11 +281,91 @@ try {
   const initialLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
   assert.deepEqual(initialLibrary, [], "the isolated Library is not empty");
   await dropSmokeFile(page.webSocketDebuggerUrl, fixturePath);
-  const readerText = await waitForText(page.webSocketDebuggerUrl, "PDFMuse Three Page Fixture");
+  const readerText = await waitForText(page.webSocketDebuggerUrl, "PDFMuse Navigation Fixture");
   assert.match(readerText, /AI 助手/, "dropping a valid PDF did not open the reading workspace");
+  const outlineText = await waitForText(page.webSocketDebuggerUrl, "Section One");
+  assert.match(outlineText, /Chapter One/, "the embedded Book Outline is unavailable");
+  const readerControls = await evaluate(
+    page.webSocketDebuggerUrl,
+    `new Promise((resolve, reject) => {
+      const deadline = Date.now() + 2500;
+      const inspect = () => {
+        if (document.querySelector('.viewer-loading')) {
+          if (Date.now() >= deadline) return reject(new Error('PDF controls did not become ready'));
+          setTimeout(inspect, 50);
+          return;
+        }
+        const container = document.querySelector('.pdf-container');
+        const initialScale = Number(document.querySelector('.zoom-value')?.textContent?.replace('%', ''));
+        container.dispatchEvent(new WheelEvent('wheel', {
+          bubbles: true,
+          cancelable: true,
+          ctrlKey: true,
+          deltaY: -120,
+          clientX: container.getBoundingClientRect().left + 100,
+          clientY: container.getBoundingClientRect().top + 100,
+        }));
+        const resize = document.querySelector('[aria-label="调整左侧栏宽度"]');
+        const initialLeftWidth = document.querySelector('.left-sidebar').getBoundingClientRect().width;
+        const resizeX = resize.getBoundingClientRect().left;
+        resize.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: resizeX }));
+        window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: resizeX - 40 }));
+        window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: resizeX - 40 }));
+        const rightResize = document.querySelector('[aria-label="调整右侧栏宽度"]');
+        const initialRightWidth = document.querySelector('.assistant-panel').getBoundingClientRect().width;
+        const rightResizeX = rightResize.getBoundingClientRect().left;
+        rightResize.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: rightResizeX }));
+        window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: rightResizeX + 40 }));
+        window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: rightResizeX + 40 }));
+        setTimeout(() => {
+          const reader = document.querySelector('.reader').getBoundingClientRect();
+          const toolbar = document.querySelector('.reader-toolbar').getBoundingClientRect();
+          resolve({
+            initialScale,
+            initialLeftWidth,
+            initialRightWidth,
+            scale: Number(document.querySelector('.zoom-value')?.textContent?.replace('%', '')),
+            leftWidth: document.querySelector('.left-sidebar').getBoundingClientRect().width,
+            rightWidth: document.querySelector('.assistant-panel').getBoundingClientRect().width,
+            toolbarContained: toolbar.left >= reader.left && toolbar.right <= reader.right,
+          });
+        }, 180);
+      };
+      inspect();
+    })`,
+  );
+  assert.ok(readerControls.scale > readerControls.initialScale, "Ctrl+mouse wheel did not zoom the PDF");
+  assert.ok(readerControls.leftWidth < readerControls.initialLeftWidth, "the left sidebar resize handle did not change its width");
+  assert.ok(readerControls.rightWidth < readerControls.initialRightWidth, "the right sidebar resize handle did not change its width");
+  assert.equal(readerControls.toolbarContained, true, "resizing a sidebar pushed the PDF toolbar outside the reader");
+  await evaluate(page.webSocketDebuggerUrl, `document.querySelector('.sidebar-tabs button:nth-child(2)')?.click()`);
+  const thumbnails = await evaluate(
+    page.webSocketDebuggerUrl,
+    `new Promise((resolve) => setTimeout(() => resolve({
+      count: document.querySelectorAll('.pdf-thumbnail').length,
+      rendered: document.querySelectorAll('.pdf-thumbnail img').length,
+    }), 500))`,
+  );
+  assert.deepEqual(thumbnails, { count: 3, rendered: 3 }, "page thumbnails are incomplete");
+  await evaluate(page.webSocketDebuggerUrl, `document.querySelector('.sidebar-tabs button:first-child')?.click()`);
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `new Promise((resolve) => {
+      document.querySelector('[aria-label="在 PDF 中查找"]')?.click();
+      setTimeout(() => {
+        const input = document.querySelector('.find-bar input');
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'PDFMuse search target');
+        input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+        input.form.requestSubmit();
+        resolve(true);
+      }, 50);
+    })`,
+  );
+  const findText = await waitForText(page.webSocketDebuggerUrl, "1 / 9");
+  assert.match(findText, /1 \/ 9/, "PDF search result position and total are unavailable");
   const populatedLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
   assert.match(populatedLibrary[0].id, /^[a-f0-9]{64}$/, "the PDF content fingerprint is invalid");
-  assert.equal(populatedLibrary[0].title, "PDFMuse Three Page Fixture", "the PDF metadata title is invalid");
+  assert.equal(populatedLibrary[0].title, "PDFMuse Navigation Fixture", "the PDF metadata title is invalid");
   assert.equal(populatedLibrary[0].pageCount, 3, "the PDF page count is invalid");
   await evaluate(
     page.webSocketDebuggerUrl,
@@ -442,7 +524,7 @@ try {
     page.webSocketDebuggerUrl,
     `document.querySelector('[aria-label^="打开《"]')?.click()`,
   );
-  await waitForText(page.webSocketDebuggerUrl, "PDFMuse Three Page Fixture");
+  await waitForText(page.webSocketDebuggerUrl, "PDFMuse Navigation Fixture");
   const expectedReadingState = await evaluate(
     page.webSocketDebuggerUrl,
     `new Promise((resolve, reject) => {
@@ -516,7 +598,7 @@ try {
   child = launchElectron(port);
   page = await waitForPage(port);
   state = await waitForStartup(page.webSocketDebuggerUrl);
-  assert.match(state.text, /PDFMuse Three Page Fixture/, "the most recent PDF was not reopened after restart");
+  assert.match(state.text, /PDFMuse Navigation Fixture/, "the most recent PDF was not reopened after restart");
   const restoredUi = await evaluate(
     page.webSocketDebuggerUrl,
     `new Promise((resolve) => setTimeout(() => resolve({
@@ -541,7 +623,45 @@ try {
   state = await waitForStartup(page.webSocketDebuggerUrl);
   assert.match(state.text, /PDF 原文件暂时不可用/, "a missing recent PDF did not return to the Library");
   assert.match(state.text, /重新定位原文件/, "the missing PDF cannot be relocated from the Library");
-  console.log("Electron smoke test passed: Library, settings, and reading state recovery are available.");
+  await dropSmokeFile(page.webSocketDebuggerUrl, encryptedFixturePath);
+  const passwordText = await waitForText(page.webSocketDebuggerUrl, "打开加密 PDF");
+  assert.match(passwordText, /记住这本书的密码/, "the encrypted PDF password controls are unavailable");
+  assert.match(passwordText, /明文保存在 PDFMuse 便携数据目录/, "the plaintext password notice is unavailable");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => {
+      const input = document.querySelector('.password-dialog input[type="password"]');
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'wrong');
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+      input.form.requestSubmit();
+    })()`,
+  );
+  const wrongPasswordText = await waitForText(page.webSocketDebuggerUrl, "密码错误，请重新输入");
+  assert.match(wrongPasswordText, /密码错误/, "an incorrect PDF password has no feedback");
+  const libraryAfterWrongPassword = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
+  assert.equal(libraryAfterWrongPassword.length, 1, "an incorrect password created a Library record");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => {
+      const input = document.querySelector('.password-dialog input[type="password"]');
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'muse-test');
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+      document.querySelector('.remember-password input').click();
+      input.form.requestSubmit();
+    })()`,
+  );
+  const unlockedText = await waitForText(page.webSocketDebuggerUrl, "AI 助手");
+  assert.match(unlockedText, /PDFMuse Navigation Fixture/, "the correct password did not open the encrypted PDF");
+
+  await stopElectron(child);
+  port = await reservePort();
+  child = launchElectron(port);
+  page = await waitForPage(port);
+  state = await waitForStartup(page.webSocketDebuggerUrl);
+  assert.match(state.text, /PDFMuse Navigation Fixture/, "a remembered password did not reopen the encrypted PDF");
+  assert.doesNotMatch(state.text, /打开加密 PDF/, "a remembered password still requested manual entry");
+  assert.equal(await evaluate(page.webSocketDebuggerUrl, "Boolean(document.querySelector('.workspace'))"), true, "the remembered encrypted PDF did not restore the reading workspace");
+  console.log("Electron smoke test passed: Library, PDF controls, encrypted books, settings, and reading recovery are available.");
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   if (diagnostics.trim()) console.error(diagnostics.trim());

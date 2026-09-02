@@ -32,6 +32,8 @@ export type ViewerState = {
   scrollTop: number;
   zoomMode: ReadingZoomMode;
   outline: OutlineNode[];
+  findCurrent: number;
+  findTotal: number;
 };
 
 export interface PdfViewerHandle {
@@ -43,6 +45,7 @@ export interface PdfViewerHandle {
   fitWidth(): void;
   fitPage(): void;
   find(query: string, findPrevious?: boolean): void;
+  getThumbnail(page: number): Promise<string | undefined>;
 }
 
 type Props = {
@@ -93,6 +96,9 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     findController: PDFFindController;
     fitMode: Exclude<ReadingZoomMode, "custom"> | null;
     currentPage: number;
+    document?: pdfjs.PDFDocumentProxy;
+    thumbnailCache: Map<number, Promise<string | undefined>>;
+    findQuery: string;
   } | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -106,10 +112,18 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       }
     },
     previousPage() {
-      adapterRef.current?.viewer.previousPage();
+      const adapter = adapterRef.current;
+      if (!adapter) return;
+      const page = Math.max(1, adapter.currentPage - 1);
+      adapter.currentPage = page;
+      adapter.viewer.currentPageNumber = page;
     },
     nextPage() {
-      adapterRef.current?.viewer.nextPage();
+      const adapter = adapterRef.current;
+      if (!adapter) return;
+      const page = Math.min(adapter.viewer.pagesCount, adapter.currentPage + 1);
+      adapter.currentPage = page;
+      adapter.viewer.currentPageNumber = page;
     },
     zoomIn() {
       if (adapterRef.current) {
@@ -138,16 +152,40 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     find(query, findPrevious = false) {
       const adapter = adapterRef.current;
       if (!adapter) return;
+      const normalizedQuery = query.trim();
+      const repeatSearch = normalizedQuery === adapter.findQuery;
+      adapter.findQuery = normalizedQuery;
       adapter.eventBus.dispatch("find", {
         source: adapter.findController,
-        type: "",
-        query,
+        type: repeatSearch && normalizedQuery ? "again" : "",
+        query: normalizedQuery,
         caseSensitive: false,
         entireWord: false,
         highlightAll: true,
         findPrevious,
         matchDiacritics: false,
       });
+    },
+    getThumbnail(pageNumber) {
+      const adapter = adapterRef.current;
+      if (!adapter?.document || pageNumber < 1 || pageNumber > adapter.document.numPages) {
+        return Promise.resolve(undefined);
+      }
+      const cached = adapter.thumbnailCache.get(pageNumber);
+      if (cached) return cached;
+      const rendering = adapter.document.getPage(pageNumber).then(async (page) => {
+        const baseViewport = page.getViewport({ scale: 1 });
+        const viewport = page.getViewport({ scale: 132 / baseViewport.width });
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.ceil(viewport.width);
+        canvas.height = Math.ceil(viewport.height);
+        const context = canvas.getContext("2d", { alpha: false });
+        if (!context) return undefined;
+        await page.render({ canvas, canvasContext: context, viewport }).promise;
+        return canvas.toDataURL("image/jpeg", 0.82);
+      }).catch(() => undefined);
+      adapter.thumbnailCache.set(pageNumber, rendering);
+      return rendering;
     },
   }));
 
@@ -170,12 +208,14 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     });
     linkService.setViewer(viewer);
     const restoredZoomMode = book.readingState.zoomMode;
-    const adapter = {
+    const adapter: NonNullable<typeof adapterRef.current> = {
       eventBus,
       viewer,
       findController,
       fitMode: restoredZoomMode === "custom" ? null : restoredZoomMode,
       currentPage: book.currentPage,
+      thumbnailCache: new Map<number, Promise<string | undefined>>(),
+      findQuery: "",
     };
     adapterRef.current = adapter;
 
@@ -188,13 +228,24 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         scrollTop: container.scrollTop,
         zoomMode: adapter.fitMode ?? "custom",
         outline,
+        findCurrent,
+        findTotal,
       });
     };
+    let findCurrent = 0;
+    let findTotal = 0;
     eventBus.on("pagechanging", (event: { pageNumber: number }) => {
       adapter.currentPage = event.pageNumber;
       reportState();
     });
     eventBus.on("scalechanging", () => reportState());
+    const updateFindState = (event: { matchesCount?: { current?: number; total?: number } }) => {
+      findCurrent = event.matchesCount?.current ?? 0;
+      findTotal = event.matchesCount?.total ?? 0;
+      reportState();
+    };
+    eventBus.on("updatefindmatchescount", updateFindState);
+    eventBus.on("updatefindcontrolstate", updateFindState);
     eventBus.on("pagesinit", () => {
       if (adapter.fitMode) viewer.currentScaleValue = adapter.fitMode;
       else viewer.currentScale = book.readingState.zoomScale / 100;
@@ -214,6 +265,35 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     };
     container.addEventListener("scroll", reportScroll, { passive: true });
 
+    let wheelFrame = 0;
+    let wheelDelta = 0;
+    let wheelAnchor = { x: 0, y: 0 };
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      const rect = container.getBoundingClientRect();
+      wheelDelta += event.deltaY;
+      wheelAnchor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      if (wheelFrame) return;
+      wheelFrame = requestAnimationFrame(() => {
+        wheelFrame = 0;
+        const oldScale = viewer.currentScale || 1;
+        const scaleFactor = Math.exp(-wheelDelta * 0.002);
+        wheelDelta = 0;
+        const nextScale = Math.min(5, Math.max(0.25, oldScale * scaleFactor));
+        if (Math.abs(nextScale - oldScale) < 0.001) return;
+        const documentX = container.scrollLeft + wheelAnchor.x;
+        const documentY = container.scrollTop + wheelAnchor.y;
+        adapter.fitMode = null;
+        viewer.currentScale = nextScale;
+        requestAnimationFrame(() => {
+          container.scrollLeft = documentX * (nextScale / oldScale) - wheelAnchor.x;
+          container.scrollTop = documentY * (nextScale / oldScale) - wheelAnchor.y;
+        });
+      });
+    };
+    container.addEventListener("wheel", handleWheel, { passive: false });
+
     let resizeFrame = 0;
     const resizeObserver = new ResizeObserver(() => {
       cancelAnimationFrame(resizeFrame);
@@ -223,10 +303,14 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     });
     resizeObserver.observe(container);
 
-    const loadingTask = pdfjs.getDocument({ data: book.bytes.slice() });
+    const loadingTask = pdfjs.getDocument({
+      data: book.bytes.slice(),
+      ...(book.password ? { password: book.password } : {}),
+    });
     loadingTask.promise
       .then(async (document) => {
         if (disposed) return;
+        adapter.document = document;
         viewer.setDocument(document);
         linkService.setDocument(document);
         outline = await resolveOutline(document, await document.getOutline());
@@ -242,6 +326,8 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       cancelAnimationFrame(resizeFrame);
       container.removeEventListener("scroll", reportScroll);
       cancelAnimationFrame(scrollFrame);
+      container.removeEventListener("wheel", handleWheel);
+      cancelAnimationFrame(wheelFrame);
       adapterRef.current = null;
       viewer.cleanup();
       void loadingTask.destroy();
