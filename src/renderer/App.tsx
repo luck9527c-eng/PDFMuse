@@ -32,15 +32,16 @@ import type {
   OpenedPdfBook,
   OpenPdfBookResult,
   ReadingState,
+  SelectedPassage,
   StartupPreflight,
 } from "../shared/contracts";
 import { IconButton } from "./components/IconButton";
 import { SettingsDialog } from "./components/SettingsDialog";
-import { PdfViewer, type OutlineNode, type PdfViewerHandle, type ViewerState } from "./pdf/PdfViewer";
+import { PdfViewer, type OutlineNode, type PdfViewerHandle, type ViewerSelection, type ViewerState } from "./pdf/PdfViewer";
 import { createReadingStateWriter } from "./reading-state-persistence";
 
-type Passage = { text: string; x: number; y: number };
 type Message = { role: "reader" | "assistant"; body: string };
+type PassagePopover = Extract<ViewerSelection, { kind: "selected" }>;
 
 const browserPreflight: StartupPreflight = {
   ok: true,
@@ -379,9 +380,10 @@ export function App() {
   const [findOpen, setFindOpen] = useState(false);
   const [panMode, setPanMode] = useState(false);
   const [findQuery, setFindQuery] = useState("");
-  const [passage, setPassage] = useState<Passage>();
+  const [passage, setPassage] = useState<PassagePopover>();
+  const [selectionFeedback, setSelectionFeedback] = useState<{ message: string; tone: "success" | "error" }>();
   const [draft, setDraft] = useState("");
-  const [attachedPassage, setAttachedPassage] = useState<string>();
+  const [attachedPassage, setAttachedPassage] = useState<SelectedPassage>();
   const [messages, setMessages] = useState<Message[]>([]);
 
   useEffect(() => {
@@ -431,23 +433,6 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const handleSelection = () => {
-      const selection = window.getSelection();
-      const text = selection?.toString().trim();
-      if (!selection || !text || selection.rangeCount === 0) {
-        setPassage(undefined);
-        return;
-      }
-      const anchor = selection.anchorNode instanceof Element ? selection.anchorNode : selection.anchorNode?.parentElement;
-      if (!anchor?.closest(".pdfViewer")) return;
-      const rect = selection.getRangeAt(0).getBoundingClientRect();
-      setPassage({ text, x: rect.left + rect.width / 2, y: rect.top });
-    };
-    document.addEventListener("mouseup", handleSelection);
-    return () => document.removeEventListener("mouseup", handleSelection);
-  }, []);
-
-  useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f" && book) {
         event.preventDefault();
@@ -481,6 +466,9 @@ export function App() {
     setUnavailableBookId(undefined);
     setMessages([]);
     setPanMode(false);
+    setPassage(undefined);
+    setAttachedPassage(undefined);
+    setSelectionFeedback(undefined);
   }, []);
 
   const handleOpenResult = useCallback((result: OpenPdfBookResult, attemptedBookId?: string) => {
@@ -631,6 +619,26 @@ export function App() {
     stateWriterRef.current?.schedule({ bookId: book.id, state: readingState });
   }, [book]);
 
+  const handleViewerSelection = useCallback((selection?: ViewerSelection) => {
+    if (!selection) {
+      setPassage(undefined);
+      return;
+    }
+    if (selection.kind === "rejected") {
+      setPassage(undefined);
+      setSelectionFeedback({ message: selection.message, tone: "error" });
+      return;
+    }
+    setSelectionFeedback(undefined);
+    setPassage(selection);
+  }, []);
+
+  useEffect(() => {
+    if (!selectionFeedback) return;
+    const timer = window.setTimeout(() => setSelectionFeedback(undefined), 3_000);
+    return () => window.clearTimeout(timer);
+  }, [selectionFeedback]);
+
   useEffect(() => {
     leftOpenRef.current = leftOpen;
     rightOpenRef.current = rightOpen;
@@ -643,8 +651,8 @@ export function App() {
     stateWriterRef.current?.schedule({ bookId: book.id, state: readingStateRef.current });
   }, [book, leftOpen, rightOpen]);
 
-  const explain = useCallback((text: string) => {
-    setAttachedPassage(text);
+  const explain = useCallback((selectedPassage: SelectedPassage) => {
+    setAttachedPassage(selectedPassage);
     setMessages([
       { role: "reader", body: "请解释这段内容。" },
       { role: "assistant", body: "已选原文已进入阅读上下文。真实回答将在后续任务中接入；当前不会生成虚构答案。" },
@@ -654,12 +662,23 @@ export function App() {
     window.getSelection()?.removeAllRanges();
   }, []);
 
-  const askAboutPassage = useCallback((text: string) => {
-    setAttachedPassage(text);
+  const askAboutPassage = useCallback((selectedPassage: SelectedPassage) => {
+    setAttachedPassage(selectedPassage);
     setRightOpen(true);
     setPassage(undefined);
     window.getSelection()?.removeAllRanges();
     requestAnimationFrame(() => composerRef.current?.focus());
+  }, []);
+
+  const copyPassage = useCallback(async (selectedPassage: SelectedPassage) => {
+    setPassage(undefined);
+    window.getSelection()?.removeAllRanges();
+    try {
+      await navigator.clipboard.writeText(selectedPassage.text);
+      setSelectionFeedback({ message: "已复制选中原文。", tone: "success" });
+    } catch {
+      setSelectionFeedback({ message: "复制失败，请检查系统剪贴板权限后重试。", tone: "error" });
+    }
   }, []);
 
   const sendDraft = useCallback(() => {
@@ -740,6 +759,12 @@ export function App() {
               <button aria-label="关闭错误提示" onClick={() => setLibraryError("")}><X size={14} /></button>
             </div>
           )}
+          {selectionFeedback && (
+            <div className={`reader-notice selection-feedback ${selectionFeedback.tone}`} role={selectionFeedback.tone === "error" ? "alert" : "status"}>
+              <span>{selectionFeedback.message}</span>
+              <button aria-label="关闭选区提示" onClick={() => setSelectionFeedback(undefined)}><X size={14} /></button>
+            </div>
+          )}
           <div className="reader-toolbar">
             <IconButton label="上一页" disabled={viewerState.page <= 1} onClick={() => viewerRef.current?.previousPage()}><ChevronLeft /></IconButton>
             <label className="page-control"><input value={viewerState.page} onChange={(event) => viewerRef.current?.goToPage(Number(event.target.value))} aria-label="当前页" /><span>/ {viewerState.pages || "-"}</span></label>
@@ -764,7 +789,7 @@ export function App() {
               <IconButton type="button" label="关闭查找" onClick={() => { viewerRef.current?.find(""); setFindQuery(""); setFindOpen(false); }}><X /></IconButton>
             </form>
           )}
-          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} panMode={panMode} onStateChange={handleViewerState} onError={setViewerError} />}
+          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} panMode={panMode} onStateChange={handleViewerState} onSelectionChange={handleViewerSelection} onError={setViewerError} />}
         </main>
 
         {rightOpen && (
@@ -783,7 +808,7 @@ export function App() {
               ))}
             </div>
             <div className="composer-wrap">
-              {attachedPassage && <div className="passage-chip"><span>已选原文</span><p>{attachedPassage}</p><button aria-label="移除已选原文" onClick={() => setAttachedPassage(undefined)}><X size={14} /></button></div>}
+              {attachedPassage && <div className="passage-chip"><span>已选原文 · 第 {attachedPassage.page} 页</span><p>{attachedPassage.text}</p><button aria-label="移除已选原文" onClick={() => setAttachedPassage(undefined)}><X size={14} /></button></div>}
               <div className="composer">
                 <textarea ref={composerRef} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendDraft(); } }} placeholder="询问这本 PDF 书籍..." rows={2} />
                 <button className="send-button" aria-label="发送问题" disabled={!draft.trim()} onClick={sendDraft}><Send size={17} /></button>
@@ -793,11 +818,11 @@ export function App() {
         )}
 
         {passage && (
-          <div className="selection-popover" style={{ left: passage.x, top: Math.max(12, passage.y - 48) }}>
-            <button onClick={() => explain(passage.text)}><Sparkles size={14} />解释</button>
-            <button onClick={() => askAboutPassage(passage.text)}><MessageSquareText size={14} />提问</button>
+          <div className="selection-popover" style={{ left: passage.popover.x, top: Math.max(12, passage.popover.y - 48) }}>
+            <button onClick={() => explain(passage.passage)}><Sparkles size={14} />解释</button>
+            <button onClick={() => askAboutPassage(passage.passage)}><MessageSquareText size={14} />提问</button>
             <span />
-            <button onClick={() => { void navigator.clipboard.writeText(passage.text); setPassage(undefined); }}><Copy size={14} />复制</button>
+            <button onClick={() => void copyPassage(passage.passage)}><Copy size={14} />复制</button>
           </div>
         )}
         <PasswordDialog request={passwordRequest} onCancel={() => setPasswordRequest(undefined)} onUnlock={unlockPdf} />

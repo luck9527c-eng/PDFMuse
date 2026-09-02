@@ -14,7 +14,8 @@ import {
 } from "pdfjs-dist/web/pdf_viewer.mjs";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
-import type { OpenedPdfBook, ReadingZoomMode } from "../../shared/contracts";
+import type { OpenedPdfBook, ReadingZoomMode, SelectedPassage } from "../../shared/contracts";
+import { normalizePageRects } from "./selection-geometry";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -48,10 +49,22 @@ export interface PdfViewerHandle {
   getThumbnail(page: number): Promise<string | undefined>;
 }
 
+export type ViewerSelection =
+  | {
+      kind: "selected";
+      passage: SelectedPassage;
+      popover: { x: number; y: number };
+    }
+  | {
+      kind: "rejected";
+      message: string;
+    };
+
 type Props = {
   book: OpenedPdfBook;
   panMode: boolean;
   onStateChange(state: ViewerState): void;
+  onSelectionChange(selection?: ViewerSelection): void;
   onError(message: string): void;
 };
 
@@ -86,7 +99,7 @@ async function resolveOutline(
 }
 
 export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
-  { book, panMode, onStateChange, onError },
+  { book, panMode, onStateChange, onSelectionChange, onError },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -265,11 +278,70 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     });
 
     let scrollFrame = 0;
+    let selectionVisible = false;
+    const clearSelectionPopover = () => {
+      if (!selectionVisible) return;
+      selectionVisible = false;
+      onSelectionChange();
+    };
     const reportScroll = () => {
+      clearSelectionPopover();
       cancelAnimationFrame(scrollFrame);
       scrollFrame = requestAnimationFrame(() => reportState());
     };
     container.addEventListener("scroll", reportScroll, { passive: true });
+
+    let selectionFrame = 0;
+    const pageForNode = (node: Node | null) => {
+      const element = node instanceof Element ? node : node?.parentElement;
+      const page = element?.closest<HTMLElement>(".page");
+      return page && viewerElement.contains(page) ? page : undefined;
+    };
+    const reportSelection = () => {
+      selectionFrame = 0;
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+        clearSelectionPopover();
+        return;
+      }
+      const range = selection.getRangeAt(0);
+      const startPage = pageForNode(range.startContainer);
+      const endPage = pageForNode(range.endContainer);
+      if (!startPage || !endPage) {
+        clearSelectionPopover();
+        return;
+      }
+      if (startPage !== endPage) {
+        selectionVisible = false;
+        onSelectionChange({ kind: "rejected", message: "暂不支持跨页选择，请在同一页内重新选择。" });
+        selection.removeAllRanges();
+        return;
+      }
+      const text = selection.toString().trim();
+      const page = Number(startPage.dataset.pageNumber);
+      const pageRect = startPage.getBoundingClientRect();
+      const rects = normalizePageRects(pageRect, Array.from(range.getClientRects()));
+      const selectionRect = range.getBoundingClientRect();
+      if (!text || !Number.isSafeInteger(page) || page < 1 || rects.length === 0
+        || selectionRect.width <= 0 || selectionRect.height <= 0) {
+        clearSelectionPopover();
+        return;
+      }
+      selectionVisible = true;
+      onSelectionChange({
+        kind: "selected",
+        passage: { bookId: book.id, page, text, rects },
+        popover: {
+          x: selectionRect.left + selectionRect.width / 2,
+          y: selectionRect.top,
+        },
+      });
+    };
+    const scheduleSelectionReport = () => {
+      cancelAnimationFrame(selectionFrame);
+      selectionFrame = requestAnimationFrame(reportSelection);
+    };
+    document.addEventListener("selectionchange", scheduleSelectionReport);
 
     let wheelFrame = 0;
     let wheelDelta = 0;
@@ -387,6 +459,9 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       cancelAnimationFrame(resizeFrame);
       container.removeEventListener("scroll", reportScroll);
       cancelAnimationFrame(scrollFrame);
+      document.removeEventListener("selectionchange", scheduleSelectionReport);
+      cancelAnimationFrame(selectionFrame);
+      if (selectionVisible) onSelectionChange();
       container.removeEventListener("wheel", handleWheel);
       cancelAnimationFrame(wheelFrame);
       stopPanning();
@@ -398,7 +473,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       viewer.cleanup();
       void loadingTask.destroy();
     };
-  }, [book, onError, onStateChange]);
+  }, [book, onError, onSelectionChange, onStateChange]);
 
   return (
     <div className={`pdf-container ${panMode ? "pan-mode" : ""}`} ref={containerRef}>

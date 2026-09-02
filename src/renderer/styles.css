@@ -98,6 +98,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .reader { position: relative; min-width: 0; min-height: 0; overflow: hidden; background: var(--canvas); }
 .reader-notice { position: absolute; z-index: 15; top: 64px; left: 50%; transform: translateX(-50%); width: min(520px, calc(100% - 32px)); display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px 9px 12px; border-left: 3px solid var(--coral); border-radius: 4px; background: #f6e7e3; color: #8d3f37; box-shadow: 0 7px 20px rgba(43,42,37,.1); font-size: 11px; line-height: 1.5; }
 .reader-notice button { width: 26px; height: 26px; flex: none; display: grid; place-items: center; padding: 0; border: 0; background: transparent; cursor: pointer; }
+.reader-notice.selection-feedback.success { border-left-color: var(--green); background: var(--green-soft); color: var(--green); }
+.reader-notice + .selection-feedback { top: 112px; }
 .reader-toolbar { position: absolute; z-index: 12; top: 10px; left: 50%; transform: translateX(-50%); min-width: max-content; height: 43px; display: flex; align-items: center; gap: 2px; padding: 4px; border: 1px solid var(--line); border-radius: 7px; background: rgba(255,254,251,.96); box-shadow: 0 7px 20px rgba(43,42,37,.1); }
 .toolbar-divider { width: 1px; height: 21px; margin: 0 3px; background: var(--line); }
 .page-control { height: 30px; display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }

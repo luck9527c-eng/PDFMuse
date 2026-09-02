@@ -39,6 +39,20 @@ export type ReadingState = {
   rightSidebarOpen: boolean;
 };
 
+export type NormalizedPageRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+export type SelectedPassage = {
+  bookId: string;
+  page: number;
+  text: string;
+  rects: NormalizedPageRect[];
+};
+
 export type LibraryBook = {
   id: string;
   title: string;

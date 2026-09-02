@@ -182,6 +182,64 @@ async function waitForText(webSocketUrl, expected) {
   return bodyText;
 }
 
+async function waitForSelector(webSocketUrl, selector, present = true) {
+  return evaluate(
+    webSocketUrl,
+    `new Promise((resolve) => {
+      const deadline = Date.now() + 3000;
+      const inspect = () => {
+        const found = Boolean(document.querySelector(${JSON.stringify(selector)}));
+        if (found === ${present}) return resolve(found);
+        if (Date.now() >= deadline) return resolve(found);
+        setTimeout(inspect, 40);
+      };
+      inspect();
+    })`,
+  );
+}
+
+async function selectPdfText(webSocketUrl, startPage, startNeedle, endPage, endNeedle) {
+  return evaluate(
+    webSocketUrl,
+    `(() => {
+      const pageText = (pageNumber) => {
+        const page = document.querySelector('.pdfViewer .page[data-page-number="' + pageNumber + '"]');
+        if (!page) return undefined;
+        const walker = document.createTreeWalker(page, NodeFilter.SHOW_TEXT);
+        const nodes = [];
+        while (walker.nextNode()) nodes.push(walker.currentNode);
+        return { nodes, text: nodes.map((node) => node.textContent ?? '').join('') };
+      };
+      const locate = (nodes, index) => {
+        let consumed = 0;
+        for (const node of nodes) {
+          const length = node.textContent?.length ?? 0;
+          if (index <= consumed + length) return { node, offset: index - consumed };
+          consumed += length;
+        }
+        return undefined;
+      };
+      const startPageText = pageText(${startPage});
+      const endPageText = pageText(${endPage});
+      if (!startPageText || !endPageText) return false;
+      const startIndex = startPageText.text.indexOf(${JSON.stringify(startNeedle)});
+      const endIndex = endPageText.text.lastIndexOf(${JSON.stringify(endNeedle)});
+      if (startIndex < 0 || endIndex < 0) return false;
+      const start = locate(startPageText.nodes, startIndex);
+      const end = locate(endPageText.nodes, endIndex + ${JSON.stringify(endNeedle)}.length);
+      if (!start || !end) return false;
+      const range = document.createRange();
+      range.setStart(start.node, start.offset);
+      range.setEnd(end.node, end.offset);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+      return true;
+    })()`,
+  );
+}
+
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const electronExecutable = path.join(
   projectRoot,
@@ -360,6 +418,7 @@ try {
   );
   assert.ok(panning.after >= panning.before + 50, "drag-to-pan did not move the PDF viewport");
   assert.equal(panning.active, false, "drag-to-pan remained active after pointer release");
+  await evaluate(page.webSocketDebuggerUrl, `document.querySelector('[aria-label="关闭拖拽浏览"]')?.click()`);
   const resizedSidebars = await evaluate(
     page.webSocketDebuggerUrl,
     `new Promise((resolve) => {
@@ -417,6 +476,82 @@ try {
   );
   const findText = await waitForText(page.webSocketDebuggerUrl, "1 / 9");
   assert.match(findText, /1 \/ 9/, "PDF search result position and total are unavailable");
+  assert.equal(
+    await selectPdfText(page.webSocketDebuggerUrl, 1, "Chapter One", 1, "PDFMuse search target."),
+    true,
+    "the fixed PDF text could not be selected",
+  );
+  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover"), true, "a same-page cross-paragraph selection has no actions");
+  const selectionActions = await evaluate(
+    page.webSocketDebuggerUrl,
+    `Array.from(document.querySelectorAll('.selection-popover button')).map((button) => button.textContent)`,
+  );
+  assert.deepEqual(selectionActions, ["解释", "提问", "复制"], "Selected Passage actions are inconsistent");
+  await evaluate(page.webSocketDebuggerUrl, `document.querySelector('.selection-popover button:nth-child(2)')?.click()`);
+  const attachedPassageText = await waitForText(page.webSocketDebuggerUrl, "已选原文 · 第 1 页");
+  assert.match(attachedPassageText, /Chapter One/, "asking did not retain the Selected Passage text");
+  await evaluate(page.webSocketDebuggerUrl, `document.querySelector('[aria-label="移除已选原文"]')?.click()`);
+
+  await selectPdfText(page.webSocketDebuggerUrl, 1, "Chapter One", 1, "PDFMuse search target.");
+  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover"), true, "Selected Passage actions did not reopen");
+  await evaluate(page.webSocketDebuggerUrl, `document.querySelector('.selection-popover button:last-child')?.click()`);
+  const copiedText = await waitForText(page.webSocketDebuggerUrl, "已复制选中原文");
+  assert.match(copiedText, /已复制选中原文/, "successful copy has no feedback");
+
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => {
+      window.__pdfMuseClipboardWrite = Object.getOwnPropertyDescriptor(navigator.clipboard, 'writeText');
+      Object.defineProperty(navigator.clipboard, 'writeText', { configurable: true, value: () => Promise.reject(new Error('smoke failure')) });
+    })()`,
+  );
+  await selectPdfText(page.webSocketDebuggerUrl, 1, "Chapter One", 1, "PDFMuse search target.");
+  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover"), true, "Selected Passage actions did not reopen for copy failure");
+  await evaluate(page.webSocketDebuggerUrl, `document.querySelector('.selection-popover button:last-child')?.click()`);
+  const copyFailureText = await waitForText(page.webSocketDebuggerUrl, "复制失败");
+  assert.match(copyFailureText, /检查系统剪贴板权限/, "failed copy has no understandable feedback");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => {
+      const descriptor = window.__pdfMuseClipboardWrite;
+      if (descriptor) Object.defineProperty(navigator.clipboard, 'writeText', descriptor);
+      else delete navigator.clipboard.writeText;
+      delete window.__pdfMuseClipboardWrite;
+    })()`,
+  );
+
+  assert.equal(
+    await selectPdfText(page.webSocketDebuggerUrl, 1, "Chapter One", 2, "Chapter Two"),
+    true,
+    "the cross-page selection fixture is unavailable",
+  );
+  const crossPageText = await waitForText(page.webSocketDebuggerUrl, "暂不支持跨页选择");
+  assert.match(crossPageText, /同一页内重新选择/, "cross-page selection is not explicitly limited");
+  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover", false), false, "cross-page selection exposed passage actions");
+
+  await selectPdfText(page.webSocketDebuggerUrl, 1, "Chapter One", 1, "PDFMuse search target.");
+  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover"), true, "Selected Passage actions did not reopen before scrolling");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => {
+      const container = document.querySelector('.pdf-container');
+      container.scrollTop += 12;
+      container.dispatchEvent(new Event('scroll'));
+    })()`,
+  );
+  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover", false), false, "scrolling did not dismiss Selected Passage actions");
+  await selectPdfText(page.webSocketDebuggerUrl, 1, "Chapter One", 1, "PDFMuse search target.");
+  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover"), true, "Selected Passage actions did not reopen before cancellation");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => {
+      window.getSelection()?.removeAllRanges();
+      document.dispatchEvent(new Event('selectionchange'));
+    })()`,
+  );
+  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover", false), false, "cancelling the selection did not dismiss its actions");
+  await selectPdfText(page.webSocketDebuggerUrl, 1, "Chapter One", 1, "PDFMuse search target.");
+  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover"), true, "Selected Passage actions did not reopen before leaving the book");
   const populatedLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
   assert.match(populatedLibrary[0].id, /^[a-f0-9]{64}$/, "the PDF content fingerprint is invalid");
   assert.equal(populatedLibrary[0].title, "PDFMuse Navigation Fixture", "the PDF metadata title is invalid");
@@ -427,6 +562,7 @@ try {
   );
   const libraryText = await waitForText(page.webSocketDebuggerUrl, "共 1 本 PDF 书籍");
   assert.match(libraryText, /读至第 1 页，共 3 页/, "the Library book card is incomplete");
+  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover", false), false, "leaving the PDF Book did not dismiss Selected Passage actions");
   await dropSmokeFile(page.webSocketDebuggerUrl, fixturePath);
   await waitForText(page.webSocketDebuggerUrl, "AI 助手");
   const deduplicatedLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
@@ -715,7 +851,7 @@ try {
   assert.match(state.text, /PDFMuse Navigation Fixture/, "a remembered password did not reopen the encrypted PDF");
   assert.doesNotMatch(state.text, /打开加密 PDF/, "a remembered password still requested manual entry");
   assert.equal(await evaluate(page.webSocketDebuggerUrl, "Boolean(document.querySelector('.workspace'))"), true, "the remembered encrypted PDF did not restore the reading workspace");
-  console.log("Electron smoke test passed: Library, PDF controls, encrypted books, settings, and reading recovery are available.");
+  console.log("Electron smoke test passed: Library, PDF controls, Selected Passage, encrypted books, settings, and reading recovery are available.");
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   if (diagnostics.trim()) console.error(diagnostics.trim());
