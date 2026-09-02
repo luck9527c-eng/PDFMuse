@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -6,9 +5,9 @@ import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 
 import { preflightDataHome } from "./data-home.js";
 import { createEmbeddingConnectionModule } from "./embedding-connection.js";
+import { createLibraryModule } from "./library.js";
 import { createModelConnectionModule } from "./model-connection.js";
 import type {
-  OpenedPdfBook,
   SaveEmbeddingConnectionInput,
   SaveModelConnectionInput,
   StartupPreflight,
@@ -18,6 +17,7 @@ import type {
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 let startupPreflight: StartupPreflight;
+let closeLibrary: (() => void) | undefined;
 
 function applicationDirectory() {
   const testDirectory = process.env.PDFMUSE_TEST_APPLICATION_DIRECTORY;
@@ -61,6 +61,25 @@ app.whenReady().then(async () => {
   if (startupPreflight.ok) {
     const modelConnection = createModelConnectionModule(startupPreflight.dataHome);
     const embeddingConnection = createEmbeddingConnectionModule(startupPreflight.dataHome);
+    const library = createLibraryModule(startupPreflight.dataHome);
+    closeLibrary = library.close;
+    ipcMain.handle("library:list", () => library.list());
+    ipcMain.handle("library:choose", async () => {
+      const result = await dialog.showOpenDialog({
+        title: "打开 PDF 书籍",
+        properties: ["openFile"],
+        filters: [{ name: "PDF 文件", extensions: ["pdf"] }],
+      });
+      const selectedPath = result.filePaths[0];
+      if (result.canceled || !selectedPath) return null;
+      return library.openPath(selectedPath);
+    });
+    ipcMain.handle("library:open-path", (_event, filePath: unknown) => library.openPath(filePath));
+    ipcMain.handle("library:open-known", (_event, bookId: unknown) => library.openKnown(bookId));
+    ipcMain.handle(
+      "library:update-page",
+      (_event, bookId: unknown, page: unknown) => library.updateCurrentPage(bookId, page),
+    );
     ipcMain.handle("model-connection:get", () => modelConnection.get());
     ipcMain.handle(
       "model-connection:save",
@@ -80,28 +99,15 @@ app.whenReady().then(async () => {
       (_event, input: TestEmbeddingConnectionInput) => embeddingConnection.test(input),
     );
   }
-  ipcMain.handle("pdf:choose", async (): Promise<OpenedPdfBook | null> => {
-    const result = await dialog.showOpenDialog({
-      title: "打开 PDF 书籍",
-      properties: ["openFile"],
-      filters: [{ name: "PDF 文件", extensions: ["pdf"] }],
-    });
-
-    const selectedPath = result.filePaths[0];
-    if (result.canceled || !selectedPath) return null;
-
-    const bytes = await readFile(selectedPath);
-    return {
-      name: path.basename(selectedPath, path.extname(selectedPath)),
-      path: selectedPath,
-      bytes: new Uint8Array(bytes),
-    };
-  });
-
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+app.once("before-quit", () => {
+  closeLibrary?.();
+  closeLibrary = undefined;
 });
 
 app.on("window-all-closed", () => {

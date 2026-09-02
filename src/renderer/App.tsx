@@ -19,11 +19,17 @@ import {
   Search,
   Send,
   Sparkles,
+  Upload,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import type { OpenedPdfBook, StartupPreflight } from "../shared/contracts";
+import type {
+  LibraryBook,
+  OpenedPdfBook,
+  OpenPdfBookResult,
+  StartupPreflight,
+} from "../shared/contracts";
 import { IconButton } from "./components/IconButton";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PdfViewer, type OutlineNode, type PdfViewerHandle, type ViewerState } from "./pdf/PdfViewer";
@@ -57,18 +63,119 @@ function OutlineTree({ nodes, onGoToPage }: { nodes: OutlineNode[]; onGoToPage(p
   );
 }
 
-function EmptyLibrary({ onOpen, warnings }: { onOpen(): void; warnings: string[] }) {
+function formatUpdatedAt(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "更新时间未知";
+  return `更新于 ${new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date)}`;
+}
+
+type LibraryViewProps = {
+  books: LibraryBook[];
+  error: string;
+  loading: boolean;
+  warnings: string[];
+  onChoose(): Promise<void>;
+  onDropFile(file?: File): Promise<void>;
+  onOpenBook(bookId: string): Promise<void>;
+};
+
+function LibraryView({
+  books,
+  error,
+  loading,
+  warnings,
+  onChoose,
+  onDropFile,
+  onOpenBook,
+}: LibraryViewProps) {
+  const [dragging, setDragging] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const run = async (action: () => Promise<void>) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await action();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDrop = (event: React.DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    setDragging(false);
+    const files = Array.from(event.dataTransfer.files);
+    if (files.length !== 1) return void run(() => onDropFile());
+    void run(() => onDropFile(files[0]!));
+  };
+
   return (
     <Tooltip.Provider>
-      <main className="empty-library">
-        <div className="empty-brand"><span>PM</span><strong>PDFMuse</strong><div className="empty-brand-actions"><SettingsDialog warnings={warnings} /></div></div>
-        <section className="empty-content">
-          <div className="empty-icon"><BookOpen size={30} /></div>
-          <h1>打开一本 PDF 书籍</h1>
-          <p>阅读位置、对话与后续索引都会保存在程序旁的数据目录。</p>
-          <button className="primary-command" onClick={onOpen}><FilePlus2 size={17} />选择 PDF</button>
+      <main
+        className={`library-view ${dragging ? "is-dragging" : ""}`}
+        onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
+        onDragOver={(event) => event.preventDefault()}
+        onDragLeave={(event) => {
+          const nextTarget = event.relatedTarget;
+          if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) setDragging(false);
+        }}
+        onDrop={handleDrop}
+      >
+        <header className="library-topbar">
+          <div className="library-brand"><span>PM</span><strong>PDFMuse</strong></div>
+          <SettingsDialog warnings={warnings} />
+        </header>
+        <section className="library-content">
+          <div className="library-heading">
+            <div><h1>书库</h1><p>{books.length > 0 ? `共 ${books.length} 本 PDF 书籍` : "你的 PDF 阅读空间"}</p></div>
+            <button className="primary-command" disabled={busy} onClick={() => void run(onChoose)}><FilePlus2 size={17} />选择 PDF</button>
+          </div>
+
+          {error && <div className="library-error" role="alert">{error}</div>}
+
+          {loading ? (
+            <div className="library-loading">正在读取书库...</div>
+          ) : books.length === 0 ? (
+            <div className="library-empty">
+              <div className="empty-icon"><BookOpen size={30} /></div>
+              <h2>打开第一本 PDF 书籍</h2>
+              <p>选择文件或将一个 PDF 拖到这里。原文件只会被读取，不会移动、复制或修改。</p>
+              <button className="primary-command" disabled={busy} onClick={() => void run(onChoose)}><FilePlus2 size={17} />选择 PDF</button>
+            </div>
+          ) : (
+            <div className="library-grid">
+              {books.map((item) => (
+                <button
+                  className="library-book"
+                  key={item.id}
+                  disabled={busy}
+                  onClick={() => void run(() => onOpenBook(item.id))}
+                  aria-label={`打开《${item.title}》`}
+                >
+                  <span className={`library-cover cover-${Number.parseInt(item.id.slice(0, 2), 16) % 4}`}>
+                    <span className="cover-label">PDFMuse</span>
+                    <strong>{item.title}</strong>
+                    <span className="cover-rule" />
+                    <small>PDF · {item.pageCount} 页</small>
+                  </span>
+                  <span className="library-book-info">
+                    <strong title={item.title}>{item.title}</strong>
+                    <span>读至第 {item.currentPage} 页，共 {item.pageCount} 页</span>
+                    <span>{formatUpdatedAt(item.updatedAt)}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div className="library-drop-hint"><Upload size={15} />也可以将一个 PDF 文件拖到窗口中</div>
         </section>
-        <div className="empty-footer"><Library size={14} /> 打开第一本书后，它会出现在书库中</div>
+        {dragging && <div className="drop-overlay"><Upload size={30} /><strong>松开以加入书库</strong><span>仅接受一个 PDF 文件</span></div>}
       </main>
     </Tooltip.Provider>
   );
@@ -77,8 +184,12 @@ function EmptyLibrary({ onOpen, warnings }: { onOpen(): void; warnings: string[]
 export function App() {
   const viewerRef = useRef<PdfViewerHandle>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const persistedPageRef = useRef(1);
   const [preflight, setPreflight] = useState<StartupPreflight>();
   const [book, setBook] = useState<OpenedPdfBook>();
+  const [libraryBooks, setLibraryBooks] = useState<LibraryBook[]>([]);
+  const [libraryError, setLibraryError] = useState("");
+  const [libraryLoading, setLibraryLoading] = useState(true);
   const [viewerState, setViewerState] = useState<ViewerState>({ page: 1, pages: 0, scale: 100, outline: [] });
   const [viewerError, setViewerError] = useState("");
   const [leftOpen, setLeftOpen] = useState(true);
@@ -94,6 +205,24 @@ export function App() {
     void (window.pdfMuse?.getStartupPreflight() ?? Promise.resolve(browserPreflight)).then(setPreflight);
   }, []);
 
+  const refreshLibrary = useCallback(async () => {
+    if (!window.pdfMuse) {
+      setLibraryLoading(false);
+      return;
+    }
+    try {
+      setLibraryBooks(await window.pdfMuse.listLibraryBooks());
+    } catch {
+      setLibraryError("无法读取书库，请重新启动 PDFMuse 后重试。");
+    } finally {
+      setLibraryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (preflight?.ok) void refreshLibrary();
+  }, [preflight, refreshLibrary]);
+
   useEffect(() => {
     const demoRequested = import.meta.env.DEV && new URLSearchParams(window.location.search).has("demo");
     if (window.pdfMuse || !demoRequested) return;
@@ -102,7 +231,14 @@ export function App() {
       .then(async (response) => {
         if (!response.ok) throw new Error(`QA PDF returned ${response.status}`);
         const bytes = new Uint8Array(await response.arrayBuffer());
-        setBook({ name: "PDFMuse 界面测试文档", path: "data/qa-sample.pdf", bytes });
+        setBook({
+          id: "demo",
+          name: "PDFMuse 界面测试文档",
+          path: "data/qa-sample.pdf",
+          pageCount: 1,
+          currentPage: 1,
+          bytes,
+        });
       })
       .catch((error: unknown) => setViewerError(error instanceof Error ? error.message : String(error)));
   }, []);
@@ -135,15 +271,70 @@ export function App() {
     return () => window.removeEventListener("keydown", handleShortcut);
   }, [book]);
 
+  const activateBook = useCallback((openedBook: OpenedPdfBook) => {
+    persistedPageRef.current = openedBook.currentPage;
+    setViewerState({ page: openedBook.currentPage, pages: openedBook.pageCount, scale: 100, outline: [] });
+    setBook(openedBook);
+    setViewerError("");
+    setLibraryError("");
+    setMessages([]);
+  }, []);
+
+  const handleOpenResult = useCallback((result: OpenPdfBookResult) => {
+    if (result.ok) activateBook(result.book);
+    else setLibraryError(result.message);
+  }, [activateBook]);
+
   const openBook = useCallback(async () => {
     if (!window.pdfMuse) return;
-    const selected = await window.pdfMuse.choosePdfBook();
-    if (selected) {
-      setBook(selected);
-      setViewerError("");
-      setMessages([]);
+    try {
+      const selected = await window.pdfMuse.choosePdfBook();
+      if (selected) handleOpenResult(selected);
+    } catch {
+      setLibraryError("无法打开文件选择器，请重试。");
     }
-  }, []);
+  }, [handleOpenResult]);
+
+  const openDroppedBook = useCallback(async (file?: File) => {
+    if (!window.pdfMuse) {
+      setLibraryError("拖放打开 PDF 仅在桌面应用中可用。");
+      return;
+    }
+    if (!file?.name || !file.name.toLowerCase().endsWith(".pdf")) {
+      setLibraryError(file?.name ? "请拖入一个 PDF 文件。" : "每次只能拖入一个 PDF 文件。");
+      return;
+    }
+    try {
+      handleOpenResult(await window.pdfMuse.openDroppedPdf(file));
+    } catch {
+      setLibraryError("无法读取拖入的 PDF 文件，请重试。");
+    }
+  }, [handleOpenResult]);
+
+  const openLibraryBook = useCallback(async (bookId: string) => {
+    if (!window.pdfMuse) return;
+    try {
+      handleOpenResult(await window.pdfMuse.openLibraryBook(bookId));
+    } catch {
+      setLibraryError("无法打开这本 PDF 书籍，请重试。");
+    }
+  }, [handleOpenResult]);
+
+  const showLibrary = useCallback(() => {
+    setBook(undefined);
+    setViewerError("");
+    setPassage(undefined);
+    setLibraryError("");
+    setLibraryLoading(true);
+    void refreshLibrary();
+  }, [refreshLibrary]);
+
+  const handleViewerState = useCallback((state: ViewerState) => {
+    setViewerState(state);
+    if (!book || state.page === persistedPageRef.current) return;
+    persistedPageRef.current = state.page;
+    void window.pdfMuse?.updateLibraryBookPage(book.id, state.page);
+  }, [book]);
 
   const explain = useCallback((text: string) => {
     setAttachedPassage(text);
@@ -187,7 +378,9 @@ export function App() {
       </main>
     );
   }
-  if (!book) return <EmptyLibrary onOpen={openBook} warnings={preflight.warnings} />;
+  if (!book) {
+    return <LibraryView books={libraryBooks} error={libraryError} loading={libraryLoading} warnings={preflight.warnings} onChoose={openBook} onDropFile={openDroppedBook} onOpenBook={openLibraryBook} />;
+  }
 
   return (
     <Tooltip.Provider>
@@ -195,6 +388,7 @@ export function App() {
         <header className="topbar">
           <div className="brand"><span className="brand-mark">PM</span><strong>PDFMuse</strong></div>
           <div className="document-bar">
+            <IconButton label="返回书库" onClick={showLibrary}><Library /></IconButton>
             <IconButton label={leftOpen ? "收起目录" : "展开目录"} onClick={() => setLeftOpen((value) => !value)}><PanelLeftClose /></IconButton>
             <button className="book-title" onClick={openBook} title={book.path}>{book.name}<ChevronDown size={14} /></button>
             <IconButton label="打开另一本 PDF" onClick={openBook}><FilePlus2 /></IconButton>
@@ -218,6 +412,12 @@ export function App() {
         )}
 
         <main className="reader">
+          {libraryError && (
+            <div className="reader-notice" role="alert">
+              <span>{libraryError}</span>
+              <button aria-label="关闭错误提示" onClick={() => setLibraryError("")}><X size={14} /></button>
+            </div>
+          )}
           <div className="reader-toolbar">
             <IconButton label="上一页" disabled={viewerState.page <= 1} onClick={() => viewerRef.current?.previousPage()}><ChevronLeft /></IconButton>
             <label className="page-control"><input value={viewerState.page} onChange={(event) => viewerRef.current?.goToPage(Number(event.target.value))} aria-label="当前页" /><span>/ {viewerState.pages || "-"}</span></label>
@@ -240,7 +440,7 @@ export function App() {
               <IconButton type="button" label="关闭查找" onClick={() => { viewerRef.current?.find(""); setFindQuery(""); setFindOpen(false); }}><X /></IconButton>
             </form>
           )}
-          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} onStateChange={setViewerState} onError={setViewerError} />}
+          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} onStateChange={handleViewerState} onError={setViewerError} />}
         </main>
 
         {rightOpen && (

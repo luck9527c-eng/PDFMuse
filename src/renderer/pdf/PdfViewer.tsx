@@ -178,6 +178,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     eventBus.on("scalechanging", reportState);
     eventBus.on("pagesinit", () => {
       viewer.currentScaleValue = adapter.fitMode ?? "page-width";
+      viewer.currentPageNumber = Math.max(1, Math.min(viewer.pagesCount, book.currentPage));
       setLoading(false);
       reportState();
     });

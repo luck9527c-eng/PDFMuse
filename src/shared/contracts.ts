@@ -18,10 +18,34 @@ export type StartupPreflight =
     };
 
 export type OpenedPdfBook = {
+  id: string;
   name: string;
   path: string;
+  pageCount: number;
+  currentPage: number;
   bytes: Uint8Array;
 };
+
+export type LibraryBook = {
+  id: string;
+  title: string;
+  fileName: string;
+  path: string;
+  pageCount: number;
+  currentPage: number;
+  updatedAt: string;
+};
+
+export type OpenPdfBookResult =
+  | {
+      ok: true;
+      book: OpenedPdfBook;
+    }
+  | {
+      ok: false;
+      code: "INVALID_FILE_TYPE" | "FILE_UNAVAILABLE" | "INVALID_PDF" | "CONTENT_CHANGED";
+      message: string;
+    };
 
 export type ModelProtocol = "openai" | "anthropic";
 
@@ -127,7 +151,11 @@ export type TestEmbeddingConnectionResult =
 
 export interface PDFMuseApi {
   getStartupPreflight(): Promise<StartupPreflight>;
-  choosePdfBook(): Promise<OpenedPdfBook | null>;
+  listLibraryBooks(): Promise<LibraryBook[]>;
+  choosePdfBook(): Promise<OpenPdfBookResult | null>;
+  openDroppedPdf(file: unknown): Promise<OpenPdfBookResult>;
+  openLibraryBook(bookId: string): Promise<OpenPdfBookResult>;
+  updateLibraryBookPage(bookId: string, page: number): Promise<void>;
   getModelConnection(): Promise<ModelConnectionState>;
   saveModelConnection(input: SaveModelConnectionInput): Promise<SaveModelConnectionResult>;
   testModelConnection(input: TestModelConnectionInput): Promise<TestModelConnectionResult>;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -38,7 +38,7 @@ async function waitForPage(port) {
   throw new Error("PDFMuse did not expose a renderer page within 8 seconds.");
 }
 
-function evaluate(webSocketUrl, expression) {
+function command(webSocketUrl, method, params = {}) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(webSocketUrl);
     const timer = setTimeout(() => {
@@ -49,8 +49,8 @@ function evaluate(webSocketUrl, expression) {
     socket.addEventListener("open", () => {
       socket.send(JSON.stringify({
         id: 1,
-        method: "Runtime.evaluate",
-        params: { expression, returnByValue: true, awaitPromise: true },
+        method,
+        params,
       }));
     });
     socket.addEventListener("message", (event) => {
@@ -61,13 +61,96 @@ function evaluate(webSocketUrl, expression) {
       if (message.error || message.result.exceptionDetails) {
         reject(new Error(JSON.stringify(message.error ?? message.result.exceptionDetails)));
       }
-      else resolve(message.result.result.value);
+      else resolve(message.result);
     });
     socket.addEventListener("error", () => {
       clearTimeout(timer);
       reject(new Error("Unable to connect to the Electron renderer."));
     });
   });
+}
+
+async function evaluate(webSocketUrl, expression) {
+  const result = await command(webSocketUrl, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  return result.result.value;
+}
+
+async function setSmokeFile(webSocketUrl, filePath) {
+  await evaluate(
+    webSocketUrl,
+    `(() => {
+      let input = document.querySelector('#smoke-pdf-input');
+      if (!input) {
+        input = document.createElement('input');
+        input.id = 'smoke-pdf-input';
+        input.type = 'file';
+        input.hidden = true;
+        document.body.append(input);
+      }
+    })()`,
+  );
+  await new Promise((resolve, reject) => {
+    const socket = new WebSocket(webSocketUrl);
+    const timer = setTimeout(() => {
+      socket.close();
+      reject(new Error("Setting the smoke test file timed out."));
+    }, 3_000);
+    socket.addEventListener("open", () => {
+      socket.send(JSON.stringify({ id: 1, method: "DOM.getDocument", params: {} }));
+    });
+    socket.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      if (message.error) {
+        clearTimeout(timer);
+        socket.close();
+        reject(new Error(JSON.stringify(message.error)));
+        return;
+      }
+      if (message.id === 1) {
+        socket.send(JSON.stringify({
+          id: 2,
+          method: "DOM.querySelector",
+          params: { nodeId: message.result.root.nodeId, selector: "#smoke-pdf-input" },
+        }));
+      } else if (message.id === 2) {
+        socket.send(JSON.stringify({
+          id: 3,
+          method: "DOM.setFileInputFiles",
+          params: { files: [filePath], nodeId: message.result.nodeId },
+        }));
+      } else if (message.id === 3) {
+        clearTimeout(timer);
+        socket.close();
+        resolve();
+      }
+    });
+    socket.addEventListener("error", () => {
+      clearTimeout(timer);
+      reject(new Error("Unable to set the smoke test file."));
+    });
+  });
+}
+
+async function dropSmokeFile(webSocketUrl, filePath) {
+  await setSmokeFile(webSocketUrl, filePath);
+  return evaluate(
+    webSocketUrl,
+    `(() => {
+      const input = document.querySelector('#smoke-pdf-input');
+      const target = document.querySelector('.library-view');
+      const transfer = new DataTransfer();
+      transfer.items.add(input.files[0]);
+      return target.dispatchEvent(new DragEvent('drop', {
+        bubbles: true,
+        cancelable: true,
+        dataTransfer: transfer,
+      }));
+    })()`,
+  );
 }
 
 async function waitForStartup(webSocketUrl) {
@@ -105,6 +188,9 @@ const electronExecutable = path.join(
 );
 const profile = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-smoke-"));
 const testApplicationDirectory = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-app-"));
+const damagedPdfPath = path.join(testApplicationDirectory, "damaged.pdf");
+await writeFile(damagedPdfPath, "%PDF-1.7\ninvalid");
+const fixturePath = path.join(projectRoot, "data", "qa-sample.pdf");
 const port = await reservePort();
 let receivedModelRequest;
 let receivedEmbeddingRequest;
@@ -164,6 +250,39 @@ try {
   const state = await waitForStartup(page.webSocketDebuggerUrl);
   assert.equal(state.apiType, "object", `preload API is ${state.apiType}`);
   assert.match(state.text, /选择 PDF/, "the startup screen is blank");
+  assert.match(state.text, /书库/, "the Library screen is unavailable");
+  const initialLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
+  assert.deepEqual(initialLibrary, [], "the isolated Library is not empty");
+  await dropSmokeFile(page.webSocketDebuggerUrl, fixturePath);
+  const readerText = await waitForText(page.webSocketDebuggerUrl, "qa-sample");
+  assert.match(readerText, /AI 助手/, "dropping a valid PDF did not open the reading workspace");
+  const populatedLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
+  assert.match(populatedLibrary[0].id, /^[a-f0-9]{64}$/, "the PDF content fingerprint is invalid");
+  assert.equal(populatedLibrary[0].title, "qa-sample", "the fallback PDF title is invalid");
+  assert.equal(populatedLibrary[0].pageCount, 1, "the PDF page count is invalid");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `document.querySelector('[aria-label="返回书库"]')?.click()`,
+  );
+  const libraryText = await waitForText(page.webSocketDebuggerUrl, "共 1 本 PDF 书籍");
+  assert.match(libraryText, /读至第 1 页/, "the Library book card is incomplete");
+  await dropSmokeFile(page.webSocketDebuggerUrl, fixturePath);
+  await waitForText(page.webSocketDebuggerUrl, "AI 助手");
+  const deduplicatedLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
+  assert.equal(deduplicatedLibrary[0].id, populatedLibrary[0].id, "the content fingerprint changed for the same PDF");
+  assert.equal(deduplicatedLibrary.length, 1, "opening the same PDF created a duplicate Library record");
+  assert.equal(deduplicatedLibrary[0].currentPage, 1, "the initial recent page is invalid");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `document.querySelector('[aria-label="返回书库"]')?.click()`,
+  );
+  await waitForText(page.webSocketDebuggerUrl, "共 1 本 PDF 书籍");
+  await dropSmokeFile(page.webSocketDebuggerUrl, damagedPdfPath);
+  const damagedText = await waitForText(page.webSocketDebuggerUrl, "无法解析此 PDF 文件");
+  assert.match(damagedText, /文件可能已损坏/, "the damaged PDF error is not shown in Chinese");
+  const libraryAfterFailure = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
+  assert.equal(libraryAfterFailure.length, 1, "a damaged PDF changed the Library");
+  assert.equal(libraryAfterFailure[0].id, populatedLibrary[0].id, "a damaged PDF replaced the Library record");
   const modelConnection = await evaluate(
     page.webSocketDebuggerUrl,
     `window.pdfMuse.getModelConnection()`,
