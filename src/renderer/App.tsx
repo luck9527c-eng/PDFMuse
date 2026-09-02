@@ -28,11 +28,13 @@ import type {
   LibraryBook,
   OpenedPdfBook,
   OpenPdfBookResult,
+  ReadingState,
   StartupPreflight,
 } from "../shared/contracts";
 import { IconButton } from "./components/IconButton";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PdfViewer, type OutlineNode, type PdfViewerHandle, type ViewerState } from "./pdf/PdfViewer";
+import { createReadingStateWriter } from "./reading-state-persistence";
 
 type Passage = { text: string; x: number; y: number };
 type Message = { role: "reader" | "assistant"; body: string };
@@ -78,20 +80,24 @@ type LibraryViewProps = {
   books: LibraryBook[];
   error: string;
   loading: boolean;
+  unavailableBookId?: string;
   warnings: string[];
   onChoose(): Promise<void>;
   onDropFile(file?: File): Promise<void>;
   onOpenBook(bookId: string): Promise<void>;
+  onRelocate(bookId: string): Promise<void>;
 };
 
 function LibraryView({
   books,
   error,
   loading,
+  unavailableBookId,
   warnings,
   onChoose,
   onDropFile,
   onOpenBook,
+  onRelocate,
 }: LibraryViewProps) {
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -136,7 +142,14 @@ function LibraryView({
             <button className="primary-command" disabled={busy} onClick={() => void run(onChoose)}><FilePlus2 size={17} />选择 PDF</button>
           </div>
 
-          {error && <div className="library-error" role="alert">{error}</div>}
+          {error && (
+            <div className="library-error" role="alert">
+              <span>{error}</span>
+              {unavailableBookId && (
+                <button className="secondary-command" disabled={busy} onClick={() => void run(() => onRelocate(unavailableBookId))}>重新定位原文件</button>
+              )}
+            </div>
+          )}
 
           {loading ? (
             <div className="library-loading">正在读取书库...</div>
@@ -184,13 +197,41 @@ function LibraryView({
 export function App() {
   const viewerRef = useRef<PdfViewerHandle>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
-  const persistedPageRef = useRef(1);
+  const startupRestoreStartedRef = useRef(false);
+  const readingStateRef = useRef<ReadingState>({
+    page: 1,
+    scrollTop: 0,
+    zoomMode: "page-width",
+    zoomScale: 100,
+    leftSidebarOpen: true,
+    rightSidebarOpen: true,
+  });
+  const leftOpenRef = useRef(true);
+  const rightOpenRef = useRef(true);
+  const stateWriterRef = useRef<ReturnType<typeof createReadingStateWriter<{
+    bookId: string;
+    state: ReadingState;
+  }>> | null>(null);
+  if (!stateWriterRef.current) {
+    stateWriterRef.current = createReadingStateWriter(({ bookId, state }) => {
+      void window.pdfMuse?.updateLibraryBookState(bookId, state).catch(() => undefined);
+    });
+  }
   const [preflight, setPreflight] = useState<StartupPreflight>();
+  const [startupReady, setStartupReady] = useState(false);
   const [book, setBook] = useState<OpenedPdfBook>();
   const [libraryBooks, setLibraryBooks] = useState<LibraryBook[]>([]);
   const [libraryError, setLibraryError] = useState("");
+  const [unavailableBookId, setUnavailableBookId] = useState<string>();
   const [libraryLoading, setLibraryLoading] = useState(true);
-  const [viewerState, setViewerState] = useState<ViewerState>({ page: 1, pages: 0, scale: 100, outline: [] });
+  const [viewerState, setViewerState] = useState<ViewerState>({
+    page: 1,
+    pages: 0,
+    scale: 100,
+    scrollTop: 0,
+    zoomMode: "page-width",
+    outline: [],
+  });
   const [viewerError, setViewerError] = useState("");
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
@@ -220,10 +261,6 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (preflight?.ok) void refreshLibrary();
-  }, [preflight, refreshLibrary]);
-
-  useEffect(() => {
     const demoRequested = import.meta.env.DEV && new URLSearchParams(window.location.search).has("demo");
     if (window.pdfMuse || !demoRequested) return;
 
@@ -237,6 +274,14 @@ export function App() {
           path: "data/qa-sample.pdf",
           pageCount: 1,
           currentPage: 1,
+          readingState: {
+            page: 1,
+            scrollTop: 0,
+            zoomMode: "page-width",
+            zoomScale: 100,
+            leftSidebarOpen: true,
+            rightSidebarOpen: true,
+          },
           bytes,
         });
       })
@@ -272,18 +317,62 @@ export function App() {
   }, [book]);
 
   const activateBook = useCallback((openedBook: OpenedPdfBook) => {
-    persistedPageRef.current = openedBook.currentPage;
-    setViewerState({ page: openedBook.currentPage, pages: openedBook.pageCount, scale: 100, outline: [] });
+    stateWriterRef.current?.flush();
+    readingStateRef.current = openedBook.readingState;
+    leftOpenRef.current = openedBook.readingState.leftSidebarOpen;
+    rightOpenRef.current = openedBook.readingState.rightSidebarOpen;
+    setViewerState({
+      page: openedBook.readingState.page,
+      pages: openedBook.pageCount,
+      scale: openedBook.readingState.zoomScale,
+      scrollTop: openedBook.readingState.scrollTop,
+      zoomMode: openedBook.readingState.zoomMode,
+      outline: [],
+    });
+    setLeftOpen(openedBook.readingState.leftSidebarOpen);
+    setRightOpen(openedBook.readingState.rightSidebarOpen);
     setBook(openedBook);
     setViewerError("");
     setLibraryError("");
+    setUnavailableBookId(undefined);
     setMessages([]);
   }, []);
 
-  const handleOpenResult = useCallback((result: OpenPdfBookResult) => {
+  const handleOpenResult = useCallback((result: OpenPdfBookResult, attemptedBookId?: string) => {
     if (result.ok) activateBook(result.book);
-    else setLibraryError(result.message);
+    else {
+      setLibraryError(result.message);
+      const canRelocate = result.code === "FILE_UNAVAILABLE" || result.code === "CONTENT_CHANGED";
+      setUnavailableBookId(canRelocate ? result.bookId ?? attemptedBookId : undefined);
+    }
   }, [activateBook]);
+
+  useEffect(() => {
+    if (!preflight?.ok || startupRestoreStartedRef.current) return;
+    startupRestoreStartedRef.current = true;
+    void (async () => {
+      if (!window.pdfMuse) {
+        await refreshLibrary();
+        setStartupReady(true);
+        return;
+      }
+      try {
+        const result = await window.pdfMuse.openRecentLibraryBook();
+        if (result?.ok) activateBook(result.book);
+        else {
+          if (result) handleOpenResult(result);
+          await refreshLibrary();
+        }
+      } catch {
+        setLibraryError("无法恢复最近阅读的书籍，已返回书库。");
+        await refreshLibrary();
+      } finally {
+        setStartupReady(true);
+      }
+    })();
+  }, [activateBook, handleOpenResult, preflight, refreshLibrary]);
+
+  useEffect(() => () => stateWriterRef.current?.flush(), []);
 
   const openBook = useCallback(async () => {
     if (!window.pdfMuse) return;
@@ -314,27 +403,59 @@ export function App() {
   const openLibraryBook = useCallback(async (bookId: string) => {
     if (!window.pdfMuse) return;
     try {
-      handleOpenResult(await window.pdfMuse.openLibraryBook(bookId));
+      handleOpenResult(await window.pdfMuse.openLibraryBook(bookId), bookId);
     } catch {
       setLibraryError("无法打开这本 PDF 书籍，请重试。");
     }
   }, [handleOpenResult]);
 
+  const relocateLibraryBook = useCallback(async (bookId: string) => {
+    if (!window.pdfMuse) return;
+    try {
+      const result = await window.pdfMuse.relocateLibraryBook(bookId);
+      if (result) handleOpenResult(result, bookId);
+    } catch {
+      setLibraryError("无法重新定位这本 PDF 书籍，请重试。");
+    }
+  }, [handleOpenResult]);
+
   const showLibrary = useCallback(() => {
+    stateWriterRef.current?.flush();
     setBook(undefined);
     setViewerError("");
     setPassage(undefined);
     setLibraryError("");
+    setUnavailableBookId(undefined);
     setLibraryLoading(true);
     void refreshLibrary();
   }, [refreshLibrary]);
 
   const handleViewerState = useCallback((state: ViewerState) => {
     setViewerState(state);
-    if (!book || state.page === persistedPageRef.current) return;
-    persistedPageRef.current = state.page;
-    void window.pdfMuse?.updateLibraryBookPage(book.id, state.page);
+    if (!book) return;
+    const readingState: ReadingState = {
+      page: state.page,
+      scrollTop: state.scrollTop,
+      zoomMode: state.zoomMode,
+      zoomScale: state.scale,
+      leftSidebarOpen: leftOpenRef.current,
+      rightSidebarOpen: rightOpenRef.current,
+    };
+    readingStateRef.current = readingState;
+    stateWriterRef.current?.schedule({ bookId: book.id, state: readingState });
   }, [book]);
+
+  useEffect(() => {
+    leftOpenRef.current = leftOpen;
+    rightOpenRef.current = rightOpen;
+    if (!book) return;
+    readingStateRef.current = {
+      ...readingStateRef.current,
+      leftSidebarOpen: leftOpen,
+      rightSidebarOpen: rightOpen,
+    };
+    stateWriterRef.current?.schedule({ bookId: book.id, state: readingStateRef.current });
+  }, [book, leftOpen, rightOpen]);
 
   const explain = useCallback((text: string) => {
     setAttachedPassage(text);
@@ -378,8 +499,9 @@ export function App() {
       </main>
     );
   }
+  if (!startupReady) return <div className="boot-state">正在恢复最近阅读...</div>;
   if (!book) {
-    return <LibraryView books={libraryBooks} error={libraryError} loading={libraryLoading} warnings={preflight.warnings} onChoose={openBook} onDropFile={openDroppedBook} onOpenBook={openLibraryBook} />;
+    return <LibraryView books={libraryBooks} error={libraryError} loading={libraryLoading} unavailableBookId={unavailableBookId} warnings={preflight.warnings} onChoose={openBook} onDropFile={openDroppedBook} onOpenBook={openLibraryBook} onRelocate={relocateLibraryBook} />;
   }
 
   return (

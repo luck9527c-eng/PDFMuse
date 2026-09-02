@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -28,7 +28,7 @@ async function waitForPage(port) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/json`);
       const targets = await response.json();
-      const page = targets.find((target) => target.type === "page" && target.title === "PDFMuse");
+      const page = targets.find((target) => target.type === "page" && target.webSocketDebuggerUrl);
       if (page?.webSocketDebuggerUrl) return page;
     } catch {
       // Electron has not exposed the debugging endpoint yet.
@@ -155,13 +155,17 @@ async function dropSmokeFile(webSocketUrl, filePath) {
 
 async function waitForStartup(webSocketUrl) {
   const deadline = Date.now() + 8_000;
-  let state = { apiType: "undefined", text: "" };
+  let state = { apiType: "undefined", text: "", ready: false };
   while (Date.now() < deadline) {
     state = await evaluate(
       webSocketUrl,
-      `({ apiType: typeof window.pdfMuse, text: document.body.innerText })`,
+      `({
+        apiType: typeof window.pdfMuse,
+        text: document.body.innerText,
+        ready: Boolean(document.querySelector('.library-view, .workspace')),
+      })`,
     );
-    if (state.apiType === "object" && /选择 PDF/.test(state.text)) return state;
+    if (state.apiType === "object" && state.ready) return state;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   return state;
@@ -190,8 +194,8 @@ const profile = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-smoke-"));
 const testApplicationDirectory = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-app-"));
 const damagedPdfPath = path.join(testApplicationDirectory, "damaged.pdf");
 await writeFile(damagedPdfPath, "%PDF-1.7\ninvalid");
-const fixturePath = path.join(projectRoot, "data", "qa-sample.pdf");
-const port = await reservePort();
+const fixturePath = path.join(testApplicationDirectory, "smoke-book.pdf");
+await copyFile(path.join(projectRoot, "src", "main", "fixtures", "three-page.pdf"), fixturePath);
 let receivedModelRequest;
 let receivedEmbeddingRequest;
 const modelServer = createServer((request, response) => {
@@ -226,46 +230,67 @@ if (!modelAddress || typeof modelAddress === "string") {
   throw new Error("Local model server did not expose a port.");
 }
 const modelBaseUrl = `http://127.0.0.1:${modelAddress.port}/v1`;
-const child = spawn(
-  electronExecutable,
-  [".", `--remote-debugging-port=${port}`, "--headless", "--disable-gpu", `--user-data-dir=${profile}`],
-  {
-    cwd: projectRoot,
-    env: {
-      ...process.env,
-      ELECTRON_DISABLE_SECURITY_WARNINGS: "true",
-      PDFMUSE_TEST_APPLICATION_DIRECTORY: testApplicationDirectory,
-      VITE_DEV_SERVER_URL: "",
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  },
-);
-
 let diagnostics = "";
-child.stdout.on("data", (chunk) => { diagnostics += chunk; });
-child.stderr.on("data", (chunk) => { diagnostics += chunk; });
+
+function launchElectron(port) {
+  const process = spawn(
+    electronExecutable,
+    [".", `--remote-debugging-port=${port}`, "--headless", "--disable-gpu", `--user-data-dir=${profile}`],
+    {
+      cwd: projectRoot,
+      env: {
+        ...globalThis.process.env,
+        ELECTRON_DISABLE_SECURITY_WARNINGS: "true",
+        PDFMUSE_TEST_APPLICATION_DIRECTORY: testApplicationDirectory,
+        VITE_DEV_SERVER_URL: "",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  process.stdout.on("data", (chunk) => { diagnostics += chunk; });
+  process.stderr.on("data", (chunk) => { diagnostics += chunk; });
+  return process;
+}
+
+async function stopElectron(process) {
+  if (!process || process.exitCode !== null) return;
+  process.kill();
+  if (globalThis.process.platform === "win32" && process.pid) {
+    spawnSync("taskkill", ["/pid", String(process.pid), "/t", "/f"], { stdio: "ignore" });
+  }
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 1_000);
+    process.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+let port = await reservePort();
+let child = launchElectron(port);
 
 try {
-  const page = await waitForPage(port);
-  const state = await waitForStartup(page.webSocketDebuggerUrl);
+  let page = await waitForPage(port);
+  let state = await waitForStartup(page.webSocketDebuggerUrl);
   assert.equal(state.apiType, "object", `preload API is ${state.apiType}`);
   assert.match(state.text, /选择 PDF/, "the startup screen is blank");
   assert.match(state.text, /书库/, "the Library screen is unavailable");
   const initialLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
   assert.deepEqual(initialLibrary, [], "the isolated Library is not empty");
   await dropSmokeFile(page.webSocketDebuggerUrl, fixturePath);
-  const readerText = await waitForText(page.webSocketDebuggerUrl, "qa-sample");
+  const readerText = await waitForText(page.webSocketDebuggerUrl, "PDFMuse Three Page Fixture");
   assert.match(readerText, /AI 助手/, "dropping a valid PDF did not open the reading workspace");
   const populatedLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
   assert.match(populatedLibrary[0].id, /^[a-f0-9]{64}$/, "the PDF content fingerprint is invalid");
-  assert.equal(populatedLibrary[0].title, "qa-sample", "the fallback PDF title is invalid");
-  assert.equal(populatedLibrary[0].pageCount, 1, "the PDF page count is invalid");
+  assert.equal(populatedLibrary[0].title, "PDFMuse Three Page Fixture", "the PDF metadata title is invalid");
+  assert.equal(populatedLibrary[0].pageCount, 3, "the PDF page count is invalid");
   await evaluate(
     page.webSocketDebuggerUrl,
     `document.querySelector('[aria-label="返回书库"]')?.click()`,
   );
   const libraryText = await waitForText(page.webSocketDebuggerUrl, "共 1 本 PDF 书籍");
-  assert.match(libraryText, /读至第 1 页/, "the Library book card is incomplete");
+  assert.match(libraryText, /读至第 1 页，共 3 页/, "the Library book card is incomplete");
   await dropSmokeFile(page.webSocketDebuggerUrl, fixturePath);
   await waitForText(page.webSocketDebuggerUrl, "AI 助手");
   const deduplicatedLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
@@ -409,16 +434,120 @@ try {
     })`,
   );
   assert.deepEqual(visibleTooltipsOnHover, ["关闭设置"], "icon tooltip is unavailable on pointer hover");
-  console.log("Electron smoke test passed: startup UI and preload API are available.");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `document.querySelector('[aria-label="关闭设置"]')?.click()`,
+  );
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `document.querySelector('[aria-label^="打开《"]')?.click()`,
+  );
+  await waitForText(page.webSocketDebuggerUrl, "PDFMuse Three Page Fixture");
+  const expectedReadingState = await evaluate(
+    page.webSocketDebuggerUrl,
+    `new Promise((resolve, reject) => {
+      const deadline = Date.now() + 1800;
+      const applyReadingState = () => {
+        const pagesReady = document.querySelector('.page-control span')?.textContent?.includes('3')
+          && !document.querySelector('.viewer-loading');
+        if (!pagesReady) {
+          if (Date.now() >= deadline) return reject(new Error('PDF pages did not become ready'));
+          setTimeout(applyReadingState, 50);
+          return;
+        }
+        const zoom = document.querySelector('[aria-label="放大"]');
+        zoom?.click();
+        zoom?.click();
+        zoom?.click();
+        document.querySelector('[aria-label="收起目录"]')?.click();
+        document.querySelector('[aria-label="收起 AI 助手"]')?.click();
+        const container = document.querySelector('.pdf-container');
+        container.scrollTop = Math.min(80, container.scrollHeight - container.clientHeight);
+        container.dispatchEvent(new Event('scroll'));
+        setTimeout(() => resolve({
+          scrollTop: container.scrollTop,
+          scale: Number(document.querySelector('.zoom-value')?.textContent?.replace('%', '')),
+        }), 700);
+      };
+      applyReadingState();
+    })`,
+  );
+  const savedReadingState = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.openLibraryBook(${JSON.stringify(populatedLibrary[0].id)}).then(
+      (result) => result.ok ? result.book.readingState : result
+    )`,
+  );
+  assert.equal(savedReadingState.zoomMode, "custom", "custom zoom mode was not persisted");
+  assert.equal(savedReadingState.zoomScale, expectedReadingState.scale, "custom zoom scale was not persisted");
+  assert.equal(savedReadingState.scrollTop, expectedReadingState.scrollTop, "scroll position was not persisted");
+  assert.equal(savedReadingState.leftSidebarOpen, false, "left sidebar state was not persisted");
+  assert.equal(savedReadingState.rightSidebarOpen, false, "right sidebar state was not persisted");
+  const secondPageScrollTop = await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => {
+      const container = document.querySelector('.pdf-container');
+      return Math.min(1200, container.scrollHeight - container.clientHeight);
+    })()`,
+  );
+  assert.equal(typeof secondPageScrollTop, "number", "the second PDF page has no scroll position");
+  const secondPageCheckpoint = {
+    ...savedReadingState,
+    page: 2,
+    scrollTop: secondPageScrollTop,
+  };
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.updateLibraryBookState(
+      ${JSON.stringify(populatedLibrary[0].id)},
+      ${JSON.stringify(secondPageCheckpoint)}
+    )`,
+  );
+  const confirmedPage = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.openLibraryBook(${JSON.stringify(populatedLibrary[0].id)}).then(
+      (result) => result.ok ? result.book.readingState.page : 0
+    )`,
+  );
+  assert.equal(confirmedPage, 2, "a non-initial page checkpoint was not persisted through IPC");
+
+  await stopElectron(child);
+  port = await reservePort();
+  child = launchElectron(port);
+  page = await waitForPage(port);
+  state = await waitForStartup(page.webSocketDebuggerUrl);
+  assert.match(state.text, /PDFMuse Three Page Fixture/, "the most recent PDF was not reopened after restart");
+  const restoredUi = await evaluate(
+    page.webSocketDebuggerUrl,
+    `new Promise((resolve) => setTimeout(() => resolve({
+      scrollTop: document.querySelector('.pdf-container')?.scrollTop,
+      page: Number(document.querySelector('[aria-label="当前页"]')?.value),
+      scale: Number(document.querySelector('.zoom-value')?.textContent?.replace('%', '')),
+      expandLeft: Boolean(document.querySelector('[aria-label="展开目录"]')),
+      expandRight: Boolean(document.querySelector('[aria-label="展开 AI 助手"]')),
+    }), 500))`,
+  );
+  assert.equal(restoredUi.page, 2, "the second page was not restored in the Viewer");
+  assert.equal(restoredUi.scale, expectedReadingState.scale, "the zoom scale was not restored in the Viewer");
+  assert.equal(restoredUi.scrollTop, secondPageCheckpoint.scrollTop, "the scroll position was not restored in the Viewer");
+  assert.equal(restoredUi.expandLeft, true, "the collapsed left sidebar was not restored");
+  assert.equal(restoredUi.expandRight, true, "the collapsed right sidebar was not restored");
+
+  await stopElectron(child);
+  await unlink(fixturePath);
+  port = await reservePort();
+  child = launchElectron(port);
+  page = await waitForPage(port);
+  state = await waitForStartup(page.webSocketDebuggerUrl);
+  assert.match(state.text, /PDF 原文件暂时不可用/, "a missing recent PDF did not return to the Library");
+  assert.match(state.text, /重新定位原文件/, "the missing PDF cannot be relocated from the Library");
+  console.log("Electron smoke test passed: Library, settings, and reading state recovery are available.");
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   if (diagnostics.trim()) console.error(diagnostics.trim());
   process.exitCode = 1;
 } finally {
-  child.kill();
-  if (process.platform === "win32" && child.pid) {
-    spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
-  }
+  await stopElectron(child);
   await new Promise((resolve, reject) => {
     modelServer.close((error) => error ? reject(error) : resolve());
   });

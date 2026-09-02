@@ -135,7 +135,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .library-heading { max-width: 1180px; margin: 0 auto 30px; display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; }
 .library-heading h1 { margin: 0 0 5px; font-size: 26px; font-weight: 600; line-height: 1.2; }
 .library-heading p { margin: 0; color: var(--muted); font-size: 11px; }
-.library-error { max-width: 1180px; margin: -13px auto 24px; padding: 10px 12px; border-left: 3px solid var(--coral); background: #f6e7e3; color: #8d3f37; font-size: 11px; line-height: 1.55; }
+.library-error { max-width: 1180px; margin: -13px auto 24px; padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-left: 3px solid var(--coral); background: #f6e7e3; color: #8d3f37; font-size: 11px; line-height: 1.55; }
+.library-error .secondary-command { flex: none; height: 32px; color: var(--ink); }
 .library-loading { min-height: 280px; display: grid; place-items: center; color: var(--muted); font-size: 12px; }
 .library-empty { min-height: min(460px, calc(100vh - 220px)); display: grid; place-content: center; justify-items: center; padding: 30px; border: 1px dashed #c8c5bb; text-align: center; }
 .empty-icon { width: 62px; height: 62px; display: grid; place-items: center; border: 1px solid #c7d7cd; border-radius: 8px; background: var(--green-soft); color: var(--green); }

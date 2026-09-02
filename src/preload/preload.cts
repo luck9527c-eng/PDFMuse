@@ -12,8 +12,10 @@ const api: PDFMuseApi = {
     }
     return ipcRenderer.invoke("library:open-path", webUtils.getPathForFile(file));
   },
+  openRecentLibraryBook: () => ipcRenderer.invoke("library:open-recent"),
   openLibraryBook: (bookId) => ipcRenderer.invoke("library:open-known", bookId),
-  updateLibraryBookPage: (bookId, page) => ipcRenderer.invoke("library:update-page", bookId, page),
+  relocateLibraryBook: (bookId) => ipcRenderer.invoke("library:relocate", bookId),
+  updateLibraryBookState: (bookId, state) => ipcRenderer.invoke("library:update-state", bookId, state),
   getModelConnection: () => ipcRenderer.invoke("model-connection:get"),
   saveModelConnection: (input) => ipcRenderer.invoke("model-connection:save", input),
   testModelConnection: (input) => ipcRenderer.invoke("model-connection:test", input),

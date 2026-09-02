@@ -9,6 +9,8 @@ import type {
   LibraryBook,
   OpenedPdfBook,
   OpenPdfBookResult,
+  ReadingState,
+  ReadingZoomMode,
 } from "../shared/contracts.js";
 
 type BookRow = {
@@ -18,8 +20,18 @@ type BookRow = {
   current_path: string;
   page_count: number;
   current_page: number;
+  scroll_top: number;
+  zoom_mode: ReadingZoomMode;
+  zoom_scale: number;
+  left_sidebar_open: number;
+  right_sidebar_open: number;
   updated_at: string;
 };
+
+const readingColumns = `
+  id, title, file_name, current_path, page_count, current_page,
+  scroll_top, zoom_mode, zoom_scale, left_sidebar_open, right_sidebar_open, updated_at
+`;
 
 function toLibraryBook(row: BookRow): LibraryBook {
   return {
@@ -40,8 +52,35 @@ function fingerprint(bytes: Uint8Array) {
 function failure(
   code: Extract<OpenPdfBookResult, { ok: false }>["code"],
   message: string,
+  bookId?: string,
 ): OpenPdfBookResult {
-  return { ok: false, code, message };
+  return { ok: false, code, message, ...(bookId ? { bookId } : {}) };
+}
+
+function toReadingState(row: BookRow): ReadingState {
+  return {
+    page: row.current_page,
+    scrollTop: row.scroll_top,
+    zoomMode: row.zoom_mode,
+    zoomScale: row.zoom_scale,
+    leftSidebarOpen: row.left_sidebar_open === 1,
+    rightSidebarOpen: row.right_sidebar_open === 1,
+  };
+}
+
+function isZoomMode(value: unknown): value is ReadingZoomMode {
+  return value === "page-width" || value === "page-fit" || value === "custom";
+}
+
+function isReadingState(value: unknown): value is ReadingState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<ReadingState>;
+  return Number.isSafeInteger(state.page)
+    && typeof state.scrollTop === "number" && Number.isFinite(state.scrollTop)
+    && isZoomMode(state.zoomMode)
+    && typeof state.zoomScale === "number" && Number.isFinite(state.zoomScale)
+    && typeof state.leftSidebarOpen === "boolean"
+    && typeof state.rightSidebarOpen === "boolean";
 }
 
 async function inspectPdf(bytes: Uint8Array, fallbackTitle: string) {
@@ -76,11 +115,32 @@ export function createLibraryModule(dataHome: string) {
       current_path TEXT NOT NULL,
       page_count INTEGER NOT NULL CHECK (page_count > 0),
       current_page INTEGER NOT NULL DEFAULT 1 CHECK (current_page > 0),
+      scroll_top REAL NOT NULL DEFAULT 0 CHECK (scroll_top >= 0),
+      zoom_mode TEXT NOT NULL DEFAULT 'page-width',
+      zoom_scale REAL NOT NULL DEFAULT 100 CHECK (zoom_scale > 0),
+      left_sidebar_open INTEGER NOT NULL DEFAULT 1 CHECK (left_sidebar_open IN (0, 1)),
+      right_sidebar_open INTEGER NOT NULL DEFAULT 1 CHECK (right_sidebar_open IN (0, 1)),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
-    PRAGMA user_version = 1;
   `);
+
+  const existingColumns = new Set(
+    (database.prepare("PRAGMA table_info(library_books)").all() as { name: string }[])
+      .map((column) => column.name),
+  );
+  const migrations = [
+    ["scroll_top", "ALTER TABLE library_books ADD COLUMN scroll_top REAL NOT NULL DEFAULT 0"],
+    ["zoom_mode", "ALTER TABLE library_books ADD COLUMN zoom_mode TEXT NOT NULL DEFAULT 'page-width'"],
+    ["zoom_scale", "ALTER TABLE library_books ADD COLUMN zoom_scale REAL NOT NULL DEFAULT 100"],
+    ["left_sidebar_open", "ALTER TABLE library_books ADD COLUMN left_sidebar_open INTEGER NOT NULL DEFAULT 1"],
+    ["right_sidebar_open", "ALTER TABLE library_books ADD COLUMN right_sidebar_open INTEGER NOT NULL DEFAULT 1"],
+  ] as const;
+  for (const [column, statement] of migrations) {
+    if (!existingColumns.has(column)) database.exec(statement);
+  }
+  const schemaVersion = database.prepare("PRAGMA user_version").get() as { user_version: number };
+  if (schemaVersion.user_version < 2) database.exec("PRAGMA user_version = 2;");
 
   const listStatement = database.prepare(`
     SELECT id, title, file_name, current_path, page_count, current_page, updated_at
@@ -88,9 +148,12 @@ export function createLibraryModule(dataHome: string) {
     ORDER BY updated_at DESC, id ASC
   `);
   const findStatement = database.prepare(`
-    SELECT id, title, file_name, current_path, page_count, current_page, updated_at
+    SELECT ${readingColumns}
     FROM library_books
     WHERE id = ?
+  `);
+  const recentStatement = database.prepare(`
+    SELECT id FROM library_books ORDER BY updated_at DESC, id ASC LIMIT 1
   `);
   const upsertStatement = database.prepare(`
     INSERT INTO library_books (
@@ -106,9 +169,18 @@ export function createLibraryModule(dataHome: string) {
   const touchStatement = database.prepare(`
     UPDATE library_books SET updated_at = ? WHERE id = ?
   `);
-  const updatePageStatement = database.prepare(`
+  const relocateStatement = database.prepare(`
+    UPDATE library_books SET file_name = ?, current_path = ?, updated_at = ? WHERE id = ?
+  `);
+  const updateStateStatement = database.prepare(`
     UPDATE library_books
-    SET current_page = MIN(MAX(?, 1), page_count), updated_at = ?
+    SET current_page = MIN(MAX(?, 1), page_count),
+        scroll_top = MAX(?, 0),
+        zoom_mode = ?,
+        zoom_scale = MIN(MAX(?, 25), 500),
+        left_sidebar_open = ?,
+        right_sidebar_open = ?,
+        updated_at = ?
     WHERE id = ?
   `);
 
@@ -116,12 +188,14 @@ export function createLibraryModule(dataHome: string) {
     filePath: string,
     bytes: Uint8Array,
     expectedFingerprint?: string,
+    relocate = false,
   ): Promise<OpenPdfBookResult> {
     const contentFingerprint = fingerprint(bytes);
     if (expectedFingerprint && contentFingerprint !== expectedFingerprint) {
       return failure(
         "CONTENT_CHANGED",
         "此路径中的 PDF 内容已经变化。原书籍记录保持不变，请重新选择该文件。",
+        expectedFingerprint,
       );
     }
 
@@ -148,6 +222,8 @@ export function createLibraryModule(dataHome: string) {
         now,
         now,
       );
+    } else if (relocate) {
+      relocateStatement.run(fileName, filePath, now, contentFingerprint);
     } else {
       touchStatement.run(now, contentFingerprint);
     }
@@ -158,6 +234,7 @@ export function createLibraryModule(dataHome: string) {
       path: row.current_path,
       pageCount: row.page_count,
       currentPage: row.current_page,
+      readingState: toReadingState(row),
       bytes,
     };
     return { ok: true, book: opened };
@@ -187,22 +264,56 @@ export function createLibraryModule(dataHome: string) {
         return failure("FILE_UNAVAILABLE", "书库记录无效，无法打开此 PDF 书籍。");
       }
       const row = findStatement.get(bookId) as BookRow | undefined;
-      if (!row) return failure("FILE_UNAVAILABLE", "书库中没有找到此 PDF 书籍。");
+      if (!row) return failure("FILE_UNAVAILABLE", "书库中没有找到此 PDF 书籍。", bookId);
       let bytes: Uint8Array;
       try {
         bytes = new Uint8Array(await readFile(row.current_path));
       } catch {
-        return failure("FILE_UNAVAILABLE", "PDF 原文件暂时不可用，书库记录已保留。");
+        return failure("FILE_UNAVAILABLE", "PDF 原文件暂时不可用，书库记录已保留。你可以重新定位原文件。", bookId);
       }
       return openBytes(row.current_path, bytes, row.id);
     },
 
-    updateCurrentPage(bookId: unknown, page: unknown) {
+    async openRecent(): Promise<OpenPdfBookResult | null> {
+      const recent = recentStatement.get() as { id: string } | undefined;
+      return recent ? this.openKnown(recent.id) : null;
+    },
+
+    async relocate(bookId: unknown, inputPath: unknown): Promise<OpenPdfBookResult> {
+      if (typeof bookId !== "string" || !/^[a-f0-9]{64}$/.test(bookId)) {
+        return failure("FILE_UNAVAILABLE", "书库记录无效，无法重新定位此 PDF 书籍。");
+      }
+      if (typeof inputPath !== "string" || path.extname(inputPath).toLowerCase() !== ".pdf") {
+        return failure("INVALID_FILE_TYPE", "请选择对应的 PDF 原文件。", bookId);
+      }
+      if (!findStatement.get(bookId)) {
+        return failure("FILE_UNAVAILABLE", "书库中没有找到此 PDF 书籍。", bookId);
+      }
+      const filePath = path.resolve(inputPath);
+      let bytes: Uint8Array;
+      try {
+        bytes = new Uint8Array(await readFile(filePath));
+      } catch {
+        return failure("FILE_UNAVAILABLE", "无法读取所选 PDF 文件，请检查它是否可访问。", bookId);
+      }
+      return openBytes(filePath, bytes, bookId, true);
+    },
+
+    updateReadingState(bookId: unknown, state: unknown) {
       if (typeof bookId !== "string" || !/^[a-f0-9]{64}$/.test(bookId)
-        || typeof page !== "number" || !Number.isSafeInteger(page)) {
+        || !isReadingState(state)) {
         return;
       }
-      updatePageStatement.run(page, new Date().toISOString(), bookId);
+      updateStateStatement.run(
+        state.page,
+        state.scrollTop,
+        state.zoomMode,
+        state.zoomScale,
+        state.leftSidebarOpen ? 1 : 0,
+        state.rightSidebarOpen ? 1 : 0,
+        new Date().toISOString(),
+        bookId,
+      );
     },
 
     close() {

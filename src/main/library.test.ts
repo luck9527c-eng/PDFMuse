@@ -8,6 +8,7 @@ import { createLibraryModule } from "./library.js";
 
 const workspaces: string[] = [];
 const fixturePath = path.resolve("data", "qa-sample.pdf");
+const multiPageFixturePath = path.resolve("src", "main", "fixtures", "three-page.pdf");
 
 async function createWorkspace() {
   const workspace = await mkdtemp(path.join(tmpdir(), "pdfmuse-library-"));
@@ -43,6 +44,14 @@ describe("Library Module", () => {
         path: sourcePath,
         pageCount: 1,
         currentPage: 1,
+        readingState: {
+          page: 1,
+          scrollTop: 0,
+          zoomMode: "page-width",
+          zoomScale: 100,
+          leftSidebarOpen: true,
+          rightSidebarOpen: true,
+        },
       });
       expect(result.book.bytes).toEqual(new Uint8Array(sourceBefore));
     }
@@ -104,7 +113,7 @@ describe("Library Module", () => {
     library.close();
   });
 
-  it("可以从书库再次打开，并在原文件不可用时保留记录", async () => {
+  it("原文件不可用时保留记录，并只允许用相同内容重新定位", async () => {
     const { workspace, dataHome } = await createWorkspace();
     const sourcePath = path.join(workspace, "可恢复.pdf");
     await copyFile(fixturePath, sourcePath);
@@ -120,8 +129,27 @@ describe("Library Module", () => {
     await expect(library.openKnown(added.book.id)).resolves.toMatchObject({
       ok: false,
       code: "FILE_UNAVAILABLE",
+      bookId: added.book.id,
     });
     expect(library.list()).toHaveLength(1);
+
+    const wrongPath = path.join(workspace, "错误文件.pdf");
+    const relocatedPath = path.join(workspace, "重新定位.pdf");
+    await Promise.all([
+      writeFile(wrongPath, "%PDF-1.7\nother"),
+      copyFile(fixturePath, relocatedPath),
+    ]);
+    await expect(library.relocate(added.book.id, wrongPath)).resolves.toMatchObject({
+      ok: false,
+      code: "CONTENT_CHANGED",
+      bookId: added.book.id,
+    });
+    await expect(library.relocate(added.book.id, relocatedPath)).resolves.toMatchObject({
+      ok: true,
+      book: { id: added.book.id, path: relocatedPath },
+    });
+    expect(library.list()).toHaveLength(1);
+    expect(library.list()[0]?.path).toBe(relocatedPath);
     library.close();
   });
 
@@ -142,17 +170,43 @@ describe("Library Module", () => {
     library.close();
   });
 
-  it("保存并限制书库显示的最近页码", async () => {
+  it("持久化完整阅读状态并在重启后恢复最近书籍", async () => {
     const { workspace, dataHome } = await createWorkspace();
     const sourcePath = path.join(workspace, "页码.pdf");
-    await copyFile(fixturePath, sourcePath);
-    const library = createLibraryModule(dataHome);
+    await copyFile(multiPageFixturePath, sourcePath);
+    let library = createLibraryModule(dataHome);
     const added = await library.openPath(sourcePath);
     if (!added.ok) throw new Error(added.message);
 
-    library.updateCurrentPage(added.book.id, 99);
+    library.updateReadingState(added.book.id, {
+      page: 2,
+      scrollTop: 428.5,
+      zoomMode: "custom",
+      zoomScale: 137.5,
+      leftSidebarOpen: false,
+      rightSidebarOpen: true,
+    });
+    library.close();
 
-    expect(library.list()[0]?.currentPage).toBe(1);
+    library = createLibraryModule(dataHome);
+    const recent = await library.openRecent();
+
+    expect(library.list()[0]?.currentPage).toBe(2);
+    expect(recent).toMatchObject({
+      ok: true,
+      book: {
+        id: added.book.id,
+        readingState: {
+          page: 2,
+          scrollTop: 428.5,
+          zoomMode: "custom",
+          zoomScale: 137.5,
+          leftSidebarOpen: false,
+          rightSidebarOpen: true,
+        },
+      },
+    });
     library.close();
   });
+
 });

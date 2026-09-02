@@ -23,7 +23,19 @@ export type OpenedPdfBook = {
   path: string;
   pageCount: number;
   currentPage: number;
+  readingState: ReadingState;
   bytes: Uint8Array;
+};
+
+export type ReadingZoomMode = "page-width" | "page-fit" | "custom";
+
+export type ReadingState = {
+  page: number;
+  scrollTop: number;
+  zoomMode: ReadingZoomMode;
+  zoomScale: number;
+  leftSidebarOpen: boolean;
+  rightSidebarOpen: boolean;
 };
 
 export type LibraryBook = {
@@ -45,6 +57,7 @@ export type OpenPdfBookResult =
       ok: false;
       code: "INVALID_FILE_TYPE" | "FILE_UNAVAILABLE" | "INVALID_PDF" | "CONTENT_CHANGED";
       message: string;
+      bookId?: string;
     };
 
 export type ModelProtocol = "openai" | "anthropic";
@@ -154,8 +167,10 @@ export interface PDFMuseApi {
   listLibraryBooks(): Promise<LibraryBook[]>;
   choosePdfBook(): Promise<OpenPdfBookResult | null>;
   openDroppedPdf(file: unknown): Promise<OpenPdfBookResult>;
+  openRecentLibraryBook(): Promise<OpenPdfBookResult | null>;
   openLibraryBook(bookId: string): Promise<OpenPdfBookResult>;
-  updateLibraryBookPage(bookId: string, page: number): Promise<void>;
+  relocateLibraryBook(bookId: string): Promise<OpenPdfBookResult | null>;
+  updateLibraryBookState(bookId: string, state: ReadingState): Promise<void>;
   getModelConnection(): Promise<ModelConnectionState>;
   saveModelConnection(input: SaveModelConnectionInput): Promise<SaveModelConnectionResult>;
   testModelConnection(input: TestModelConnectionInput): Promise<TestModelConnectionResult>;

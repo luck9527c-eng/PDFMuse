@@ -14,7 +14,7 @@ import {
 } from "pdfjs-dist/web/pdf_viewer.mjs";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
-import type { OpenedPdfBook } from "../../shared/contracts";
+import type { OpenedPdfBook, ReadingZoomMode } from "../../shared/contracts";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -29,6 +29,8 @@ export type ViewerState = {
   page: number;
   pages: number;
   scale: number;
+  scrollTop: number;
+  zoomMode: ReadingZoomMode;
   outline: OutlineNode[];
 };
 
@@ -89,14 +91,19 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     eventBus: EventBus;
     viewer: PDFViewer;
     findController: PDFFindController;
-    fitMode: "page-width" | "page-fit" | null;
+    fitMode: Exclude<ReadingZoomMode, "custom"> | null;
+    currentPage: number;
   } | null>(null);
   const [loading, setLoading] = useState(true);
 
   useImperativeHandle(ref, () => ({
     goToPage(page) {
-      const viewer = adapterRef.current?.viewer;
-      if (viewer) viewer.currentPageNumber = Math.max(1, Math.min(viewer.pagesCount, page));
+      const adapter = adapterRef.current;
+      if (adapter) {
+        const targetPage = Math.max(1, Math.min(adapter.viewer.pagesCount, page));
+        adapter.currentPage = targetPage;
+        adapter.viewer.currentPageNumber = targetPage;
+      }
     },
     previousPage() {
       adapterRef.current?.viewer.previousPage();
@@ -162,26 +169,50 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       textLayerMode: 1,
     });
     linkService.setViewer(viewer);
-    const adapter = { eventBus, viewer, findController, fitMode: "page-width" as "page-width" | "page-fit" | null };
+    const restoredZoomMode = book.readingState.zoomMode;
+    const adapter = {
+      eventBus,
+      viewer,
+      findController,
+      fitMode: restoredZoomMode === "custom" ? null : restoredZoomMode,
+      currentPage: book.currentPage,
+    };
     adapterRef.current = adapter;
 
     let outline: OutlineNode[] = [];
-    const reportState = () => {
+    const reportState = (page = adapter.currentPage) => {
       onStateChange({
-        page: viewer.currentPageNumber || 1,
+        page,
         pages: viewer.pagesCount || 0,
         scale: Math.round((viewer.currentScale || 1) * 100),
+        scrollTop: container.scrollTop,
+        zoomMode: adapter.fitMode ?? "custom",
         outline,
       });
     };
-    eventBus.on("pagechanging", reportState);
-    eventBus.on("scalechanging", reportState);
-    eventBus.on("pagesinit", () => {
-      viewer.currentScaleValue = adapter.fitMode ?? "page-width";
-      viewer.currentPageNumber = Math.max(1, Math.min(viewer.pagesCount, book.currentPage));
-      setLoading(false);
+    eventBus.on("pagechanging", (event: { pageNumber: number }) => {
+      adapter.currentPage = event.pageNumber;
       reportState();
     });
+    eventBus.on("scalechanging", () => reportState());
+    eventBus.on("pagesinit", () => {
+      if (adapter.fitMode) viewer.currentScaleValue = adapter.fitMode;
+      else viewer.currentScale = book.readingState.zoomScale / 100;
+      adapter.currentPage = Math.max(1, Math.min(viewer.pagesCount, book.currentPage));
+      viewer.currentPageNumber = adapter.currentPage;
+      setLoading(false);
+      requestAnimationFrame(() => {
+        container.scrollTop = book.readingState.scrollTop;
+        reportState();
+      });
+    });
+
+    let scrollFrame = 0;
+    const reportScroll = () => {
+      cancelAnimationFrame(scrollFrame);
+      scrollFrame = requestAnimationFrame(() => reportState());
+    };
+    container.addEventListener("scroll", reportScroll, { passive: true });
 
     let resizeFrame = 0;
     const resizeObserver = new ResizeObserver(() => {
@@ -209,6 +240,8 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       disposed = true;
       resizeObserver.disconnect();
       cancelAnimationFrame(resizeFrame);
+      container.removeEventListener("scroll", reportScroll);
+      cancelAnimationFrame(scrollFrame);
       adapterRef.current = null;
       viewer.cleanup();
       void loadingTask.destroy();

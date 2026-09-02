@@ -75,10 +75,21 @@ app.whenReady().then(async () => {
       return library.openPath(selectedPath);
     });
     ipcMain.handle("library:open-path", (_event, filePath: unknown) => library.openPath(filePath));
+    ipcMain.handle("library:open-recent", () => library.openRecent());
     ipcMain.handle("library:open-known", (_event, bookId: unknown) => library.openKnown(bookId));
+    ipcMain.handle("library:relocate", async (_event, bookId: unknown) => {
+      const result = await dialog.showOpenDialog({
+        title: "重新定位 PDF 原文件",
+        properties: ["openFile"],
+        filters: [{ name: "PDF 文件", extensions: ["pdf"] }],
+      });
+      const selectedPath = result.filePaths[0];
+      if (result.canceled || !selectedPath) return null;
+      return library.relocate(bookId, selectedPath);
+    });
     ipcMain.handle(
-      "library:update-page",
-      (_event, bookId: unknown, page: unknown) => library.updateCurrentPage(bookId, page),
+      "library:update-state",
+      (_event, bookId: unknown, state: unknown) => library.updateReadingState(bookId, state),
     );
     ipcMain.handle("model-connection:get", () => modelConnection.get());
     ipcMain.handle(
