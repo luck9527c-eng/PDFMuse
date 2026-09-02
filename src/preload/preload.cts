@@ -8,6 +8,9 @@ const api: PDFMuseApi = {
   getModelConnection: () => ipcRenderer.invoke("model-connection:get"),
   saveModelConnection: (input) => ipcRenderer.invoke("model-connection:save", input),
   testModelConnection: (input) => ipcRenderer.invoke("model-connection:test", input),
+  getEmbeddingConnection: () => ipcRenderer.invoke("embedding-connection:get"),
+  saveEmbeddingConnection: (input) => ipcRenderer.invoke("embedding-connection:save", input),
+  testEmbeddingConnection: (input) => ipcRenderer.invoke("embedding-connection:test", input),
 };
 
 contextBridge.exposeInMainWorld("pdfMuse", api);

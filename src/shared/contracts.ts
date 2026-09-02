@@ -80,10 +80,58 @@ export type TestModelConnectionResult =
       message: string;
     };
 
+export type EmbeddingConnectionState = {
+  baseUrl: string;
+  model: string;
+  hasApiKey: boolean;
+};
+
+export type SaveEmbeddingConnectionInput = {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+};
+
+export type SaveEmbeddingConnectionResult =
+  | {
+      ok: true;
+      connection: EmbeddingConnectionState;
+    }
+  | {
+      ok: false;
+      code: "VALIDATION_ERROR";
+      message: string;
+    };
+
+export type TestEmbeddingConnectionInput = SaveEmbeddingConnectionInput;
+
+export type TestEmbeddingConnectionResult =
+  | {
+      ok: true;
+      model: string;
+      dimensions: number;
+      message: string;
+    }
+  | {
+      ok: false;
+      code:
+        | "VALIDATION_ERROR"
+        | "AUTHENTICATION_ERROR"
+        | "NETWORK_ERROR"
+        | "TIMEOUT"
+        | "SERVICE_ERROR"
+        | "INVALID_RESPONSE";
+      message: string;
+    };
+
 export interface PDFMuseApi {
   getStartupPreflight(): Promise<StartupPreflight>;
   choosePdfBook(): Promise<OpenedPdfBook | null>;
   getModelConnection(): Promise<ModelConnectionState>;
   saveModelConnection(input: SaveModelConnectionInput): Promise<SaveModelConnectionResult>;
   testModelConnection(input: TestModelConnectionInput): Promise<TestModelConnectionResult>;
+  getEmbeddingConnection(): Promise<EmbeddingConnectionState>;
+  saveEmbeddingConnection(input: SaveEmbeddingConnectionInput): Promise<SaveEmbeddingConnectionResult>;
+  testEmbeddingConnection(input: TestEmbeddingConnectionInput): Promise<TestEmbeddingConnectionResult>;
 }

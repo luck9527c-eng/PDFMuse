@@ -12,10 +12,16 @@ export type StoredAppConfig = {
     model: string;
     apiKey?: string;
   };
+  embedding?: {
+    baseUrl: string;
+    model: string;
+    apiKey?: string;
+  };
   [key: string]: unknown;
 };
 
 export const EMPTY_APP_CONFIG: StoredAppConfig = { version: 2 };
+const updateQueues = new Map<string, Promise<void>>();
 
 type ParseAppConfigOptions = {
   allowLegacyVersion?: boolean;
@@ -34,6 +40,14 @@ function hasValidChatConfig(value: Record<string, unknown>, allowMissingProtocol
     && (value.chat.apiKey === undefined || typeof value.chat.apiKey === "string");
 }
 
+function hasValidEmbeddingConfig(value: Record<string, unknown>) {
+  if (value.embedding === undefined) return true;
+  if (!isRecord(value.embedding)) return false;
+  return typeof value.embedding.baseUrl === "string"
+    && typeof value.embedding.model === "string"
+    && (value.embedding.apiKey === undefined || typeof value.embedding.apiKey === "string");
+}
+
 export function parseAppConfig(
   source: string,
   options: ParseAppConfigOptions = {},
@@ -42,7 +56,8 @@ export function parseAppConfig(
   const isLegacyVersion = isRecord(value) && (value.version === undefined || value.version === 1);
   if (!isRecord(value)
     || (value.version !== 2 && !(options.allowLegacyVersion && isLegacyVersion))
-    || !hasValidChatConfig(value, Boolean(options.allowLegacyVersion && isLegacyVersion))) {
+    || !hasValidChatConfig(value, Boolean(options.allowLegacyVersion && isLegacyVersion))
+    || !hasValidEmbeddingConfig(value)) {
     throw new SyntaxError("Invalid PDFMuse configuration");
   }
 
@@ -85,5 +100,24 @@ export async function writeAppConfig(configPath: string, config: StoredAppConfig
   } catch (error) {
     await unlink(temporaryPath).catch(() => undefined);
     throw error;
+  }
+}
+
+export async function updateAppConfig(
+  configPath: string,
+  update: (current: StoredAppConfig) => StoredAppConfig,
+) {
+  const previous = updateQueues.get(configPath) ?? Promise.resolve();
+  const operation = previous.then(async () => {
+    const next = update(await readAppConfig(configPath));
+    await writeAppConfig(configPath, next);
+    return next;
+  });
+  const tail = operation.then(() => undefined, () => undefined);
+  updateQueues.set(configPath, tail);
+  try {
+    return await operation;
+  } finally {
+    if (updateQueues.get(configPath) === tail) updateQueues.delete(configPath);
   }
 }

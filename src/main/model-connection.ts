@@ -3,7 +3,7 @@ import path from "node:path";
 import {
   readAppConfig,
   type StoredAppConfig,
-  writeAppConfig,
+  updateAppConfig,
 } from "./config-store.js";
 import {
   isModelProtocol,
@@ -106,27 +106,27 @@ export function createModelConnectionModule(
         || (input.clearApiKey !== undefined && typeof input.clearApiKey !== "boolean")) {
         return validationError();
       }
-      const current = await readAppConfig(configPath);
       const baseUrl = input.baseUrl.trim().replace(/\/+$/, "");
       const model = input.model.trim();
       if (!isHttpUrl(baseUrl) || !model) {
         return validationError();
       }
       const apiKey = input.apiKey?.trim();
-      const savedApiKey = input.clearApiKey
-        ? undefined
-        : apiKey || current.chat?.apiKey;
-      const config: StoredAppConfig = {
-        ...current,
-        version: 2,
-        chat: {
-          protocol: input.protocol,
-          baseUrl,
-          model,
-          ...(savedApiKey ? { apiKey: savedApiKey } : {}),
-        },
-      };
-      await writeAppConfig(configPath, config);
+      const config = await updateAppConfig(configPath, (current): StoredAppConfig => {
+        const savedApiKey = input.clearApiKey
+          ? undefined
+          : apiKey || current.chat?.apiKey;
+        return {
+          ...current,
+          version: 2,
+          chat: {
+            protocol: input.protocol,
+            baseUrl,
+            model,
+            ...(savedApiKey ? { apiKey: savedApiKey } : {}),
+          },
+        };
+      });
       return { ok: true, connection: toState(config) };
     },
 

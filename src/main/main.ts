@@ -5,11 +5,14 @@ import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 
 import { preflightDataHome } from "./data-home.js";
+import { createEmbeddingConnectionModule } from "./embedding-connection.js";
 import { createModelConnectionModule } from "./model-connection.js";
 import type {
   OpenedPdfBook,
+  SaveEmbeddingConnectionInput,
   SaveModelConnectionInput,
   StartupPreflight,
+  TestEmbeddingConnectionInput,
   TestModelConnectionInput,
 } from "../shared/contracts.js";
 
@@ -57,6 +60,7 @@ app.whenReady().then(async () => {
   ipcMain.handle("app:get-startup-preflight", () => startupPreflight);
   if (startupPreflight.ok) {
     const modelConnection = createModelConnectionModule(startupPreflight.dataHome);
+    const embeddingConnection = createEmbeddingConnectionModule(startupPreflight.dataHome);
     ipcMain.handle("model-connection:get", () => modelConnection.get());
     ipcMain.handle(
       "model-connection:save",
@@ -65,6 +69,15 @@ app.whenReady().then(async () => {
     ipcMain.handle(
       "model-connection:test",
       (_event, input: TestModelConnectionInput) => modelConnection.test(input),
+    );
+    ipcMain.handle("embedding-connection:get", () => embeddingConnection.get());
+    ipcMain.handle(
+      "embedding-connection:save",
+      (_event, input: SaveEmbeddingConnectionInput) => embeddingConnection.save(input),
+    );
+    ipcMain.handle(
+      "embedding-connection:test",
+      (_event, input: TestEmbeddingConnectionInput) => embeddingConnection.test(input),
     );
   }
   ipcMain.handle("pdf:choose", async (): Promise<OpenedPdfBook | null> => {

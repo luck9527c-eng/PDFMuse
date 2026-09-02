@@ -159,7 +159,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .settings-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .settings-section-heading > div { display: grid; gap: 3px; }
 .settings-section-heading h3 { margin: 0; }
-.settings-section-heading > div > span, .settings-section-disabled p { margin: 0; color: var(--muted); font-size: 10px; }
+.settings-section-heading > div > span { margin: 0; color: var(--muted); font-size: 10px; }
 .saved-key-state { display: inline-flex; align-items: center; gap: 5px; color: var(--green); font-size: 10px; }
 .settings-section label { display: grid; gap: 5px; margin-bottom: 10px; color: var(--muted); font-size: 10px; font-weight: 650; }
 .settings-section input, .settings-section select { height: 36px; padding: 0 9px; border: 1px solid var(--line); border-radius: 5px; color: var(--ink); background: white; font-size: 12px; }
@@ -174,7 +174,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .settings-feedback.success { background: var(--green-soft); color: var(--green); }
 .settings-feedback.error { background: #f6e7e3; color: var(--coral); }
 .settings-feedback.neutral { background: #eeece6; color: var(--muted); }
-.settings-section-disabled { padding-bottom: 2px; }
 .spin { animation: spin 900ms linear infinite; }
 
 @keyframes spin { to { transform: rotate(360deg); } }

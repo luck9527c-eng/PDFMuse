@@ -12,6 +12,7 @@ import {
 import { useEffect, useState } from "react";
 
 import type { ModelConnectionState } from "../../shared/contracts";
+import { EmbeddingConnectionSection } from "./EmbeddingConnectionSection";
 import { IconButton } from "./IconButton";
 
 type Feedback = {
@@ -222,10 +223,7 @@ export function SettingsDialog({ warnings = [] }: { warnings?: string[] }) {
             )}
           </section>
 
-          <section className="settings-section settings-section-disabled">
-            <h3>嵌入模型</h3>
-            <p>嵌入模型连接将在下一个任务中接入。</p>
-          </section>
+          <EmbeddingConnectionSection open={open} />
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>

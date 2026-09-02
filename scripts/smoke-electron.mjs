@@ -107,15 +107,26 @@ const profile = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-smoke-"));
 const testApplicationDirectory = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-app-"));
 const port = await reservePort();
 let receivedModelRequest;
+let receivedEmbeddingRequest;
 const modelServer = createServer((request, response) => {
   const chunks = [];
   request.on("data", (chunk) => chunks.push(chunk));
   request.on("end", () => {
-    receivedModelRequest = {
+    const receivedRequest = {
       url: request.url,
       authorization: request.headers.authorization,
       body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
     };
+    if (request.url?.endsWith("/embeddings")) {
+      receivedEmbeddingRequest = receivedRequest;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        data: [{ index: 0, embedding: [0.1, -0.2, 0.3, 0.4] }],
+        model: "smoke-embedding-model",
+      }));
+      return;
+    }
+    receivedModelRequest = receivedRequest;
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({
       id: "chatcmpl-smoke",
@@ -193,6 +204,44 @@ try {
       stream: false,
     },
   });
+  const embeddingConnection = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.getEmbeddingConnection()`,
+  );
+  assert.deepEqual(embeddingConnection, {
+    baseUrl: "",
+    model: "",
+    hasApiKey: false,
+  }, "initial embedding connection state is invalid");
+  const savedEmbedding = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.saveEmbeddingConnection(${JSON.stringify({
+      baseUrl: modelBaseUrl,
+      model: "smoke-embedding-model",
+      apiKey: "smoke-embedding-secret",
+    })})`,
+  );
+  assert.equal(savedEmbedding.ok, true, "embedding connection could not be saved through IPC");
+  assert.equal(savedEmbedding.connection.hasApiKey, true, "embedding API key state is unavailable");
+  assert.equal("apiKey" in savedEmbedding.connection, false, "embedding save IPC exposed the API key");
+  const testedEmbedding = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.testEmbeddingConnection(${JSON.stringify({
+      baseUrl: modelBaseUrl,
+      model: "smoke-embedding-model",
+    })})`,
+  );
+  assert.deepEqual(testedEmbedding, {
+    ok: true,
+    model: "smoke-embedding-model",
+    dimensions: 4,
+    message: "连接成功，嵌入向量维度为 4。",
+  }, "local embedding connection test failed through IPC");
+  assert.deepEqual(receivedEmbeddingRequest, {
+    url: "/v1/embeddings",
+    authorization: "Bearer smoke-embedding-secret",
+    body: { model: "smoke-embedding-model", input: "PDFMuse 连接测试" },
+  });
   const storedConfig = JSON.parse(await readFile(
     path.join(testApplicationDirectory, "data", "config.json"),
     "utf8",
@@ -200,6 +249,8 @@ try {
   assert.equal(storedConfig.version, 2, "stored config has no explicit version");
   assert.equal(storedConfig.chat.protocol, "openai", "Main did not persist the protocol");
   assert.equal(storedConfig.chat.apiKey, "smoke-secret", "Main did not persist the API key");
+  assert.equal(storedConfig.embedding.model, "smoke-embedding-model", "Main did not persist the embedding model");
+  assert.equal(storedConfig.embedding.apiKey, "smoke-embedding-secret", "Main did not persist the embedding API key");
   await evaluate(
     page.webSocketDebuggerUrl,
     `document.querySelector('[aria-label="模型与阅读设置"]')?.click()`,
@@ -208,6 +259,8 @@ try {
   assert.match(settingsText, /测试连接/, "model connection test command is unavailable");
   assert.match(settingsText, /接口协议/, "model protocol selector is unavailable");
   assert.match(settingsText, /API 密钥/, "API key editor is unavailable");
+  assert.match(settingsText, /测试嵌入连接/, "embedding connection test command is unavailable");
+  assert.match(settingsText, /保存嵌入配置/, "embedding connection save command is unavailable");
   assert.match(settingsText, /尚未安装 OCR 工作进程资源/, "startup warnings are unavailable in settings");
   const protocolOptions = await evaluate(
     page.webSocketDebuggerUrl,

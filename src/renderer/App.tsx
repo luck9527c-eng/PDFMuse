@@ -149,7 +149,7 @@ export function App() {
     setAttachedPassage(text);
     setMessages([
       { role: "reader", body: "请解释这段内容。" },
-      { role: "assistant", body: "已选原文已进入阅读上下文。模型连接将在阶段 2 接入；当前不会生成虚构答案。" },
+      { role: "assistant", body: "已选原文已进入阅读上下文。真实回答将在后续任务中接入；当前不会生成虚构答案。" },
     ]);
     setRightOpen(true);
     setPassage(undefined);
