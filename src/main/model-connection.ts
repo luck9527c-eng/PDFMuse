@@ -5,12 +5,14 @@ import {
   type StoredAppConfig,
   writeAppConfig,
 } from "./config-store.js";
-import type {
-  ModelConnectionState,
-  SaveModelConnectionInput,
-  SaveModelConnectionResult,
-  TestModelConnectionInput,
-  TestModelConnectionResult,
+import {
+  isModelProtocol,
+  type ModelProtocol,
+  type ModelConnectionState,
+  type SaveModelConnectionInput,
+  type SaveModelConnectionResult,
+  type TestModelConnectionInput,
+  type TestModelConnectionResult,
 } from "../shared/contracts.js";
 
 type ModelConnectionModuleOptions = {
@@ -19,6 +21,7 @@ type ModelConnectionModuleOptions = {
 
 function toState(config: StoredAppConfig): ModelConnectionState {
   return {
+    protocol: config.chat?.protocol ?? "openai",
     baseUrl: config.chat?.baseUrl ?? "",
     model: config.chat?.model ?? "",
     hasApiKey: Boolean(config.chat?.apiKey),
@@ -42,16 +45,44 @@ function validationError(): SaveModelConnectionResult & TestModelConnectionResul
   return {
     ok: false,
     code: "VALIDATION_ERROR",
-    message: "请输入有效的 HTTP 或 HTTPS 接口地址，并填写模型名称。",
+    message: "请选择支持的接口协议，输入有效的 HTTP 或 HTTPS 接口地址，并填写模型名称。",
   };
 }
 
-function chatCompletionsUrl(baseUrl: string) {
+function connectionTestUrl(protocol: ModelProtocol, baseUrl: string) {
   const url = new URL(baseUrl);
-  url.pathname = `${url.pathname.replace(/\/+$/, "")}/chat/completions`;
+  const basePath = url.pathname.replace(/\/+$/, "");
+  url.pathname = protocol === "openai"
+    ? `${basePath}/chat/completions`
+    : `${basePath.endsWith("/v1") ? basePath : `${basePath}/v1`}/messages`;
   url.search = "";
   url.hash = "";
   return url;
+}
+
+function connectionTestHeaders(protocol: ModelProtocol, apiKey?: string) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (protocol === "anthropic") {
+    headers["anthropic-version"] = "2023-06-01";
+    if (apiKey) headers["x-api-key"] = apiKey;
+  } else if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+  return headers;
+}
+
+function hasCompatibleResponse(protocol: ModelProtocol, body: unknown) {
+  if (!isRecord(body)) return false;
+  if (protocol === "openai") {
+    const choices = body.choices;
+    return Array.isArray(choices)
+      && isRecord(choices[0])
+      && isRecord(choices[0].message)
+      && typeof choices[0].message.content === "string";
+  }
+  const content = body.content;
+  return Array.isArray(content)
+    && content.some((block) => isRecord(block) && block.type === "text" && typeof block.text === "string");
 }
 
 export function createModelConnectionModule(
@@ -68,6 +99,7 @@ export function createModelConnectionModule(
 
     async save(input: SaveModelConnectionInput): Promise<SaveModelConnectionResult> {
       if (!isRecord(input)
+        || !isModelProtocol(input.protocol)
         || typeof input.baseUrl !== "string"
         || typeof input.model !== "string"
         || (input.apiKey !== undefined && typeof input.apiKey !== "string")
@@ -86,8 +118,9 @@ export function createModelConnectionModule(
         : apiKey || current.chat?.apiKey;
       const config: StoredAppConfig = {
         ...current,
-        version: 1,
+        version: 2,
         chat: {
+          protocol: input.protocol,
           baseUrl,
           model,
           ...(savedApiKey ? { apiKey: savedApiKey } : {}),
@@ -99,6 +132,7 @@ export function createModelConnectionModule(
 
     async test(input: TestModelConnectionInput): Promise<TestModelConnectionResult> {
       if (!isRecord(input)
+        || !isModelProtocol(input.protocol)
         || typeof input.baseUrl !== "string"
         || typeof input.model !== "string"
         || (input.apiKey !== undefined && typeof input.apiKey !== "string")
@@ -114,22 +148,27 @@ export function createModelConnectionModule(
       const apiKey = input.clearApiKey
         ? undefined
         : input.apiKey?.trim() || current.chat?.apiKey;
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+      const headers = connectionTestHeaders(input.protocol, apiKey);
 
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
       try {
-        const response = await fetch(chatCompletionsUrl(baseUrl), {
+        const response = await fetch(connectionTestUrl(input.protocol, baseUrl), {
           method: "POST",
           headers,
           signal: controller.signal,
-          body: JSON.stringify({
-            model,
-            messages: [{ role: "user", content: "请回复 OK" }],
-            max_tokens: 1,
-            stream: false,
-          }),
+          body: JSON.stringify(input.protocol === "openai"
+            ? {
+                model,
+                messages: [{ role: "user", content: "请回复 OK" }],
+                max_tokens: 1,
+                stream: false,
+              }
+            : {
+                model,
+                messages: [{ role: "user", content: "请回复 OK" }],
+                max_tokens: 1,
+              }),
         });
         if (response.status === 401 || response.status === 403) {
           return {
@@ -138,21 +177,21 @@ export function createModelConnectionModule(
             message: "API 密钥无效，或当前账号没有访问该模型的权限。",
           };
         }
-        let body: { choices?: Array<{ message?: { content?: unknown } }> };
+        let body: unknown;
         try {
-          body = await response.json() as typeof body;
+          body = await response.json();
         } catch {
           return {
             ok: false,
             code: "INVALID_RESPONSE",
-            message: "服务已响应，但返回格式与 OpenAI 对话接口不兼容。",
+            message: "服务已响应，但返回格式与所选对话协议不兼容。",
           };
         }
-        if (!response.ok || typeof body.choices?.[0]?.message?.content !== "string") {
+        if (!response.ok || !hasCompatibleResponse(input.protocol, body)) {
           return {
             ok: false,
             code: "INVALID_RESPONSE",
-            message: "服务已响应，但返回格式与 OpenAI 对话接口不兼容。",
+            message: "服务已响应，但返回格式与所选对话协议不兼容。",
           };
         }
         return {

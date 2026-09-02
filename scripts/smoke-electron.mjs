@@ -159,11 +159,13 @@ try {
   );
   assert.equal(typeof modelConnection.baseUrl, "string", "model base URL is unavailable");
   assert.equal(typeof modelConnection.model, "string", "model name is unavailable");
+  assert.equal(modelConnection.protocol, "openai", "default model protocol is unavailable");
   assert.equal(typeof modelConnection.hasApiKey, "boolean", "API key state is unavailable");
   assert.equal("apiKey" in modelConnection, false, "preload exposed the saved API key");
   const savedConnection = await evaluate(
     page.webSocketDebuggerUrl,
     `window.pdfMuse.saveModelConnection(${JSON.stringify({
+      protocol: "openai",
       baseUrl: modelBaseUrl,
       model: "smoke-chat-model",
       apiKey: "smoke-secret",
@@ -175,6 +177,7 @@ try {
   const testedConnection = await evaluate(
     page.webSocketDebuggerUrl,
     `window.pdfMuse.testModelConnection(${JSON.stringify({
+      protocol: "openai",
       baseUrl: modelBaseUrl,
       model: "smoke-chat-model",
     })})`,
@@ -194,7 +197,8 @@ try {
     path.join(testApplicationDirectory, "data", "config.json"),
     "utf8",
   ));
-  assert.equal(storedConfig.version, 1, "stored config has no explicit version");
+  assert.equal(storedConfig.version, 2, "stored config has no explicit version");
+  assert.equal(storedConfig.chat.protocol, "openai", "Main did not persist the protocol");
   assert.equal(storedConfig.chat.apiKey, "smoke-secret", "Main did not persist the API key");
   await evaluate(
     page.webSocketDebuggerUrl,
@@ -202,8 +206,37 @@ try {
   );
   const settingsText = await waitForText(page.webSocketDebuggerUrl, "保存配置");
   assert.match(settingsText, /测试连接/, "model connection test command is unavailable");
+  assert.match(settingsText, /接口协议/, "model protocol selector is unavailable");
   assert.match(settingsText, /API 密钥/, "API key editor is unavailable");
   assert.match(settingsText, /尚未安装 OCR 工作进程资源/, "startup warnings are unavailable in settings");
+  const protocolOptions = await evaluate(
+    page.webSocketDebuggerUrl,
+    `Array.from(document.querySelectorAll('select option')).map((option) => option.textContent)`,
+  );
+  assert.deepEqual(protocolOptions, ["OpenAI", "Anthropic"], "model protocol options are incomplete");
+  const visibleTooltipsWithoutHover = await evaluate(
+    page.webSocketDebuggerUrl,
+    `new Promise((resolve) => setTimeout(() => resolve(
+      Array.from(document.querySelectorAll('[role="tooltip"]'))
+        .filter((element) => element.getClientRects().length > 0)
+        .map((element) => element.textContent)
+    ), 650))`,
+  );
+  assert.deepEqual(visibleTooltipsWithoutHover, [], "icon tooltips are visible without pointer hover");
+  const visibleTooltipsOnHover = await evaluate(
+    page.webSocketDebuggerUrl,
+    `new Promise((resolve) => {
+      document.querySelector('[aria-label="关闭设置"]')?.dispatchEvent(
+        new PointerEvent('pointerover', { bubbles: true, pointerType: 'mouse' })
+      );
+      setTimeout(() => resolve(
+        Array.from(document.querySelectorAll('[role="tooltip"]'))
+          .filter((element) => element.getClientRects().length > 0)
+          .map((element) => element.textContent)
+      ), 100);
+    })`,
+  );
+  assert.deepEqual(visibleTooltipsOnHover, ["关闭设置"], "icon tooltip is unavailable on pointer hover");
   console.log("Electron smoke test passed: startup UI and preload API are available.");
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));

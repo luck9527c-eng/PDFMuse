@@ -20,6 +20,7 @@ type Feedback = {
 };
 
 const EMPTY_CONNECTION: ModelConnectionState = {
+  protocol: "openai",
   baseUrl: "",
   model: "",
   hasApiKey: false,
@@ -64,6 +65,7 @@ export function SettingsDialog({ warnings = [] }: { warnings?: string[] }) {
   }, [open]);
 
   const draft = () => ({
+    protocol: connection.protocol,
     baseUrl: connection.baseUrl,
     model: connection.model,
     ...(apiKey ? { apiKey } : {}),
@@ -136,15 +138,34 @@ export function SettingsDialog({ warnings = [] }: { warnings?: string[] }) {
 
           <section className="settings-section">
             <div className="settings-section-heading">
-              <div><h3>对话模型</h3><span>OpenAI 兼容接口</span></div>
+              <div>
+                <h3>对话模型</h3>
+                <span>{connection.protocol === "openai" ? "OpenAI 对话接口" : "Anthropic 消息接口"}</span>
+              </div>
               {connection.hasApiKey && <span className="saved-key-state"><KeyRound size={13} />已保存密钥</span>}
             </div>
+            <label>
+              接口协议
+              <select
+                value={connection.protocol}
+                onChange={(event) => setConnection((current) => ({
+                  ...current,
+                  protocol: event.target.value === "anthropic" ? "anthropic" : "openai",
+                }))}
+                disabled={busy}
+              >
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+              </select>
+            </label>
             <label>
               接口地址
               <input
                 value={connection.baseUrl}
                 onChange={(event) => setConnection((current) => ({ ...current, baseUrl: event.target.value }))}
-                placeholder="https://api.example.com/v1"
+                placeholder={connection.protocol === "openai"
+                  ? "https://api.openai.com/v1"
+                  : "https://api.anthropic.com"}
                 disabled={busy}
               />
             </label>

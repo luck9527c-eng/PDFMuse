@@ -32,9 +32,9 @@
 
 * { box-sizing: border-box; }
 html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
-button, input, textarea { font: inherit; letter-spacing: 0; }
+button, input, select, textarea { font: inherit; letter-spacing: 0; }
 button { color: inherit; }
-button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
 
 .boot-state { width: 100%; height: 100%; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
 .workspace { width: 100%; height: 100%; display: grid; grid-template: 58px minmax(0, 1fr) / minmax(0, 1fr); background: var(--canvas); }
@@ -162,8 +162,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .settings-section-heading > div > span, .settings-section-disabled p { margin: 0; color: var(--muted); font-size: 10px; }
 .saved-key-state { display: inline-flex; align-items: center; gap: 5px; color: var(--green); font-size: 10px; }
 .settings-section label { display: grid; gap: 5px; margin-bottom: 10px; color: var(--muted); font-size: 10px; font-weight: 650; }
-.settings-section input { height: 36px; padding: 0 9px; border: 1px solid var(--line); border-radius: 5px; color: var(--ink); background: white; font-size: 12px; }
-.settings-section input:disabled { background: #efede7; color: var(--muted); }
+.settings-section input, .settings-section select { height: 36px; padding: 0 9px; border: 1px solid var(--line); border-radius: 5px; color: var(--ink); background: white; font-size: 12px; }
+.settings-section input:disabled, .settings-section select:disabled { background: #efede7; color: var(--muted); }
 .settings-section .settings-checkbox { display: flex; align-items: center; gap: 7px; width: fit-content; color: var(--ink); cursor: pointer; }
 .settings-section .settings-checkbox input { width: 15px; height: 15px; margin: 0; accent-color: var(--green); }
 .settings-security-note { margin: 3px 0 13px; color: var(--muted); font-size: 10px; line-height: 1.55; }

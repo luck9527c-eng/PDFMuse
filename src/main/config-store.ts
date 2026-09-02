@@ -2,9 +2,12 @@ import { randomUUID } from "node:crypto";
 import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { isModelProtocol, type ModelProtocol } from "../shared/contracts.js";
+
 export type StoredAppConfig = {
-  version: 1;
+  version: 2;
   chat?: {
+    protocol: ModelProtocol;
     baseUrl: string;
     model: string;
     apiKey?: string;
@@ -12,7 +15,7 @@ export type StoredAppConfig = {
   [key: string]: unknown;
 };
 
-export const EMPTY_APP_CONFIG: StoredAppConfig = { version: 1 };
+export const EMPTY_APP_CONFIG: StoredAppConfig = { version: 2 };
 
 type ParseAppConfigOptions = {
   allowLegacyVersion?: boolean;
@@ -22,10 +25,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function hasValidChatConfig(value: Record<string, unknown>) {
+function hasValidChatConfig(value: Record<string, unknown>, allowMissingProtocol: boolean) {
   if (value.chat === undefined) return true;
   if (!isRecord(value.chat)) return false;
-  return typeof value.chat.baseUrl === "string"
+  return (isModelProtocol(value.chat.protocol) || (allowMissingProtocol && value.chat.protocol === undefined))
+    && typeof value.chat.baseUrl === "string"
     && typeof value.chat.model === "string"
     && (value.chat.apiKey === undefined || typeof value.chat.apiKey === "string");
 }
@@ -35,15 +39,26 @@ export function parseAppConfig(
   options: ParseAppConfigOptions = {},
 ): { config: StoredAppConfig; migrated: boolean } {
   const value: unknown = JSON.parse(source);
+  const isLegacyVersion = isRecord(value) && (value.version === undefined || value.version === 1);
   if (!isRecord(value)
-    || (value.version !== 1 && !(options.allowLegacyVersion && value.version === undefined))
-    || !hasValidChatConfig(value)) {
+    || (value.version !== 2 && !(options.allowLegacyVersion && isLegacyVersion))
+    || !hasValidChatConfig(value, Boolean(options.allowLegacyVersion && isLegacyVersion))) {
     throw new SyntaxError("Invalid PDFMuse configuration");
   }
 
+  const chat = isRecord(value.chat)
+    ? {
+        ...value.chat,
+        protocol: isModelProtocol(value.chat.protocol) ? value.chat.protocol : "openai",
+      }
+    : undefined;
   return {
-    config: { ...value, version: 1 } as StoredAppConfig,
-    migrated: value.version === undefined,
+    config: {
+      ...value,
+      version: 2,
+      ...(chat ? { chat } : {}),
+    } as StoredAppConfig,
+    migrated: value.version !== 2,
   };
 }
 

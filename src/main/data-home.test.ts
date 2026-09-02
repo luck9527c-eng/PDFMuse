@@ -47,7 +47,7 @@ describe("preflightDataHome", () => {
       expect(result.warnings).toContainEqual(expect.stringContaining("损坏的配置文件已备份"));
     }
     await expect(readFile(path.join(dataHome, "config.json"), "utf8")).resolves.toBe(
-      '{\n  "version": 1\n}\n',
+      '{\n  "version": 2\n}\n',
     );
     const backup = (await readdir(dataHome)).find((name) => name.startsWith("config.invalid-") && name.endsWith(".json"));
     expect(backup).toBeDefined();
@@ -78,16 +78,40 @@ describe("preflightDataHome", () => {
     await import("node:fs/promises").then(({ mkdir }) => mkdir(dataHome));
     await writeFile(
       path.join(dataHome, "config.json"),
-      '{"chat":{"baseUrl":"https://api.example.com/v1","model":"test-model"}}',
+      '{"version":1,"chat":{"baseUrl":"https://api.example.com/v1","model":"test-model"}}',
       "utf8",
     );
 
     const result = await preflightDataHome(applicationDirectory);
 
     expect(result.ok).toBe(true);
-    await expect(readFile(path.join(dataHome, "config.json"), "utf8")).resolves.toBe(
-      '{\n  "chat": {\n    "baseUrl": "https://api.example.com/v1",\n    "model": "test-model"\n  },\n  "version": 1\n}\n',
-    );
+    const migrated = JSON.parse(await readFile(path.join(dataHome, "config.json"), "utf8"));
+    expect(migrated).toEqual({
+      version: 2,
+      chat: {
+        baseUrl: "https://api.example.com/v1",
+        model: "test-model",
+        protocol: "openai",
+      },
+    });
     expect(await readdir(dataHome)).not.toContainEqual(expect.stringMatching(/\.tmp$/));
+  });
+
+  it("将缺少协议的当前版本配置视为损坏", async () => {
+    const applicationDirectory = await createWorkspace();
+    const dataHome = path.join(applicationDirectory, "data");
+    await import("node:fs/promises").then(({ mkdir }) => mkdir(dataHome));
+    const invalidConfig = '{"version":2,"chat":{"baseUrl":"https://api.example.com/v1","model":"test-model"}}';
+    await writeFile(path.join(dataHome, "config.json"), invalidConfig, "utf8");
+
+    const result = await preflightDataHome(applicationDirectory);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.warnings).toContainEqual(expect.stringContaining("损坏的配置文件已备份"));
+    }
+    const backup = (await readdir(dataHome)).find((name) => name.startsWith("config.invalid-"));
+    expect(backup).toBeDefined();
+    await expect(readFile(path.join(dataHome, backup!), "utf8")).resolves.toBe(invalidConfig);
   });
 });

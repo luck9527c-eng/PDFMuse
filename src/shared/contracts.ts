@@ -23,13 +23,21 @@ export type OpenedPdfBook = {
   bytes: Uint8Array;
 };
 
+export type ModelProtocol = "openai" | "anthropic";
+
+export function isModelProtocol(value: unknown): value is ModelProtocol {
+  return value === "openai" || value === "anthropic";
+}
+
 export type ModelConnectionState = {
+  protocol: ModelProtocol;
   baseUrl: string;
   model: string;
   hasApiKey: boolean;
 };
 
 export type SaveModelConnectionInput = {
+  protocol: ModelProtocol;
   baseUrl: string;
   model: string;
   apiKey?: string;
@@ -48,6 +56,7 @@ export type SaveModelConnectionResult =
     };
 
 export type TestModelConnectionInput = {
+  protocol: ModelProtocol;
   baseUrl: string;
   model: string;
   apiKey?: string;

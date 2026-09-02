@@ -1,16 +1,43 @@
 import * as Tooltip from "@radix-ui/react-tooltip";
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { useState, type ButtonHTMLAttributes, type ReactNode } from "react";
 
 type IconButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
   label: string;
   children: ReactNode;
 };
 
-export function IconButton({ label, children, ...props }: IconButtonProps) {
+export function IconButton({
+  label,
+  children,
+  onPointerDown,
+  onPointerEnter,
+  onPointerLeave,
+  ...props
+}: IconButtonProps) {
+  const [tooltipOpen, setTooltipOpen] = useState(false);
+
   return (
-    <Tooltip.Root delayDuration={450}>
+    <Tooltip.Root open={tooltipOpen} onOpenChange={(nextOpen) => {
+      if (!nextOpen) setTooltipOpen(false);
+    }}>
       <Tooltip.Trigger asChild>
-        <button className="icon-button" aria-label={label} {...props}>
+        <button
+          className="icon-button"
+          aria-label={label}
+          {...props}
+          onPointerDown={(event) => {
+            setTooltipOpen(false);
+            onPointerDown?.(event);
+          }}
+          onPointerEnter={(event) => {
+            if (event.pointerType !== "touch") setTooltipOpen(true);
+            onPointerEnter?.(event);
+          }}
+          onPointerLeave={(event) => {
+            setTooltipOpen(false);
+            onPointerLeave?.(event);
+          }}
+        >
           {children}
         </button>
       </Tooltip.Trigger>

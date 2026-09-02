@@ -40,12 +40,14 @@ describe("Model Connection Module", () => {
     const connection = createModelConnectionModule(dataHome);
 
     await expect(connection.save({
+      protocol: "openai",
       baseUrl: "https://api.example.com/v1/",
       model: "example-chat-model",
       apiKey: "secret-api-key",
     })).resolves.toEqual({
       ok: true,
       connection: {
+        protocol: "openai",
         baseUrl: "https://api.example.com/v1",
         model: "example-chat-model",
         hasApiKey: true,
@@ -54,6 +56,7 @@ describe("Model Connection Module", () => {
 
     const reloaded = createModelConnectionModule(dataHome);
     await expect(reloaded.get()).resolves.toEqual({
+      protocol: "openai",
       baseUrl: "https://api.example.com/v1",
       model: "example-chat-model",
       hasApiKey: true,
@@ -64,12 +67,14 @@ describe("Model Connection Module", () => {
     const dataHome = await createDataHome();
     const connection = createModelConnectionModule(dataHome);
     await connection.save({
+      protocol: "openai",
       baseUrl: "https://api.example.com/v1",
       model: "first-model",
       apiKey: "saved-secret",
     });
 
     await expect(connection.save({
+      protocol: "openai",
       baseUrl: "https://api.example.com/v1",
       model: "second-model",
     })).resolves.toMatchObject({
@@ -78,6 +83,7 @@ describe("Model Connection Module", () => {
     });
 
     await expect(connection.save({
+      protocol: "openai",
       baseUrl: "https://api.example.com/v1",
       model: "second-model",
       clearApiKey: true,
@@ -91,20 +97,23 @@ describe("Model Connection Module", () => {
     const dataHome = await createDataHome();
     const connection = createModelConnectionModule(dataHome);
     await connection.save({
+      protocol: "openai",
       baseUrl: "https://api.example.com/v1",
       model: "working-model",
       apiKey: "saved-secret",
     });
 
     await expect(connection.save({
+      protocol: "openai",
       baseUrl: "ftp://api.example.com/v1",
       model: " ",
     })).resolves.toEqual({
       ok: false,
       code: "VALIDATION_ERROR",
-      message: "请输入有效的 HTTP 或 HTTPS 接口地址，并填写模型名称。",
+      message: "请选择支持的接口协议，输入有效的 HTTP 或 HTTPS 接口地址，并填写模型名称。",
     });
     await expect(connection.get()).resolves.toEqual({
+      protocol: "openai",
       baseUrl: "https://api.example.com/v1",
       model: "working-model",
       hasApiKey: true,
@@ -132,12 +141,14 @@ describe("Model Connection Module", () => {
     const dataHome = await createDataHome();
     const connection = createModelConnectionModule(dataHome);
     await connection.save({
+      protocol: "openai",
       baseUrl: `${baseUrl}/v1`,
       model: "working-model",
       apiKey: "saved-secret",
     });
 
     await expect(connection.test({
+      protocol: "openai",
       baseUrl: `${baseUrl}/v1`,
       model: "working-model",
     })).resolves.toEqual({
@@ -157,6 +168,60 @@ describe("Model Connection Module", () => {
     });
   });
 
+  it("使用 Anthropic Messages 协议测试当前连接", async () => {
+    let receivedRequest: {
+      url?: string;
+      authorization?: string;
+      apiKey?: string;
+      anthropicVersion?: string;
+      body?: unknown;
+    } = {};
+    const baseUrl = await listen(createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        receivedRequest = {
+          url: request.url,
+          authorization: request.headers.authorization,
+          apiKey: request.headers["x-api-key"] as string | undefined,
+          anthropicVersion: request.headers["anthropic-version"] as string | undefined,
+          body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+        };
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({
+          id: "msg-test",
+          content: [{ type: "text", text: "OK" }],
+        }));
+      });
+    }));
+    const dataHome = await createDataHome();
+    const connection = createModelConnectionModule(dataHome);
+    await connection.save({
+      protocol: "anthropic",
+      baseUrl,
+      model: "claude-test-model",
+      apiKey: "anthropic-secret",
+    });
+
+    await expect(connection.test({
+      protocol: "anthropic",
+      baseUrl,
+      model: "claude-test-model",
+    })).resolves.toMatchObject({ ok: true, model: "claude-test-model" });
+    expect(receivedRequest).toEqual({
+      url: "/v1/messages",
+      authorization: undefined,
+      apiKey: "anthropic-secret",
+      anthropicVersion: "2023-06-01",
+      body: {
+        model: "claude-test-model",
+        messages: [{ role: "user", content: "请回复 OK" }],
+        max_tokens: 1,
+      },
+    });
+    await expect(connection.get()).resolves.toMatchObject({ protocol: "anthropic" });
+  });
+
   it("测试清除密钥的表单草稿时不回退使用已保存密钥", async () => {
     let authorization: string | undefined;
     const baseUrl = await listen(createServer((request, response) => {
@@ -169,12 +234,14 @@ describe("Model Connection Module", () => {
     const dataHome = await createDataHome();
     const connection = createModelConnectionModule(dataHome);
     await connection.save({
+      protocol: "openai",
       baseUrl: `${baseUrl}/v1`,
       model: "working-model",
       apiKey: "saved-secret",
     });
 
     await expect(connection.test({
+      protocol: "openai",
       baseUrl: `${baseUrl}/v1`,
       model: "working-model",
       clearApiKey: true,
@@ -191,6 +258,7 @@ describe("Model Connection Module", () => {
     const connection = createModelConnectionModule(dataHome);
 
     await expect(connection.test({
+      protocol: "openai",
       baseUrl: `${baseUrl}/v1`,
       model: "working-model",
       apiKey: "wrong-secret",
@@ -212,6 +280,7 @@ describe("Model Connection Module", () => {
     const connection = createModelConnectionModule(dataHome);
 
     await expect(connection.test({
+      protocol: "openai",
       baseUrl: `${unavailableBaseUrl}/v1`,
       model: "working-model",
       apiKey: "secret",
@@ -235,6 +304,7 @@ describe("Model Connection Module", () => {
     const connection = createModelConnectionModule(dataHome, { requestTimeoutMs: 25 });
 
     await expect(connection.test({
+      protocol: "openai",
       baseUrl: `${baseUrl}/v1`,
       model: "slow-model",
     })).resolves.toEqual({
@@ -253,12 +323,13 @@ describe("Model Connection Module", () => {
     const connection = createModelConnectionModule(dataHome);
 
     await expect(connection.test({
+      protocol: "openai",
       baseUrl: `${baseUrl}/v1`,
       model: "wrong-endpoint-model",
     })).resolves.toEqual({
       ok: false,
       code: "INVALID_RESPONSE",
-      message: "服务已响应，但返回格式与 OpenAI 对话接口不兼容。",
+      message: "服务已响应，但返回格式与所选对话协议不兼容。",
     });
   });
 
@@ -267,12 +338,13 @@ describe("Model Connection Module", () => {
     const connection = createModelConnectionModule(dataHome);
 
     await expect(connection.test({
+      protocol: "openai",
       baseUrl: "not-a-url",
       model: "",
     })).resolves.toEqual({
       ok: false,
       code: "VALIDATION_ERROR",
-      message: "请输入有效的 HTTP 或 HTTPS 接口地址，并填写模型名称。",
+      message: "请选择支持的接口协议，输入有效的 HTTP 或 HTTPS 接口地址，并填写模型名称。",
     });
   });
 
@@ -281,18 +353,28 @@ describe("Model Connection Module", () => {
     const connection = createModelConnectionModule(dataHome);
 
     await expect(connection.save({
+      protocol: "openai",
       baseUrl: 42,
       model: ["wrong-type"],
     } as unknown as Parameters<typeof connection.save>[0])).resolves.toEqual({
       ok: false,
       code: "VALIDATION_ERROR",
-      message: "请输入有效的 HTTP 或 HTTPS 接口地址，并填写模型名称。",
+      message: "请选择支持的接口协议，输入有效的 HTTP 或 HTTPS 接口地址，并填写模型名称。",
     });
     await expect(connection.test({
+      protocol: "openai",
       baseUrl: "https://api.example.com/v1",
       model: "test-model",
       clearApiKey: "yes",
     } as unknown as Parameters<typeof connection.test>[0])).resolves.toMatchObject({
+      ok: false,
+      code: "VALIDATION_ERROR",
+    });
+    await expect(connection.save({
+      protocol: "unsupported",
+      baseUrl: "https://api.example.com/v1",
+      model: "test-model",
+    } as unknown as Parameters<typeof connection.save>[0])).resolves.toMatchObject({
       ok: false,
       code: "VALIDATION_ERROR",
     });
