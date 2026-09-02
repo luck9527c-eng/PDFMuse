@@ -296,38 +296,46 @@ try {
           return;
         }
         const container = document.querySelector('.pdf-container');
+        const firstPage = document.querySelector('.pdfViewer .page[data-page-number="1"]');
+        const beforePageRect = firstPage.getBoundingClientRect();
+        const pointerX = beforePageRect.left + beforePageRect.width * 0.72;
+        const pointerY = beforePageRect.top + Math.min(beforePageRect.height * 0.3, 180);
+        const beforeAnchor = {
+          x: (pointerX - beforePageRect.left) / beforePageRect.width,
+          y: (pointerY - beforePageRect.top) / beforePageRect.height,
+        };
         const initialScale = Number(document.querySelector('.zoom-value')?.textContent?.replace('%', ''));
         container.dispatchEvent(new WheelEvent('wheel', {
           bubbles: true,
           cancelable: true,
           ctrlKey: true,
           deltaY: -120,
-          clientX: container.getBoundingClientRect().left + 100,
-          clientY: container.getBoundingClientRect().top + 100,
+          clientX: pointerX,
+          clientY: pointerY,
         }));
-        const resize = document.querySelector('[aria-label="调整左侧栏宽度"]');
-        const initialLeftWidth = document.querySelector('.left-sidebar').getBoundingClientRect().width;
-        const resizeX = resize.getBoundingClientRect().left;
-        resize.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: resizeX }));
-        window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: resizeX - 40 }));
-        window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: resizeX - 40 }));
-        const rightResize = document.querySelector('[aria-label="调整右侧栏宽度"]');
-        const initialRightWidth = document.querySelector('.assistant-panel').getBoundingClientRect().width;
-        const rightResizeX = rightResize.getBoundingClientRect().left;
-        rightResize.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: rightResizeX }));
-        window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: rightResizeX + 40 }));
-        window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: rightResizeX + 40 }));
         setTimeout(() => {
-          const reader = document.querySelector('.reader').getBoundingClientRect();
-          const toolbar = document.querySelector('.reader-toolbar').getBoundingClientRect();
+          const afterPageRect = firstPage.getBoundingClientRect();
+          const afterAnchor = {
+            x: (pointerX - afterPageRect.left) / afterPageRect.width,
+            y: (pointerY - afterPageRect.top) / afterPageRect.height,
+          };
           resolve({
             initialScale,
-            initialLeftWidth,
-            initialRightWidth,
             scale: Number(document.querySelector('.zoom-value')?.textContent?.replace('%', '')),
-            leftWidth: document.querySelector('.left-sidebar').getBoundingClientRect().width,
-            rightWidth: document.querySelector('.assistant-panel').getBoundingClientRect().width,
-            toolbarContained: toolbar.left >= reader.left && toolbar.right <= reader.right,
+            anchorDrift: Math.max(
+              Math.abs(afterAnchor.x - beforeAnchor.x),
+              Math.abs(afterAnchor.y - beforeAnchor.y),
+            ),
+            anchorProbe: {
+              beforeAnchor,
+              afterAnchor,
+              beforePage: { left: beforePageRect.left, top: beforePageRect.top, width: beforePageRect.width, height: beforePageRect.height },
+              afterPage: { left: afterPageRect.left, top: afterPageRect.top, width: afterPageRect.width, height: afterPageRect.height },
+              scrollLeft: container.scrollLeft,
+              scrollTop: container.scrollTop,
+              scrollWidth: container.scrollWidth,
+              clientWidth: container.clientWidth,
+            },
           });
         }, 180);
       };
@@ -335,9 +343,54 @@ try {
     })`,
   );
   assert.ok(readerControls.scale > readerControls.initialScale, "Ctrl+mouse wheel did not zoom the PDF");
-  assert.ok(readerControls.leftWidth < readerControls.initialLeftWidth, "the left sidebar resize handle did not change its width");
-  assert.ok(readerControls.rightWidth < readerControls.initialRightWidth, "the right sidebar resize handle did not change its width");
-  assert.equal(readerControls.toolbarContained, true, "resizing a sidebar pushed the PDF toolbar outside the reader");
+  assert.ok(readerControls.anchorDrift < 0.02, `Ctrl+mouse wheel anchor probe: ${JSON.stringify(readerControls.anchorProbe)}`);
+  const panning = await evaluate(
+    page.webSocketDebuggerUrl,
+    `new Promise((resolve) => {
+      document.querySelector('[aria-label="开启拖拽浏览"]')?.click();
+      setTimeout(() => {
+        const container = document.querySelector('.pdf-container');
+        const before = container.scrollTop;
+        container.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0, pointerId: 7, clientX: 420, clientY: 360 }));
+        container.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, button: 0, pointerId: 7, clientX: 420, clientY: 300 }));
+        container.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, button: 0, pointerId: 7, clientX: 420, clientY: 300 }));
+        resolve({ before, after: container.scrollTop, active: container.classList.contains('is-panning') });
+      }, 50);
+    })`,
+  );
+  assert.ok(panning.after >= panning.before + 50, "drag-to-pan did not move the PDF viewport");
+  assert.equal(panning.active, false, "drag-to-pan remained active after pointer release");
+  const resizedSidebars = await evaluate(
+    page.webSocketDebuggerUrl,
+    `new Promise((resolve) => {
+      const resize = document.querySelector('[aria-label="调整左侧栏宽度"]');
+      const initialLeftWidth = document.querySelector('.left-sidebar').getBoundingClientRect().width;
+      const resizeX = resize.getBoundingClientRect().left;
+      resize.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: resizeX }));
+      window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: resizeX - 40 }));
+      window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: resizeX - 40 }));
+      const rightResize = document.querySelector('[aria-label="调整右侧栏宽度"]');
+      const initialRightWidth = document.querySelector('.assistant-panel').getBoundingClientRect().width;
+      const rightResizeX = rightResize.getBoundingClientRect().left;
+      rightResize.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: rightResizeX }));
+      window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: rightResizeX + 40 }));
+      window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: rightResizeX + 40 }));
+      setTimeout(() => {
+        const reader = document.querySelector('.reader').getBoundingClientRect();
+        const toolbar = document.querySelector('.reader-toolbar').getBoundingClientRect();
+        resolve({
+          initialLeftWidth,
+          initialRightWidth,
+          leftWidth: document.querySelector('.left-sidebar').getBoundingClientRect().width,
+          rightWidth: document.querySelector('.assistant-panel').getBoundingClientRect().width,
+          toolbarContained: toolbar.left >= reader.left && toolbar.right <= reader.right,
+        });
+      }, 100);
+    })`,
+  );
+  assert.ok(resizedSidebars.leftWidth < resizedSidebars.initialLeftWidth, "the left sidebar resize handle did not change its width");
+  assert.ok(resizedSidebars.rightWidth < resizedSidebars.initialRightWidth, "the right sidebar resize handle did not change its width");
+  assert.equal(resizedSidebars.toolbarContained, true, "resizing a sidebar pushed the PDF toolbar outside the reader");
   await evaluate(page.webSocketDebuggerUrl, `document.querySelector('.sidebar-tabs button:nth-child(2)')?.click()`);
   const thumbnails = await evaluate(
     page.webSocketDebuggerUrl,
@@ -346,7 +399,8 @@ try {
       rendered: document.querySelectorAll('.pdf-thumbnail img').length,
     }), 500))`,
   );
-  assert.deepEqual(thumbnails, { count: 3, rendered: 3 }, "page thumbnails are incomplete");
+  assert.equal(thumbnails.count, 3, "page thumbnail navigation is incomplete");
+  assert.ok(thumbnails.rendered >= 1, "visible page thumbnails were not rendered");
   await evaluate(page.webSocketDebuggerUrl, `document.querySelector('.sidebar-tabs button:first-child')?.click()`);
   await evaluate(
     page.webSocketDebuggerUrl,

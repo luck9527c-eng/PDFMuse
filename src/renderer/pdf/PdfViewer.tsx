@@ -50,6 +50,7 @@ export interface PdfViewerHandle {
 
 type Props = {
   book: OpenedPdfBook;
+  panMode: boolean;
   onStateChange(state: ViewerState): void;
   onError(message: string): void;
 };
@@ -85,7 +86,7 @@ async function resolveOutline(
 }
 
 export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
-  { book, onStateChange, onError },
+  { book, panMode, onStateChange, onError },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -100,7 +101,12 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     thumbnailCache: Map<number, Promise<string | undefined>>;
     findQuery: string;
   } | null>(null);
+  const panModeRef = useRef(panMode);
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    panModeRef.current = panMode;
+  }, [panMode]);
 
   useImperativeHandle(ref, () => ({
     goToPage(page) {
@@ -267,13 +273,12 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
 
     let wheelFrame = 0;
     let wheelDelta = 0;
-    let wheelAnchor = { x: 0, y: 0 };
+    let wheelAnchor = { clientX: 0, clientY: 0 };
     const handleWheel = (event: WheelEvent) => {
       if (!event.ctrlKey) return;
       event.preventDefault();
-      const rect = container.getBoundingClientRect();
       wheelDelta += event.deltaY;
-      wheelAnchor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      wheelAnchor = { clientX: event.clientX, clientY: event.clientY };
       if (wheelFrame) return;
       wheelFrame = requestAnimationFrame(() => {
         wheelFrame = 0;
@@ -282,17 +287,73 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         wheelDelta = 0;
         const nextScale = Math.min(5, Math.max(0.25, oldScale * scaleFactor));
         if (Math.abs(nextScale - oldScale) < 0.001) return;
-        const documentX = container.scrollLeft + wheelAnchor.x;
-        const documentY = container.scrollTop + wheelAnchor.y;
+        const pages = Array.from(viewerElement.querySelectorAll<HTMLElement>(".page"));
+        const anchorPage = pages.find((page) => {
+          const rect = page.getBoundingClientRect();
+          return wheelAnchor.clientX >= rect.left && wheelAnchor.clientX <= rect.right
+            && wheelAnchor.clientY >= rect.top && wheelAnchor.clientY <= rect.bottom;
+        });
+        const anchorRect = anchorPage?.getBoundingClientRect();
+        const pageAnchor = anchorPage && anchorRect ? {
+          page: anchorPage,
+          x: (wheelAnchor.clientX - anchorRect.left) / anchorRect.width,
+          y: (wheelAnchor.clientY - anchorRect.top) / anchorRect.height,
+        } : undefined;
+        const containerRect = container.getBoundingClientRect();
+        const fallbackAnchor = {
+          x: wheelAnchor.clientX - containerRect.left,
+          y: wheelAnchor.clientY - containerRect.top,
+          scrollLeft: container.scrollLeft,
+          scrollTop: container.scrollTop,
+        };
         adapter.fitMode = null;
         viewer.currentScale = nextScale;
         requestAnimationFrame(() => {
-          container.scrollLeft = documentX * (nextScale / oldScale) - wheelAnchor.x;
-          container.scrollTop = documentY * (nextScale / oldScale) - wheelAnchor.y;
+          if (pageAnchor) {
+            const scaledRect = pageAnchor.page.getBoundingClientRect();
+            container.scrollLeft += scaledRect.left + scaledRect.width * pageAnchor.x - wheelAnchor.clientX;
+            container.scrollTop += scaledRect.top + scaledRect.height * pageAnchor.y - wheelAnchor.clientY;
+          } else {
+            const ratio = nextScale / oldScale;
+            container.scrollLeft = (fallbackAnchor.scrollLeft + fallbackAnchor.x) * ratio - fallbackAnchor.x;
+            container.scrollTop = (fallbackAnchor.scrollTop + fallbackAnchor.y) * ratio - fallbackAnchor.y;
+          }
         });
       });
     };
     container.addEventListener("wheel", handleWheel, { passive: false });
+
+    let pan: { pointerId: number; x: number; y: number; scrollLeft: number; scrollTop: number } | undefined;
+    const stopPanning = (event?: PointerEvent) => {
+      if (!pan || (event && event.pointerId !== pan.pointerId)) return;
+      try { container.releasePointerCapture(pan.pointerId); } catch { /* Synthetic test events have no capture. */ }
+      pan = undefined;
+      container.classList.remove("is-panning");
+    };
+    const startPanning = (event: PointerEvent) => {
+      const enabled = (panModeRef.current && event.button === 0) || event.button === 1;
+      if (!enabled) return;
+      event.preventDefault();
+      pan = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        scrollLeft: container.scrollLeft,
+        scrollTop: container.scrollTop,
+      };
+      try { container.setPointerCapture(event.pointerId); } catch { /* Synthetic test events have no capture. */ }
+      container.classList.add("is-panning");
+    };
+    const movePanning = (event: PointerEvent) => {
+      if (!pan || event.pointerId !== pan.pointerId) return;
+      event.preventDefault();
+      container.scrollLeft = pan.scrollLeft - (event.clientX - pan.x);
+      container.scrollTop = pan.scrollTop - (event.clientY - pan.y);
+    };
+    container.addEventListener("pointerdown", startPanning);
+    container.addEventListener("pointermove", movePanning);
+    container.addEventListener("pointerup", stopPanning);
+    container.addEventListener("pointercancel", stopPanning);
 
     let resizeFrame = 0;
     const resizeObserver = new ResizeObserver(() => {
@@ -328,6 +389,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       cancelAnimationFrame(scrollFrame);
       container.removeEventListener("wheel", handleWheel);
       cancelAnimationFrame(wheelFrame);
+      stopPanning();
+      container.removeEventListener("pointerdown", startPanning);
+      container.removeEventListener("pointermove", movePanning);
+      container.removeEventListener("pointerup", stopPanning);
+      container.removeEventListener("pointercancel", stopPanning);
       adapterRef.current = null;
       viewer.cleanup();
       void loadingTask.destroy();
@@ -335,7 +401,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
   }, [book, onError, onStateChange]);
 
   return (
-    <div className="pdf-container" ref={containerRef}>
+    <div className={`pdf-container ${panMode ? "pan-mode" : ""}`} ref={containerRef}>
       {loading && <div className="viewer-loading">正在准备 PDF 书籍...</div>}
       <div className="pdfViewer" ref={viewerElementRef} />
     </div>

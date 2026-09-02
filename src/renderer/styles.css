@@ -54,6 +54,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .data-home-status > span { width: 6px; height: 6px; border-radius: 50%; background: #54866a; }
 .icon-button { width: 34px; height: 34px; flex: none; border: 0; border-radius: 5px; display: inline-grid; place-items: center; background: transparent; cursor: pointer; }
 .icon-button:hover:not(:disabled) { background: #eae7df; }
+.icon-button[aria-pressed="true"] { background: var(--green-soft); color: var(--green); }
 .icon-button:disabled { opacity: .35; cursor: default; }
 .icon-button svg { width: 17px; height: 17px; stroke-width: 1.8; }
 .tooltip { z-index: 100; padding: 6px 8px; background: #20221f; color: #fff; border-radius: 4px; font-size: 11px; box-shadow: 0 6px 18px rgba(0,0,0,.18); }
@@ -106,6 +107,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .find-bar input { width: 190px; height: 30px; border: 0; outline: 0; background: transparent; font-size: 12px; }
 .find-count { width: 54px; flex: none; text-align: center; font-size: 10px; font-variant-numeric: tabular-nums; }
 .pdf-container { position: absolute; inset: 0; overflow: auto; padding: 72px 24px 80px; }
+.pdf-container.pan-mode { cursor: grab; }
+.pdf-container.pan-mode.is-panning { cursor: grabbing; }
+.pdf-container.pan-mode, .pdf-container.pan-mode .textLayer { user-select: none; }
 .pdfViewer { width: 100%; }
 .pdfViewer .page { border: 0 !important; box-shadow: 0 8px 25px rgba(42,40,34,.13); margin: 0 auto 22px !important; }
 .viewer-loading { position: absolute; z-index: 2; top: 110px; left: 50%; transform: translateX(-50%); color: var(--muted); font-size: 12px; }

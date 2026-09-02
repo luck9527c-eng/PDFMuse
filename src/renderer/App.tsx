@@ -11,6 +11,7 @@ import {
   Copy,
   FilePlus2,
   Focus,
+  Hand,
   Library,
   LockKeyhole,
   MessageSquareText,
@@ -376,6 +377,7 @@ export function App() {
   const [sidebarView, setSidebarView] = useState<"outline" | "thumbnails">("outline");
   const [passwordRequest, setPasswordRequest] = useState<PasswordRequest>();
   const [findOpen, setFindOpen] = useState(false);
+  const [panMode, setPanMode] = useState(false);
   const [findQuery, setFindQuery] = useState("");
   const [passage, setPassage] = useState<Passage>();
   const [draft, setDraft] = useState("");
@@ -478,6 +480,7 @@ export function App() {
     setLibraryError("");
     setUnavailableBookId(undefined);
     setMessages([]);
+    setPanMode(false);
   }, []);
 
   const handleOpenResult = useCallback((result: OpenPdfBookResult, attemptedBookId?: string) => {
@@ -748,6 +751,7 @@ export function App() {
             <IconButton label="适合宽度" onClick={() => viewerRef.current?.fitWidth()}><ChevronsLeft /></IconButton>
             <IconButton label="适合页面" onClick={() => viewerRef.current?.fitPage()}><Focus /></IconButton>
             <span className="toolbar-divider" />
+            <IconButton aria-pressed={panMode} label={panMode ? "关闭拖拽浏览" : "开启拖拽浏览"} onClick={() => setPanMode((value) => !value)}><Hand /></IconButton>
             <IconButton label="在 PDF 中查找" onClick={() => setFindOpen((value) => !value)}><Search /></IconButton>
           </div>
           {findOpen && (
@@ -760,7 +764,7 @@ export function App() {
               <IconButton type="button" label="关闭查找" onClick={() => { viewerRef.current?.find(""); setFindQuery(""); setFindOpen(false); }}><X /></IconButton>
             </form>
           )}
-          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} onStateChange={handleViewerState} onError={setViewerError} />}
+          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} panMode={panMode} onStateChange={handleViewerState} onError={setViewerError} />}
         </main>
 
         {rightOpen && (
