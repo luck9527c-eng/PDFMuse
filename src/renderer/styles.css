@@ -253,6 +253,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .settings-section label { display: grid; gap: 5px; margin-bottom: 10px; color: var(--muted); font-size: 10px; font-weight: 650; }
 .settings-section input, .settings-section select { height: 36px; padding: 0 9px; border: 1px solid var(--line); border-radius: 5px; color: var(--ink); background: white; font-size: 12px; }
 .settings-section input:disabled, .settings-section select:disabled { background: #efede7; color: var(--muted); }
+.settings-section textarea { min-height: 88px; max-height: 180px; padding: 8px 9px; border: 1px solid var(--line); border-radius: 5px; color: var(--ink); background: white; font-size: 12px; line-height: 1.55; resize: vertical; }
+.settings-section textarea:disabled { background: #efede7; color: var(--muted); }
+.profile-hint { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--muted); font-size: 10px; }
 .settings-section .settings-checkbox { display: flex; align-items: center; gap: 7px; width: fit-content; color: var(--ink); cursor: pointer; }
 .settings-section .settings-checkbox input { width: 15px; height: 15px; margin: 0; accent-color: var(--green); }
 .settings-security-note { margin: 3px 0 13px; color: var(--muted); font-size: 10px; line-height: 1.55; }

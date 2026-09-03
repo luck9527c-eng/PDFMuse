@@ -144,7 +144,7 @@ describe("agent host", () => {
     expect(messageEvent?.status).toBe("complete");
   });
 
-  it("injects history, focus and system prompt into the model context", async () => {
+  it("injects history, focus, reader profile and system prompt into the model context", async () => {
     const first = createFakeStreamFn(({ push }) => {
       push({ type: "start", partial: assistantMessage("") });
       push({ type: "done", reason: "stop", message: assistantMessage("第一轮回答") });
@@ -159,7 +159,10 @@ describe("agent host", () => {
       push({ type: "start", partial: assistantMessage("") });
       push({ type: "done", reason: "stop", message: assistantMessage("第二轮回答") });
     });
-    buildHost({ createStreamFn: () => second.streamFn });
+    buildHost({
+      createStreamFn: () => second.streamFn,
+      loadReaderProfile: async () => "我是工程师，偏好先结论后展开。",
+    });
 
     const focus = {
       currentPage: 3,
@@ -171,6 +174,8 @@ describe("agent host", () => {
     expect(second.requests).toHaveLength(1);
     const request = second.requests[0]!;
     expect(request.context.systemPrompt).toContain("PDFMuse");
+    expect(request.context.systemPrompt).toContain("Reader Profile");
+    expect(request.context.systemPrompt).toContain("我是工程师，偏好先结论后展开。");
     expect(request.context.tools).toEqual([]);
     const serialized = JSON.stringify(request.context.messages);
     expect(serialized).toContain("第一个问题");
@@ -182,6 +187,22 @@ describe("agent host", () => {
     const conversation = host.getConversation(BOOK_ID);
     expect(conversation).toHaveLength(4);
     expect(conversation[2]?.passage).toEqual({ page: 3, text: "选中的原文片段" });
+  });
+
+  it("truncates oversized reader profiles inside the system prompt budget", async () => {
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("好") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadReaderProfile: async () => "长".repeat(2_600),
+    });
+    await startRun("任何问题");
+    await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"));
+    const prompt = fake.requests[0]!.context.systemPrompt;
+    expect(prompt).toContain("已截断");
+    expect(prompt.length).toBeLessThan(2_700);
   });
 
   it("serializes runs on the same book conversation", async () => {

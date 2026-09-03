@@ -8,8 +8,16 @@ const SYSTEM_PROMPT = [
   "引用书中内容时注明页码；书外知识要明确说明不是本书内容。回答保持精炼，避免重复 Reader 已有的原文。",
 ].join("\n");
 
-export function buildSystemPrompt() {
-  return SYSTEM_PROMPT;
+/** Reader Profile 进入系统提示的独立小预算，超长时按字符截断。 */
+const PROFILE_BUDGET = 2_000;
+
+export function buildSystemPrompt(profile?: string) {
+  const trimmed = profile?.trim();
+  if (!trimmed) return SYSTEM_PROMPT;
+  const bounded = trimmed.length > PROFILE_BUDGET
+    ? `${trimmed.slice(0, PROFILE_BUDGET)}…（已截断）`
+    : trimmed;
+  return `${SYSTEM_PROMPT}\n\n【Reader Profile · 由 Reader 提供】\n${bounded}`;
 }
 
 /** Reading Focus 以固定结构进入问题消息，保持 Reader 原文不被改写。 */

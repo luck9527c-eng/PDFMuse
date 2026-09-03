@@ -15,6 +15,8 @@ import { createSessionStore, type SessionStore } from "./session-store.js";
 export type AgentHostOptions = {
   dataHome: string;
   loadModelConnection(): Promise<ResolvedModelConnection | undefined>;
+  /** Reader Profile 只读注入；没有 Profile 时返回空字符串。 */
+  loadReaderProfile?(): Promise<string>;
   emit(event: AgentStreamEvent): void;
   runTimeoutMs?: number;
   historyLimit?: number;
@@ -87,8 +89,9 @@ export function createAgentHost(options: AgentHostOptions) {
     question: string;
     focus?: ReadingFocus;
     connection: ResolvedModelConnection;
+    profile: string;
   }) {
-    const { runId, sessionId, question, focus, connection } = input;
+    const { runId, sessionId, question, focus, connection, profile } = input;
     if (cancelledBeforeStart.delete(runId)) return;
 
     // Reader 问题先落盘：失败或中断时问题和阅读焦点不丢失。
@@ -101,7 +104,7 @@ export function createAgentHost(options: AgentHostOptions) {
 
     const agent = new Agent({
       initialState: {
-        systemPrompt: buildSystemPrompt(),
+        systemPrompt: buildSystemPrompt(profile),
         model: toLlmModel(connection),
         messages: llmMessages.slice(0, -1),
         tools: [],
@@ -247,7 +250,8 @@ export function createAgentHost(options: AgentHostOptions) {
       const session = store.ensureSession(input.bookId);
       const runId = randomUUID();
       const focus = isReadingFocus(input.focus) ? input.focus : undefined;
-      void enqueue(session.id, () => executeRun({ runId, sessionId: session.id, question, focus, connection }));
+      const profile = await (options.loadReaderProfile?.() ?? "");
+      void enqueue(session.id, () => executeRun({ runId, sessionId: session.id, question, focus, connection, profile }));
       return { ok: true, runId, sessionId: session.id };
     },
 

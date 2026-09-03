@@ -800,6 +800,11 @@ try {
   assert.equal(confirmedPage, 2, "a non-initial page checkpoint was not persisted through IPC");
 
   // Book Conversation：从 Renderer 发起问题，验证流式回答与持久化。
+  const savedProfile = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.saveReaderProfile(${JSON.stringify({ content: "我是冒烟测试读者，偏好先给结论。" })})`,
+  );
+  assert.equal(savedProfile.ok, true, "the reader profile could not be saved through IPC");
   const agentRun = await evaluate(
     page.webSocketDebuggerUrl,
     `window.pdfMuse.startAgentRun(${JSON.stringify({
@@ -827,6 +832,8 @@ try {
   assert.equal(typeof receivedAgentStreamRequest, "object", "the agent run did not reach the local model server");
   assert.equal(receivedAgentStreamRequest.authorization, "Bearer smoke-secret", "the agent run did not use the saved API key");
   assert.equal(receivedAgentStreamRequest.body.stream, true, "the agent run did not request a streaming completion");
+  const systemMessage = receivedAgentStreamRequest.body.messages.find((message) => message.role === "system");
+  assert.match(systemMessage?.content ?? "", /我是冒烟测试读者，偏好先给结论。/, "the reader profile was not injected into the system prompt");
 
   await stopElectron(child);
   port = await reservePort();

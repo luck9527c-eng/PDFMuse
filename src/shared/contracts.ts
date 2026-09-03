@@ -250,6 +250,24 @@ export type AgentStreamEvent =
       summary?: string;
     };
 
+export type ReaderProfileState = {
+  content: string;
+  updatedAt?: string;
+};
+
+export type SaveReaderProfileInput = { content: string };
+
+export type SaveReaderProfileResult =
+  | {
+      ok: true;
+      profile: ReaderProfileState;
+    }
+  | {
+      ok: false;
+      code: "VALIDATION_ERROR" | "WRITE_ERROR";
+      message: string;
+    };
+
 export interface PDFMuseApi {
   getStartupPreflight(): Promise<StartupPreflight>;
   listLibraryBooks(): Promise<LibraryBook[]>;
@@ -270,4 +288,6 @@ export interface PDFMuseApi {
   startAgentRun(input: StartAgentRunInput): Promise<StartAgentRunResult>;
   cancelAgentRun(runId: string): Promise<void>;
   onAgentEvent(listener: (event: AgentStreamEvent) => void): () => void;
+  getReaderProfile(): Promise<ReaderProfileState>;
+  saveReaderProfile(input: SaveReaderProfileInput): Promise<SaveReaderProfileResult>;
 }

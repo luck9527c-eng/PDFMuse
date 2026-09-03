@@ -10,6 +10,7 @@ import { createModelConnectionModule } from "./model-connection.js";
 import { readAppConfig } from "./config-store.js";
 import { createAgentHost, type AgentHost } from "./agent/agent-host.js";
 import type { ResolvedModelConnection } from "./agent/model-runtime.js";
+import { createReaderProfileModule } from "./reader-profile.js";
 import type {
   AgentStreamEvent,
   SaveEmbeddingConnectionInput,
@@ -75,6 +76,7 @@ app.whenReady().then(async () => {
     const library = createLibraryModule(startupPreflight.dataHome);
     closeLibrary = library.close;
     const configPath = path.join(startupPreflight.dataHome, "config.json");
+    const readerProfile = createReaderProfileModule(startupPreflight.dataHome);
     const agentHost: AgentHost = createAgentHost({
       dataHome: startupPreflight.dataHome,
       emit: broadcastAgentEvent,
@@ -89,6 +91,7 @@ app.whenReady().then(async () => {
           }
           : undefined;
       },
+      loadReaderProfile: async () => (await readerProfile.get()).content,
     });
     closeAgentHost = agentHost.close;
     ipcMain.handle("library:list", () => library.list());
@@ -146,6 +149,8 @@ app.whenReady().then(async () => {
     ipcMain.handle("agent:get-conversation", (_event, bookId: unknown) => agentHost.getConversation(bookId));
     ipcMain.handle("agent:start-run", (_event, input: unknown) => agentHost.start(input));
     ipcMain.handle("agent:cancel-run", (_event, runId: unknown) => agentHost.cancel(runId));
+    ipcMain.handle("reader-profile:get", () => readerProfile.get());
+    ipcMain.handle("reader-profile:save", (_event, input: unknown) => readerProfile.save(input));
   }
   createWindow();
   app.on("activate", () => {

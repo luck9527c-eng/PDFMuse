@@ -33,6 +33,8 @@ const api: PDFMuseApi = {
     ipcRenderer.on("agent:event", channel);
     return () => ipcRenderer.removeListener("agent:event", channel);
   },
+  getReaderProfile: () => ipcRenderer.invoke("reader-profile:get"),
+  saveReaderProfile: (input) => ipcRenderer.invoke("reader-profile:save", input),
 };
 
 contextBridge.exposeInMainWorld("pdfMuse", api);

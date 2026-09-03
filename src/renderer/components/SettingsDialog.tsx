@@ -14,6 +14,7 @@ import { useEffect, useState } from "react";
 import type { ModelConnectionState } from "../../shared/contracts";
 import { EmbeddingConnectionSection } from "./EmbeddingConnectionSection";
 import { IconButton } from "./IconButton";
+import { ReaderProfileSection } from "./ReaderProfileSection";
 
 type Feedback = {
   tone: "success" | "error" | "neutral";
@@ -224,6 +225,8 @@ export function SettingsDialog({ warnings = [] }: { warnings?: string[] }) {
           </section>
 
           <EmbeddingConnectionSection open={open} />
+
+          <ReaderProfileSection open={open} />
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
