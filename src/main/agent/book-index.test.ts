@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { createBookIndex, tokenizeForIndex } from "./book-index.js";
+import { createBookIndex, tokenizeForIndex, type EmbeddingProvider } from "./book-index.js";
 import { createLibraryModule } from "../library.js";
 
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
@@ -87,5 +87,55 @@ describe("book index", () => {
     });
     expect(second.indexedPages).toBe(3);
     expect(loads).toBe(0);
+  });
+
+  it("uses semantic embeddings to find a synonym and applies reading focus", async () => {
+    index.close();
+    const provider: EmbeddingProvider = {
+      model: "test-embedding-v1",
+      embed: async (inputs) => inputs.map((input) => (
+        input.includes("第一章") || input.includes("Chapter One") ? [1, 0] : [0, 1]
+      )),
+    };
+    index = createBookIndex(dataHome, { getEmbeddingProvider: () => provider });
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+
+    const search = await index.search(bookId, "第一章", 3, { currentPage: 1 });
+    expect(search.status).toBe("ok");
+    if (search.status !== "ok") return;
+    expect(search.retrievalMode).toBe("hybrid");
+    expect(search.hits[0]).toMatchObject({ source: "pdf", page: 1 });
+  });
+
+  it("returns earlier conversation messages as a separate source", async () => {
+    index.close();
+    const provider: EmbeddingProvider = {
+      model: "test-embedding-v1",
+      embed: async (inputs) => inputs.map((input) => (
+        input.includes("记忆") || input.includes("回顾") ? [0, 1] : [1, 0]
+      )),
+    };
+    index = createBookIndex(dataHome, { getEmbeddingProvider: () => provider });
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+    await index.indexConversationMessage(bookId, {
+      id: "message-1",
+      role: "assistant",
+      body: "这是一条可供后续回顾的记忆",
+      status: "complete",
+    });
+
+    const search = await index.search(bookId, "回顾", 8);
+    expect(search.status).toBe("ok");
+    if (search.status !== "ok") return;
+    expect(search.hits.some((hit) => hit.source === "conversation" && hit.sourceId === "message-1")).toBe(true);
+    expect(search.hits.find((hit) => hit.source === "conversation")?.page).toBeUndefined();
+  });
+
+  it("marks retrieval as FTS-only when no embedding provider is available", async () => {
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+    const search = await index.search(bookId, "Chapter One");
+    expect(search.status).toBe("ok");
+    if (search.status !== "ok") return;
+    expect(search.retrievalMode).toBe("fts-only");
   });
 });

@@ -80,7 +80,16 @@ app.whenReady().then(async () => {
     closeLibrary = library.close;
     const configPath = path.join(startupPreflight.dataHome, "config.json");
     const readerProfile = createReaderProfileModule(startupPreflight.dataHome);
-    const bookIndex = createBookIndex(startupPreflight.dataHome);
+    const bookIndex = createBookIndex(startupPreflight.dataHome, {
+      getEmbeddingProvider: async () => {
+        const config = await readAppConfig(configPath);
+        if (!config.embedding) return undefined;
+        return {
+          model: config.embedding.model,
+          embed: (inputs: readonly string[], signal?: AbortSignal) => embeddingConnection.embed(inputs, signal),
+        };
+      },
+    });
     closeBookIndex = bookIndex.close;
     const toolRegistry = createToolRegistry();
     const agentHost: AgentHost = createAgentHost({
@@ -101,9 +110,13 @@ app.whenReady().then(async () => {
       isKnownBook: (bookId) => library.list().some((book) => book.id === bookId),
       buildTools: (context) => toolRegistry.buildAgentTools(() => ({
         bookId: context.bookId,
+        focus: context.focus,
         reportEvidence: context.reportEvidence,
         bookIndex,
       })),
+      indexConversationMessage: async (bookId, message) => {
+        await bookIndex.indexConversationMessage(bookId, message);
+      },
     });
     closeAgentHost = agentHost.close;
     ipcMain.handle("library:list", () => library.list());

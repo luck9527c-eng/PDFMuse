@@ -73,6 +73,22 @@ function readDimensions(body: unknown) {
   return embedding.length;
 }
 
+function readEmbeddings(body: unknown) {
+  if (!isRecord(body) || !Array.isArray(body.data)) return undefined;
+  const rows = body.data
+    .filter((item): item is Record<string, unknown> => isRecord(item))
+    .sort((left, right) => Number(left.index ?? 0) - Number(right.index ?? 0));
+  const vectors = rows.map((row) => row.embedding);
+  if (vectors.length === 0 || !vectors.every((vector) => (
+    Array.isArray(vector)
+    && vector.length > 0
+    && vector.every((value) => typeof value === "number" && Number.isFinite(value))
+  ))) return undefined;
+  const dimensions = (vectors[0] as number[]).length;
+  if (!vectors.every((vector) => (vector as number[]).length === dimensions)) return undefined;
+  return vectors as number[][];
+}
+
 export function createEmbeddingConnectionModule(
   dataHome: string,
   options: EmbeddingConnectionModuleOptions = {},
@@ -180,6 +196,35 @@ export function createEmbeddingConnectionModule(
         };
       } finally {
         clearTimeout(timeout);
+      }
+    },
+
+    /** Main 侧批量 Embedding 运行时；不向 Renderer 暴露 API Key。 */
+    async embed(inputs: readonly string[], signal?: AbortSignal): Promise<readonly number[][]> {
+      const config = await readAppConfig(configPath);
+      const embedding = config.embedding;
+      if (!embedding) throw new Error("嵌入模型尚未配置。");
+      if (inputs.length === 0) return [];
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+      const onAbort = () => controller.abort();
+      signal?.addEventListener("abort", onAbort);
+      try {
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        if (embedding.apiKey) headers.Authorization = `Bearer ${embedding.apiKey}`;
+        const response = await fetch(embeddingsUrl(embedding.baseUrl), {
+          method: "POST",
+          headers,
+          signal: controller.signal,
+          body: JSON.stringify({ model: embedding.model, input: [...inputs] }),
+        });
+        if (!response.ok) throw new Error(`嵌入模型服务返回 HTTP ${response.status}。`);
+        const vectors = readEmbeddings(await response.json());
+        if (!vectors || vectors.length !== inputs.length) throw new Error("嵌入模型返回了无效向量。");
+        return vectors;
+      } finally {
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", onAbort);
       }
     },
   };

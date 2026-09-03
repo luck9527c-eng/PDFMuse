@@ -1,5 +1,6 @@
 import { Type, type Static, type TSchema } from "typebox";
 
+import type { ReadingFocus } from "../../shared/contracts.js";
 import type { BookIndex } from "./book-index.js";
 import type { AgentTool, AgentToolResult } from "./openclaw-core.js";
 
@@ -13,6 +14,7 @@ export type PdfEvidence = {
 
 export type ToolExecutionContext = {
   bookId: string;
+  focus?: ReadingFocus;
   signal?: AbortSignal;
   reportEvidence(evidence: PdfEvidence[]): void;
   bookIndex: BookIndex;
@@ -77,24 +79,30 @@ function createBookSearchTool(): RegisteredTool {
         ctx.signal?.removeEventListener("abort", onOuterAbort);
       }
 
-      const outcome = await ctx.bookIndex.search(ctx.bookId, query.trim(), hitLimit);
+      const outcome = await ctx.bookIndex.search(ctx.bookId, query.trim(), hitLimit, ctx.focus, ctx.signal);
       if (outcome.status === "unavailable") {
         return { displaySummary: `检索「${query.trim()}」不可用`, contentText: outcome.note };
       }
-      const lines = outcome.hits.map((hit) => `第 ${hit.page} 页：${hit.snippet}`);
-      const evidence: PdfEvidence[] = outcome.hits.map((hit) => ({
-        source: "pdf",
-        page: hit.page,
-        snippet: hit.snippet,
-        trust: "trusted",
-      }));
-      const header = outcome.status === "partial" ? `${outcome.note}\n\n` : "";
+      const lines = outcome.hits.map((hit) => (
+        hit.source === "conversation"
+          ? `较早对话：${hit.snippet}`
+          : `第 ${hit.page ?? "未知"} 页：${hit.snippet}`
+      ));
+      const evidence: PdfEvidence[] = outcome.hits.flatMap((hit) => (
+        hit.source === "conversation" || hit.page === undefined
+          ? []
+          : [{ source: "pdf" as const, page: hit.page, snippet: hit.snippet, trust: "trusted" as const }]
+      ));
+      const header = [
+        outcome.status === "partial" ? outcome.note : "",
+        outcome.retrievalMode === "fts-only" ? "当前未完成向量检索，结果仅基于关键词匹配。" : "",
+      ].filter(Boolean).join("\n\n");
       const body = lines.length > 0
         ? lines.join("\n\n")
         : "没有在书中找到相关内容。请基于已有上下文回答，并明确说明书中未检索到。";
       const contentText = `${header}${body}`.slice(0, CONTENT_MAX_LENGTH);
       return {
-        displaySummary: `已检索「${query.trim()}」，命中 ${outcome.hits.length} 处`,
+        displaySummary: `已检索「${query.trim()}」，命中 ${outcome.hits.length} 处${outcome.retrievalMode === "hybrid" ? "（混合检索）" : ""}`,
         contentText,
         evidence,
       };

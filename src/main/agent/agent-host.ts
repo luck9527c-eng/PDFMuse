@@ -23,8 +23,16 @@ export type AgentHostOptions = {
   /** 为一次运行构造可见工具；工具通过 reportEvidence 上报检索证据。 */
   buildTools?(context: {
     bookId: string;
+    focus?: ReadingFocus;
     reportEvidence(evidence: ConversationEvidence[]): void;
   }): AgentTool[];
+  /** 将已完成的会话消息交给检索模块；失败不得阻断回答。 */
+  indexConversationMessage?(bookId: string, message: {
+    id: string;
+    role: "reader" | "assistant";
+    body: string;
+    status: string;
+  }): Promise<void> | void;
   emit(event: AgentStreamEvent): void;
   runTimeoutMs?: number;
   historyLimit?: number;
@@ -103,7 +111,7 @@ export function createAgentHost(options: AgentHostOptions) {
     connection: ResolvedModelConnection;
     profile: string;
   }) {
-    const { runId, sessionId, question, focus, connection, profile } = input;
+    const { runId, sessionId, bookId, question, focus, connection, profile } = input;
     if (cancelledBeforeStart.delete(runId)) {
       // 排队期间被取消：仍保留 Reader 问题，并发出终态让 Renderer 解除占用。
       store.appendMessage({ sessionId, runId, role: "reader", body: question, status: "complete", focus });
@@ -113,7 +121,23 @@ export function createAgentHost(options: AgentHostOptions) {
 
     // Reader 问题先落盘：失败或中断时问题和阅读焦点不丢失。
     const history = store.listMessages(sessionId);
-    store.appendMessage({ sessionId, runId, role: "reader", body: question, status: "complete", focus });
+    for (const message of history) {
+      if (message.body && message.status === "complete") {
+        await options.indexConversationMessage?.(bookId, {
+          id: message.id,
+          role: message.role,
+          body: message.body,
+          status: message.status,
+        });
+      }
+    }
+    const readerMessage = store.appendMessage({ sessionId, runId, role: "reader", body: question, status: "complete", focus });
+    await options.indexConversationMessage?.(bookId, {
+      id: readerMessage.id,
+      role: readerMessage.role,
+      body: readerMessage.body,
+      status: readerMessage.status,
+    });
 
     const llmMessages = historyToLlmMessages(history, question, focus, historyLimit);
     const questionMessage = llmMessages[llmMessages.length - 1];
@@ -128,7 +152,7 @@ export function createAgentHost(options: AgentHostOptions) {
         if (!duplicate) collectedEvidence.push(item);
       }
     };
-    const tools = options.buildTools?.({ bookId: input.bookId, reportEvidence }) ?? [];
+    const tools = options.buildTools?.({ bookId: input.bookId, focus, reportEvidence }) ?? [];
 
     const agent = new Agent({
       initialState: {
@@ -229,6 +253,14 @@ export function createAgentHost(options: AgentHostOptions) {
         evidence: collectedEvidence,
       });
       if (finalized) {
+        if (assistantFailure?.status !== "cancelled" && assistantBody) {
+          await options.indexConversationMessage?.(bookId, {
+            id: assistantMessageId,
+            role: "assistant",
+            body: assistantBody,
+            status: assistantFailure?.status ?? "complete",
+          });
+        }
         options.emit({
           stream: "message",
           runId,
