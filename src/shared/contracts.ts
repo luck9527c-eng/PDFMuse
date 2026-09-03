@@ -186,6 +186,14 @@ export type TestEmbeddingConnectionResult =
 
 export type AgentMessageStatus = "complete" | "error" | "cancelled";
 
+/** 回答引用的 PDF Evidence：来自当前书的可信检索结果，可点击跳回原文。 */
+export type ConversationEvidence = {
+  source: "pdf";
+  page: number;
+  snippet: string;
+  trust: "trusted";
+};
+
 export type ConversationMessage = {
   id: string;
   sessionId: string;
@@ -195,6 +203,7 @@ export type ConversationMessage = {
   status: AgentMessageStatus;
   errorMessage?: string;
   passage?: { page: number; text: string; rects: NormalizedPageRect[] };
+  evidence?: ConversationEvidence[];
   createdAt: string;
 };
 

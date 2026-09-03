@@ -49,6 +49,10 @@ import { createReadingStateWriter } from "./reading-state-persistence";
 type PassagePopover = Extract<ViewerSelection, { kind: "selected" }>;
 type StreamingReply = { runId: string; sessionId: string; body: string };
 
+const TOOL_TITLES: Record<string, string> = {
+  book_search: "检索本书",
+};
+
 const browserPreflight: StartupPreflight = {
   ok: true,
   dataHome: "浏览器预览模式",
@@ -392,6 +396,7 @@ export function App() {
   const [attachedPassage, setAttachedPassage] = useState<SelectedPassage>();
   const [conversation, setConversation] = useState<ConversationMessage[]>([]);
   const [streamingReply, setStreamingReply] = useState<StreamingReply>();
+  const [toolStatus, setToolStatus] = useState<string>();
   const [agentNotice, setAgentNotice] = useState("");
   const [conversationLoading, setConversationLoading] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
@@ -430,6 +435,7 @@ export function App() {
   const resetConversationState = useCallback(() => {
     setConversation([]);
     setStreamingReply(undefined);
+    setToolStatus(undefined);
     setAgentNotice("");
     activeRunRef.current = undefined;
   }, []);
@@ -683,7 +689,7 @@ export function App() {
     stateWriterRef.current?.schedule({ bookId: book.id, state: readingStateRef.current });
   }, [book, leftOpen, rightOpen]);
 
-  // Agent 事件订阅：流式增量、消息终态与会话收尾都由 Main 推送。
+  // Agent 事件订阅：流式增量、工具状态、消息终态与会话收尾都由 Main 推送。
   useEffect(() => {
     if (!window.pdfMuse) return;
     return window.pdfMuse.onAgentEvent((event) => {
@@ -692,9 +698,13 @@ export function App() {
         if (event.stream === "assistant") {
           activeRunRef.current = { ...active, body: active.body + event.delta };
           setStreamingReply(activeRunRef.current);
+        } else if (event.stream === "tool") {
+          const title = TOOL_TITLES[event.name] ?? event.name;
+          setToolStatus(event.phase === "end" ? `${title}完成` : `${title}中...`);
         } else if (event.stream === "lifecycle" && (event.phase === "end" || event.phase === "cancelled" || event.phase === "error")) {
           activeRunRef.current = undefined;
           setStreamingReply(undefined);
+          setToolStatus(undefined);
           if (book) void refreshConversation(book.id);
         }
       }
@@ -940,6 +950,20 @@ export function App() {
                             </div>
                           )}
                           {message.status === "cancelled" && message.body && <div className="message-interrupted">回答已停止，以上为已生成内容。</div>}
+                          {message.evidence && message.evidence.length > 0 && (
+                            <div className="evidence-tags">
+                              {[...new Set(message.evidence.map((item) => item.page))].map((page) => (
+                                <button
+                                  className="evidence-tag"
+                                  key={page}
+                                  title={message.evidence!.find((item) => item.page === page)?.snippet}
+                                  onClick={() => viewerRef.current?.goToPage(page)}
+                                >
+                                  本书第 {page} 页
+                                </button>
+                              ))}
+                            </div>
+                          )}
                           {passageByRun.get(message.runId) && (
                             <button className="evidence-tag" onClick={() => viewerRef.current?.goToPage(passageByRun.get(message.runId)!.page)}>参考：PDF 第 {passageByRun.get(message.runId)!.page} 页</button>
                           )}
@@ -951,6 +975,7 @@ export function App() {
                     <article className="message assistant streaming">
                       <div className="message-role">PDFMuse</div>
                       {streamingReply.body ? <MarkdownView markdown={streamingReply.body} /> : <div className="streaming-hint"><Loader2 size={13} className="spin" />正在生成回答...</div>}
+                      {toolStatus && <div className="tool-status" role="status"><Search size={12} className="spin" />{toolStatus}</div>}
                       {streamingReply.body && <span className="streaming-cursor" aria-hidden />}
                     </article>
                   )}

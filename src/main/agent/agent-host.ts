@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type {
   AgentStreamEvent,
+  ConversationEvidence,
   ConversationMessage,
   ReadingFocus,
   StartAgentRunInput,
@@ -9,7 +10,7 @@ import type {
 } from "../../shared/contracts.js";
 import { assistantText, buildSystemPrompt, historyToLlmMessages } from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, toLlmModel, type ResolvedModelConnection } from "./model-runtime.js";
-import { Agent, type AgentEvent, type StreamFn } from "./openclaw-core.js";
+import { Agent, type AgentEvent, type AgentTool, type StreamFn } from "./openclaw-core.js";
 import { createSessionStore, type SessionStore } from "./session-store.js";
 
 export type AgentHostOptions = {
@@ -19,6 +20,11 @@ export type AgentHostOptions = {
   loadReaderProfile?(): Promise<string>;
   /** Book 所有权验证：伪造的 bookId 不允许建立会话。 */
   isKnownBook?(bookId: string): boolean | Promise<boolean>;
+  /** 为一次运行构造可见工具；工具通过 reportEvidence 上报检索证据。 */
+  buildTools?(context: {
+    bookId: string;
+    reportEvidence(evidence: ConversationEvidence[]): void;
+  }): AgentTool[];
   emit(event: AgentStreamEvent): void;
   runTimeoutMs?: number;
   historyLimit?: number;
@@ -91,6 +97,7 @@ export function createAgentHost(options: AgentHostOptions) {
   async function executeRun(input: {
     runId: string;
     sessionId: string;
+    bookId: string;
     question: string;
     focus?: ReadingFocus;
     connection: ResolvedModelConnection;
@@ -112,12 +119,23 @@ export function createAgentHost(options: AgentHostOptions) {
     const questionMessage = llmMessages[llmMessages.length - 1];
     if (!questionMessage) return;
 
+    const collectedEvidence: ConversationEvidence[] = [];
+    const reportEvidence = (evidence: ConversationEvidence[]) => {
+      for (const item of evidence) {
+        const duplicate = collectedEvidence.some(
+          (existing) => existing.page === item.page && existing.snippet === item.snippet,
+        );
+        if (!duplicate) collectedEvidence.push(item);
+      }
+    };
+    const tools = options.buildTools?.({ bookId: input.bookId, reportEvidence }) ?? [];
+
     const agent = new Agent({
       initialState: {
         systemPrompt: buildSystemPrompt(profile),
         model: toLlmModel(connection),
         messages: llmMessages.slice(0, -1),
-        tools: [],
+        tools,
       },
       streamFn: makeStreamFn(connection),
     });
@@ -208,6 +226,7 @@ export function createAgentHost(options: AgentHostOptions) {
         body: assistantBody,
         status: assistantFailure?.status ?? "complete",
         errorMessage: assistantFailure?.message,
+        evidence: collectedEvidence,
       });
       if (finalized) {
         options.emit({
@@ -265,7 +284,15 @@ export function createAgentHost(options: AgentHostOptions) {
       const runId = randomUUID();
       const focus = isReadingFocus(input.focus) ? input.focus : undefined;
       const profile = await (options.loadReaderProfile?.() ?? "");
-      void enqueue(sessionId, () => executeRun({ runId, sessionId, question, focus, connection, profile }));
+      void enqueue(sessionId, () => executeRun({
+        runId,
+        sessionId,
+        bookId: input.bookId,
+        question,
+        focus,
+        connection,
+        profile,
+      }));
       return { ok: true, runId, sessionId };
     },
 

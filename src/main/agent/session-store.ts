@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import type { AgentMessageStatus, ConversationMessage, ReadingFocus } from "../../shared/contracts.js";
+import type {
+  AgentMessageStatus,
+  ConversationEvidence,
+  ConversationMessage,
+  ReadingFocus,
+} from "../../shared/contracts.js";
 
 type SessionRow = {
   id: string;
@@ -23,9 +28,25 @@ type MessageRow = {
   status: StoredMessageStatus;
   error_message: string | null;
   focus_json: string | null;
+  evidence_json: string | null;
   created_at: string;
 };
 
+function parseEvidence(json: string | null): ConversationEvidence[] | undefined {
+  if (!json) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (!Array.isArray(parsed)) return undefined;
+    return parsed.filter((item): item is ConversationEvidence => (
+      typeof item === "object" && item !== null
+      && (item as { source?: unknown }).source === "pdf"
+      && Number.isSafeInteger((item as { page?: unknown }).page)
+      && typeof (item as { snippet?: unknown }).snippet === "string"
+    ));
+  } catch {
+    return undefined;
+  }
+}
 
 function toConversationMessage(row: MessageRow): ConversationMessage {
   const message: ConversationMessage = {
@@ -52,6 +73,8 @@ function toConversationMessage(row: MessageRow): ConversationMessage {
       // 旧的或不完整的 focus 记录不进入会话展示。
     }
   }
+  const evidence = parseEvidence(row.evidence_json);
+  if (evidence && evidence.length > 0) message.evidence = evidence;
   return message;
 }
 
@@ -75,12 +98,21 @@ export function createSessionStore(dataHome: string) {
       status TEXT NOT NULL CHECK (status IN ('streaming', 'complete', 'error', 'cancelled')),
       error_message TEXT,
       focus_json TEXT,
+      evidence_json TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS agent_messages_session_order
       ON agent_messages(session_id, created_at, id);
   `);
+  // 旧库迁移：T08 之前的 agent_messages 没有 evidence_json。
+  const messageColumns = new Set(
+    (database.prepare("PRAGMA table_info(agent_messages)").all() as { name: string }[])
+      .map((column) => column.name),
+  );
+  if (!messageColumns.has("evidence_json")) {
+    database.exec("ALTER TABLE agent_messages ADD COLUMN evidence_json TEXT");
+  }
 
   const findSessionStatement = database.prepare(`
     SELECT id, book_id, created_at, updated_at FROM agent_sessions WHERE book_id = ?
@@ -100,14 +132,14 @@ export function createSessionStore(dataHome: string) {
   `);
   const updateMessageStatement = database.prepare(`
     UPDATE agent_messages
-    SET body = ?, status = ?, error_message = ?, updated_at = ?
+    SET body = ?, status = ?, error_message = ?, evidence_json = COALESCE(?, evidence_json), updated_at = ?
     WHERE id = ? AND session_id = ?
   `);
   const findMessageRunStatement = database.prepare(
     "SELECT run_id, status FROM agent_messages WHERE id = ? AND session_id = ?",
   );
   const listMessagesStatement = database.prepare(`
-    SELECT id, session_id, run_id, role, body, status, error_message, focus_json, created_at
+    SELECT id, session_id, run_id, role, body, status, error_message, focus_json, evidence_json, created_at
     FROM agent_messages
     WHERE session_id = ?
     ORDER BY created_at ASC, id ASC
@@ -187,6 +219,7 @@ export function createSessionStore(dataHome: string) {
       body: string;
       status: AgentMessageStatus;
       errorMessage?: string;
+      evidence?: ConversationEvidence[];
     }) {
       const owned = findMessageRunStatement.get(input.messageId, input.sessionId) as
         | { run_id: string; status: string }
@@ -196,6 +229,7 @@ export function createSessionStore(dataHome: string) {
         input.body,
         input.status,
         input.errorMessage ?? null,
+        input.evidence && input.evidence.length > 0 ? JSON.stringify(input.evidence) : null,
         now(),
         input.messageId,
         input.sessionId,

@@ -1,10 +1,11 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { AgentStreamEvent, StartAgentRunResult } from "../../shared/contracts.js";
 import { createAgentHost, type AgentHost } from "./agent-host.js";
+import { createBookIndex } from "./book-index.js";
 import type { ResolvedModelConnection } from "./model-runtime.js";
 import {
   AssistantMessageEventStream,
@@ -15,6 +16,10 @@ import {
   type SimpleStreamOptions,
 } from "./openclaw-core.js";
 import { createSessionStore } from "./session-store.js";
+import { createLibraryModule } from "../library.js";
+import { createToolRegistry } from "./tool-registry.js";
+
+const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
 
 const BOOK_ID = "a".repeat(64);
 const CONNECTION: ResolvedModelConnection = {
@@ -403,5 +408,84 @@ describe("agent host", () => {
     expect(conversation.at(-1)?.status).toBe("cancelled");
     expect(conversation.at(-1)?.errorMessage).toContain("程序中断，回答未完成");
     expect(conversation.at(-1)?.body).toBe("写到一半");
+  });
+
+  it("runs book_search tool turns and persists pdf evidence", async () => {
+    // 真实 Library + 索引 + Registry，验证工具续轮闭环。
+    const library = createLibraryModule(dataHome);
+    const bookIndex = createBookIndex(dataHome);
+    const opened = await library.openPath(FIXTURE);
+    expect(opened.ok).toBe(true);
+    const fixtureBookId = opened.ok ? opened.book.id : "";
+    const registry = createToolRegistry();
+
+    const requests: CapturedRequest[] = [];
+    const streamFn = async (model: Model, context: Context, options?: SimpleStreamOptions) => {
+      const request: CapturedRequest = { model, context, options };
+      requests.push(request);
+      const stream = new AssistantMessageEventStream();
+      void Promise.resolve().then(() => {
+        if (requests.length === 1) {
+          // 第一轮：模型请求检索本书。
+          const toolCallMessage = assistantMessage("", "toolUse");
+          toolCallMessage.content = [{
+            type: "toolCall",
+            id: "call-book-1",
+            name: "book_search",
+            arguments: { query: "Chapter One" },
+          }];
+          stream.push({ type: "start", partial: toolCallMessage });
+          stream.push({
+            type: "toolcall_end",
+            contentIndex: 0,
+            toolCall: { type: "toolCall", id: "call-book-1", name: "book_search", arguments: { query: "Chapter One" } },
+            partial: toolCallMessage,
+          });
+          stream.push({ type: "done", reason: "toolUse", message: toolCallMessage });
+          return;
+        }
+        // 第二轮：模型基于工具结果回答。
+        stream.push({ type: "start", partial: assistantMessage("") });
+        stream.push({ type: "text_delta", contentIndex: 0, delta: "第一章内容如下。" });
+        stream.push({ type: "done", reason: "stop", message: assistantMessage("第一章内容如下。") });
+      });
+      return stream;
+    };
+
+    buildHost({
+      createStreamFn: () => streamFn,
+      buildTools: (context) => registry.buildAgentTools(() => ({
+        bookId: context.bookId,
+        reportEvidence: context.reportEvidence,
+        bookIndex,
+      })),
+    });
+
+    const result = await host.start({ bookId: fixtureBookId, question: "第一章讲了什么？" });
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    // 两个模型轮次，第二轮上下文含工具结果。
+    expect(requests.length).toBe(2);
+    const secondRound = JSON.stringify(requests[1]!.context.messages);
+    expect(secondRound).toContain("toolResult");
+    expect(secondRound).toContain("book_search");
+    expect(secondRound).toContain("Chapter One");
+
+    // 工具事件顺序：start 在 end 之前。
+    const toolEvents = events.filter((event): event is Extract<AgentStreamEvent, { stream: "tool" }> => event.stream === "tool");
+    expect(toolEvents.map((event) => event.phase)).toEqual(["start", "update", "end"]);
+    expect(toolEvents[0]?.name).toBe("book_search");
+
+    // Evidence 持久化到 assistant 消息并指向真实页码。
+    const conversation = host.getConversation(fixtureBookId);
+    expect(conversation.at(-1)?.status).toBe("complete");
+    expect(conversation.at(-1)?.body).toBe("第一章内容如下。");
+    expect(conversation.at(-1)?.evidence?.[0]).toMatchObject({ source: "pdf", page: 1, trust: "trusted" });
+    expect(conversation.at(-1)?.evidence?.[0]?.snippet).toContain("Chapter One");
+
+    await Promise.resolve();
+    bookIndex.close();
+    library.close();
   });
 });

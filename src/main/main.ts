@@ -9,7 +9,9 @@ import { createLibraryModule } from "./library.js";
 import { createModelConnectionModule } from "./model-connection.js";
 import { readAppConfig } from "./config-store.js";
 import { createAgentHost, type AgentHost } from "./agent/agent-host.js";
+import { createBookIndex } from "./agent/book-index.js";
 import type { ResolvedModelConnection } from "./agent/model-runtime.js";
+import { createToolRegistry } from "./agent/tool-registry.js";
 import { createReaderProfileModule } from "./reader-profile.js";
 import type {
   AgentStreamEvent,
@@ -24,6 +26,7 @@ const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 let startupPreflight: StartupPreflight;
 let closeLibrary: (() => void) | undefined;
 let closeAgentHost: (() => void) | undefined;
+let closeBookIndex: (() => void) | undefined;
 
 function broadcastAgentEvent(event: AgentStreamEvent) {
   for (const window of BrowserWindow.getAllWindows()) {
@@ -77,6 +80,9 @@ app.whenReady().then(async () => {
     closeLibrary = library.close;
     const configPath = path.join(startupPreflight.dataHome, "config.json");
     const readerProfile = createReaderProfileModule(startupPreflight.dataHome);
+    const bookIndex = createBookIndex(startupPreflight.dataHome);
+    closeBookIndex = bookIndex.close;
+    const toolRegistry = createToolRegistry();
     const agentHost: AgentHost = createAgentHost({
       dataHome: startupPreflight.dataHome,
       emit: broadcastAgentEvent,
@@ -93,6 +99,11 @@ app.whenReady().then(async () => {
       },
       loadReaderProfile: async () => (await readerProfile.get()).content,
       isKnownBook: (bookId) => library.list().some((book) => book.id === bookId),
+      buildTools: (context) => toolRegistry.buildAgentTools(() => ({
+        bookId: context.bookId,
+        reportEvidence: context.reportEvidence,
+        bookIndex,
+      })),
     });
     closeAgentHost = agentHost.close;
     ipcMain.handle("library:list", () => library.list());
@@ -164,6 +175,8 @@ app.once("before-quit", () => {
   closeLibrary = undefined;
   closeAgentHost?.();
   closeAgentHost = undefined;
+  closeBookIndex?.();
+  closeBookIndex = undefined;
 });
 
 app.on("window-all-closed", () => {

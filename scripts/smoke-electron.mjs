@@ -171,8 +171,8 @@ async function waitForStartup(webSocketUrl) {
   return state;
 }
 
-async function waitForText(webSocketUrl, expected) {
-  const deadline = Date.now() + 3_000;
+async function waitForText(webSocketUrl, expected, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
   let bodyText = "";
   while (Date.now() < deadline) {
     bodyText = await evaluate(webSocketUrl, "document.body.innerText");
@@ -279,13 +279,45 @@ const modelServer = createServer((request, response) => {
     }
     if (request.url?.endsWith("/chat/completions") && receivedRequest.body.stream) {
       receivedAgentStreamRequest = receivedRequest;
+      const messages = receivedRequest.body.messages ?? [];
+      const hasToolResult = messages.some((message) => message.role === "tool");
+      const lastUser = [...messages].reverse().find((message) => message.role === "user");
+      const isToolQuestion = typeof lastUser?.content === "string" && lastUser.content.includes("第二章在哪");
       response.writeHead(200, { "Content-Type": "text/event-stream" });
-      const chunks = ["PDFMuse 冒烟", "流式回答", "已完成。"];
-      const events = [
-        { id: "chatcmpl-agent", choices: [{ delta: { role: "assistant" } }] },
-        ...chunks.map((content) => ({ id: "chatcmpl-agent", choices: [{ delta: { content } }] })),
-        { id: "chatcmpl-agent", choices: [{ delta: {}, finish_reason: "stop" }] },
-      ];
+      let events;
+      if (isToolQuestion && !hasToolResult) {
+        // 第一轮：模型请求检索本书。
+        events = [
+          {
+            id: "chatcmpl-tool",
+            choices: [{
+              delta: {
+                tool_calls: [{
+                  index: 0,
+                  id: "call-smoke-book",
+                  type: "function",
+                  function: { name: "book_search", arguments: JSON.stringify({ query: "Chapter Two" }) },
+                }],
+              },
+            }],
+          },
+          { id: "chatcmpl-tool", choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+        ];
+      } else if (hasToolResult) {
+        // 第二轮：模型基于工具结果回答并引用页码。
+        events = [
+          { id: "chatcmpl-tool", choices: [{ delta: { role: "assistant" } }] },
+          { id: "chatcmpl-tool", choices: [{ delta: { content: "第二章从本书第 2 页开始，讲的是 Chapter Two。" } }] },
+          { id: "chatcmpl-tool", choices: [{ delta: {}, finish_reason: "stop" }] },
+        ];
+      } else {
+        const chunks = ["PDFMuse 冒烟", "流式回答", "已完成。"];
+        events = [
+          { id: "chatcmpl-agent", choices: [{ delta: { role: "assistant" } }] },
+          ...chunks.map((content) => ({ id: "chatcmpl-agent", choices: [{ delta: { content } }] })),
+          { id: "chatcmpl-agent", choices: [{ delta: {}, finish_reason: "stop" }] },
+        ];
+      }
       for (const event of events) {
         response.write(`data: ${JSON.stringify(event)}\n\n`);
       }
@@ -800,19 +832,28 @@ try {
   assert.equal(confirmedPage, 2, "a non-initial page checkpoint was not persisted through IPC");
 
   // Book Conversation：从 Renderer 发起问题，验证流式回答与持久化。
+  // 阅读状态场景收起过 AI 助手，先展开再走真实输入路径。
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `document.querySelector('[aria-label="展开 AI 助手"]')?.click()`,
+  );
   const savedProfile = await evaluate(
     page.webSocketDebuggerUrl,
     `window.pdfMuse.saveReaderProfile(${JSON.stringify({ content: "我是冒烟测试读者，偏好先给结论。" })})`,
   );
   assert.equal(savedProfile.ok, true, "the reader profile could not be saved through IPC");
-  const agentRun = await evaluate(
+  const agentAskStarted = await evaluate(
     page.webSocketDebuggerUrl,
-    `window.pdfMuse.startAgentRun(${JSON.stringify({
-      bookId: populatedLibrary[0].id,
-      question: "冒烟测试问题：第一章讲了什么？",
-    })})`,
+    `(() => {
+    const textarea = document.querySelector('.composer textarea');
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(textarea, "冒烟测试问题：第一章讲了什么？");
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    setTimeout(() => document.querySelector('[aria-label="发送问题"]')?.click(), 40);
+    return true;
+  })()`,
   );
-  assert.equal(agentRun.ok, true, "the agent run was not accepted");
+  assert.equal(agentAskStarted, true, "the agent question could not be typed into the composer");
   // 先等 Main 侧完成持久化，再验证 UI（问题文本在终态刷新后才上屏）。
   let persistedConversation = [];
   const persistenceDeadline = Date.now() + 8_000;
@@ -866,6 +907,31 @@ try {
   await evaluate(page.webSocketDebuggerUrl, `document.querySelector('[aria-label="展开 AI 助手"]')?.click()`);
   const restoredConversationText = await waitForText(page.webSocketDebuggerUrl, "PDFMuse 冒烟流式回答已完成。");
   assert.match(restoredConversationText, /冒烟测试问题/, "the restored conversation is not rendered in the assistant panel");
+
+  // book_search 工具续轮：问题触发检索，回答带可点击的本书页码 Evidence。
+  const toolAskStarted = await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => {
+    const textarea = document.querySelector('.composer textarea');
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(textarea, "第二章在哪一章？");
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    setTimeout(() => document.querySelector('[aria-label="发送问题"]')?.click(), 40);
+    return true;
+  })()`,
+  );
+  assert.equal(toolAskStarted, true, "the book_search question could not be typed into the composer");
+  const toolAnswerText = await waitForText(page.webSocketDebuggerUrl, "第二章从本书第 2 页开始", 15_000);
+  assert.match(toolAnswerText, /本书第 2 页/, "the clickable book evidence page tag is unavailable");
+  const toolConversation = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.getBookConversation(${JSON.stringify(populatedLibrary[0].id)})`,
+  );
+  const toolAnswer = toolConversation.at(-1);
+  assert.equal(toolAnswer.status, "complete", "the tool-assisted answer is not complete");
+  assert.equal(toolAnswer.evidence?.[0]?.page, 2, "pdf evidence was not persisted with the answer");
+  assert.equal(toolAnswer.evidence?.[0]?.source, "pdf", "the persisted evidence is not marked as a pdf source");
+  assert.match(toolAnswer.evidence?.[0]?.snippet ?? "", /Chapter Two/, "the persisted evidence snippet is invalid");
 
   await stopElectron(child);
   await unlink(fixturePath);
