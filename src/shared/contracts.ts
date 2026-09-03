@@ -194,7 +194,7 @@ export type ConversationMessage = {
   body: string;
   status: AgentMessageStatus;
   errorMessage?: string;
-  passage?: { page: number; text: string };
+  passage?: { page: number; text: string; rects: NormalizedPageRect[] };
   createdAt: string;
 };
 

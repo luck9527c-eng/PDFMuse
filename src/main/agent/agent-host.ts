@@ -7,7 +7,7 @@ import type {
   StartAgentRunInput,
   StartAgentRunResult,
 } from "../../shared/contracts.js";
-import { buildSystemPrompt, historyToLlmMessages } from "./context-assembly.js";
+import { assistantText, buildSystemPrompt, historyToLlmMessages } from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, toLlmModel, type ResolvedModelConnection } from "./model-runtime.js";
 import { Agent, type AgentEvent, type StreamFn } from "./openclaw-core.js";
 import { createSessionStore, type SessionStore } from "./session-store.js";
@@ -17,6 +17,8 @@ export type AgentHostOptions = {
   loadModelConnection(): Promise<ResolvedModelConnection | undefined>;
   /** Reader Profile 只读注入；没有 Profile 时返回空字符串。 */
   loadReaderProfile?(): Promise<string>;
+  /** Book 所有权验证：伪造的 bookId 不允许建立会话。 */
+  isKnownBook?(bookId: string): boolean | Promise<boolean>;
   emit(event: AgentStreamEvent): void;
   runTimeoutMs?: number;
   historyLimit?: number;
@@ -46,9 +48,12 @@ function isReadingFocus(value: unknown): value is ReadingFocus {
   return true;
 }
 
+function isBookId(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
 function isStartInput(value: Record<string, unknown>): value is StartAgentRunInput {
-  return typeof value.bookId === "string" && /^[a-f0-9]{64}$/.test(value.bookId)
-    && typeof value.question === "string";
+  return isBookId(value.bookId) && typeof value.question === "string";
 }
 
 type ActiveRun = {
@@ -92,7 +97,12 @@ export function createAgentHost(options: AgentHostOptions) {
     profile: string;
   }) {
     const { runId, sessionId, question, focus, connection, profile } = input;
-    if (cancelledBeforeStart.delete(runId)) return;
+    if (cancelledBeforeStart.delete(runId)) {
+      // 排队期间被取消：仍保留 Reader 问题，并发出终态让 Renderer 解除占用。
+      store.appendMessage({ sessionId, runId, role: "reader", body: question, status: "complete", focus });
+      options.emit({ stream: "lifecycle", phase: "cancelled", runId, sessionId });
+      return;
+    }
 
     // Reader 问题先落盘：失败或中断时问题和阅读焦点不丢失。
     const history = store.listMessages(sessionId);
@@ -148,10 +158,7 @@ export function createAgentHost(options: AgentHostOptions) {
         }
         case "message_end":
           if (event.message.role === "assistant") {
-            const content = event.message.content
-              .filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
-              .map((block) => block.text)
-              .join("");
+            const content = assistantText(event.message);
             if (content) assistantBody = content;
             if (event.message.stopReason === "error") {
               const normalized = normalizeModelError(event.message);
@@ -247,12 +254,19 @@ export function createAgentHost(options: AgentHostOptions) {
           message: "尚未配置对话模型，请先在设置中保存并测试模型连接。",
         };
       }
-      const session = store.ensureSession(input.bookId);
+      if (options.isKnownBook && !(await options.isKnownBook(input.bookId))) {
+        return {
+          ok: false,
+          code: "VALIDATION_ERROR",
+          message: "书库中没有这本 PDF 书籍，无法开始对话。",
+        };
+      }
+      const sessionId = store.ensureSession(input.bookId).id;
       const runId = randomUUID();
       const focus = isReadingFocus(input.focus) ? input.focus : undefined;
       const profile = await (options.loadReaderProfile?.() ?? "");
-      void enqueue(session.id, () => executeRun({ runId, sessionId: session.id, question, focus, connection, profile }));
-      return { ok: true, runId, sessionId: session.id };
+      void enqueue(sessionId, () => executeRun({ runId, sessionId, question, focus, connection, profile }));
+      return { ok: true, runId, sessionId };
     },
 
     cancel(runId: unknown) {
@@ -268,7 +282,7 @@ export function createAgentHost(options: AgentHostOptions) {
     },
 
     getConversation(bookId: unknown): ConversationMessage[] {
-      if (typeof bookId !== "string" || !/^[a-f0-9]{64}$/.test(bookId)) return [];
+      if (!isBookId(bookId)) return [];
       const session = store.findSession(bookId);
       return session ? store.listMessages(session.id) : [];
     },

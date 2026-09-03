@@ -59,15 +59,17 @@ export function normalizeModelError(failure: {
 }): NormalizedModelError | undefined {
   if (failure.stopReason !== "error") return undefined;
   const text = `${failure.errorCode ?? ""} ${failure.errorMessage ?? ""}`.toLowerCase();
+  // 状态码只在词边界上匹配，避免 "1401 tokens" 之类误判为 401。
   if (failure.errorCode === "401" || failure.errorCode === "403"
-    || text.includes("401") || text.includes("403")
+    || /\b(401|403)\b/.test(text)
     || text.includes("unauthorized") || text.includes("authentication") || text.includes("api key")) {
     return {
       code: "AUTHENTICATION_ERROR",
       message: "模型服务拒绝了 API 密钥，请在设置中检查密钥后重试。",
     };
   }
-  if (failure.errorCode === "429" || text.includes("429") || text.includes("rate limit") || text.includes("quota")) {
+  if (failure.errorCode === "429" || /\b429\b/.test(text)
+    || text.includes("rate limit") || text.includes("quota")) {
     return {
       code: "RATE_LIMITED",
       message: "模型服务限流或额度不足，请稍后重试。",

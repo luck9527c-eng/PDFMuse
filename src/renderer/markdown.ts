@@ -3,8 +3,7 @@ import { marked } from "marked";
 
 marked.setOptions({ gfm: true, breaks: false });
 
-const HOOKS_INSTALLED = (() => {
-  if (typeof window === "undefined") return false;
+if (typeof window !== "undefined") {
   DOMPurify.addHook("afterSanitizeAttributes", (node) => {
     // 链接只允许新窗口打开，并切断 referrer。
     if (node instanceof Element && node.tagName === "A") {
@@ -12,11 +11,6 @@ const HOOKS_INSTALLED = (() => {
       node.setAttribute("rel", "noreferrer noopener");
     }
   });
-  return true;
-})();
-
-export function isMarkdownHooksInstalled() {
-  return HOOKS_INSTALLED;
 }
 
 /** Markdown -> 安全 HTML；禁止脚本、事件处理器和危险协议。 */

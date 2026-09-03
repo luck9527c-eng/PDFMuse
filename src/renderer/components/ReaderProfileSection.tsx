@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { AlertCircle, CheckCircle2, LoaderCircle, UserRound, Save } from "lucide-react";
 
 type Feedback = {
-  tone: "success" | "error" | "neutral";
+  tone: "success" | "error";
   message: string;
 };
 
@@ -105,7 +105,7 @@ export function ReaderProfileSection({ open }: { open: boolean }) {
       </div>
       {feedback && (
         <p className={`settings-feedback ${feedback.tone}`} role={feedback.tone === "error" ? "alert" : "status"}>
-          {feedback.tone === "success" ? <CheckCircle2 size={14} /> : feedback.tone === "error" ? <AlertCircle size={14} /> : <LoaderCircle className="spin" size={14} />}
+          {feedback.tone === "success" ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
           <span>{feedback.message}</span>
         </p>
       )}

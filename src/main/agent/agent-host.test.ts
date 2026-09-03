@@ -186,7 +186,7 @@ describe("agent host", () => {
 
     const conversation = host.getConversation(BOOK_ID);
     expect(conversation).toHaveLength(4);
-    expect(conversation[2]?.passage).toEqual({ page: 3, text: "选中的原文片段" });
+    expect(conversation[2]?.passage).toEqual({ page: 3, text: "选中的原文片段", rects: [] });
   });
 
   it("truncates oversized reader profiles inside the system prompt budget", async () => {
@@ -296,6 +296,79 @@ describe("agent host", () => {
     expect(conversation[1]?.status).toBe("error");
     expect(conversation[1]?.errorMessage).toContain("API 密钥");
     expect(conversation[0]?.body).toBe("任何问题");
+  });
+
+  it("normalizes rate limiting that flows through the agent stream", async () => {
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "error", reason: "error", error: assistantMessage("", "error", "429 rate limit exceeded") });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    await startRun("被限流的问题");
+    await waitFor(() => lifecyclePhase(events).includes("error"));
+
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation[1]?.status).toBe("error");
+    expect(conversation[1]?.errorMessage).toContain("限流");
+  });
+
+  it("marks the run as failed when the model stream ends without a terminal event", async () => {
+    const fake = createFakeStreamFn(({ stream, push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "text_delta", contentIndex: 0, delta: "残缺" });
+      // 畸形响应：没有任何 done/error 事件就结束流。
+      stream.end();
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    await startRun("畸形响应问题");
+    await waitFor(() => lifecyclePhase(events).some((phase) => phase === "error" || phase === "end"), 4_000);
+
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation.length).toBe(2);
+    expect(["error", "cancelled"]).toContain(conversation[1]?.status);
+    expect(conversation[1]?.body).toBe("残缺");
+  });
+
+  it("keeps the question and emits a terminal event when a queued run is cancelled before start", async () => {
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const fake = createFakeStreamFn(({ push }) => {
+      void firstGate.then(() => {
+        push({ type: "start", partial: assistantMessage("") });
+        push({ type: "done", reason: "stop", message: assistantMessage("先回答") });
+      });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    const first = await startRun("第一问");
+    const second = await startRun("第二问");
+    expect(second.ok).toBe(true);
+    if (second.ok) host.cancel(second.runId);
+    releaseFirst?.();
+    await waitFor(() => lifecyclePhase(events).includes("cancelled"));
+
+    // 被取消的排队运行保留了问题并发出终态；后续运行不受影响。
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation.map((message) => [message.role, message.body])).toEqual([
+      ["reader", "第一问"],
+      ["assistant", "先回答"],
+      ["reader", "第二问"],
+    ]);
+  });
+
+  it("rejects a fabricated book id that is not in the library", async () => {
+    buildHost({ isKnownBook: (bookId) => bookId === BOOK_ID });
+    const result = await host.start({ bookId: "b".repeat(64), question: "伪造书籍" });
+    expect(result).toEqual({
+      ok: false,
+      code: "VALIDATION_ERROR",
+      message: "书库中没有这本 PDF 书籍，无法开始对话。",
+    });
+    expect(host.getConversation("b".repeat(64))).toEqual([]);
   });
 
   it("rejects runs when the model connection is missing", async () => {

@@ -26,7 +26,6 @@ type MessageRow = {
   created_at: string;
 };
 
-const PASSAGE_FOCUS_COLUMNS = "focus_json";
 
 function toConversationMessage(row: MessageRow): ConversationMessage {
   const message: ConversationMessage = {
@@ -46,6 +45,7 @@ function toConversationMessage(row: MessageRow): ConversationMessage {
         message.passage = {
           page: focus.selectedPassage.page,
           text: focus.selectedPassage.text,
+          rects: focus.selectedPassage.rects,
         };
       }
     } catch {
@@ -95,7 +95,7 @@ export function createSessionStore(dataHome: string) {
   `);
   const insertMessageStatement = database.prepare(`
     INSERT INTO agent_messages (
-      id, session_id, run_id, role, body, status, error_message, ${PASSAGE_FOCUS_COLUMNS}, created_at, updated_at
+      id, session_id, run_id, role, body, status, error_message, focus_json, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const updateMessageStatement = database.prepare(`
@@ -103,6 +103,9 @@ export function createSessionStore(dataHome: string) {
     SET body = ?, status = ?, error_message = ?, updated_at = ?
     WHERE id = ? AND session_id = ?
   `);
+  const findMessageRunStatement = database.prepare(
+    "SELECT run_id, status FROM agent_messages WHERE id = ? AND session_id = ?",
+  );
   const listMessagesStatement = database.prepare(`
     SELECT id, session_id, run_id, role, body, status, error_message, focus_json, created_at
     FROM agent_messages
@@ -165,12 +168,18 @@ export function createSessionStore(dataHome: string) {
         createdAt: timestamp,
         ...(input.errorMessage ? { errorMessage: input.errorMessage } : {}),
         ...(input.focus?.selectedPassage
-          ? { passage: { page: input.focus.selectedPassage.page, text: input.focus.selectedPassage.text } }
+          ? {
+            passage: {
+              page: input.focus.selectedPassage.page,
+              text: input.focus.selectedPassage.text,
+              rects: input.focus.selectedPassage.rects,
+            },
+          }
           : {}),
       };
     },
 
-    // 仅当消息仍处于 streaming 语义时才允许同一运行收尾；过期运行不得覆盖新结果。
+    // 只有仍处于 streaming 且属于同一运行的消息才允许收尾；过期运行不得覆盖新结果。
     finalizeMessage(input: {
       sessionId: string;
       messageId: string;
@@ -179,10 +188,10 @@ export function createSessionStore(dataHome: string) {
       status: AgentMessageStatus;
       errorMessage?: string;
     }) {
-      const owned = database.prepare(
-        "SELECT run_id FROM agent_messages WHERE id = ? AND session_id = ?",
-      ).get(input.messageId, input.sessionId) as { run_id: string } | undefined;
-      if (!owned || owned.run_id !== input.runId) return false;
+      const owned = findMessageRunStatement.get(input.messageId, input.sessionId) as
+        | { run_id: string; status: string }
+        | undefined;
+      if (!owned || owned.run_id !== input.runId || owned.status !== "streaming") return false;
       updateMessageStatement.run(
         input.body,
         input.status,

@@ -92,6 +92,7 @@ app.whenReady().then(async () => {
           : undefined;
       },
       loadReaderProfile: async () => (await readerProfile.get()).content,
+      isKnownBook: (bookId) => library.list().some((book) => book.id === bookId),
     });
     closeAgentHost = agentHost.close;
     ipcMain.handle("library:list", () => library.list());

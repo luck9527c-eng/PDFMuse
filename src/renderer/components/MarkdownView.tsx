@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   loadKatex,
@@ -39,7 +39,7 @@ function TextHtml({ markdown }: { markdown: string }) {
 }
 
 /** AI 回答的安全渲染：Markdown/GFM + 代码块 + 惰性加载的 KaTeX 公式，不执行 HTML 或脚本。 */
-export function MarkdownView({ markdown }: { markdown: string; children?: ReactNode }) {
+export function MarkdownView({ markdown }: { markdown: string }) {
   const segments = useMemo(() => splitFormulas(markdown), [markdown]);
   if (segments.every((segment: MarkdownSegment) => segment.kind === "text" && !segment.value)) {
     return null;

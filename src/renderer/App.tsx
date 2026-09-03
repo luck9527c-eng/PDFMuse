@@ -427,6 +427,13 @@ export function App() {
     }
   }, []);
 
+  const resetConversationState = useCallback(() => {
+    setConversation([]);
+    setStreamingReply(undefined);
+    setAgentNotice("");
+    activeRunRef.current = undefined;
+  }, []);
+
   useEffect(() => {
     const demoRequested = import.meta.env.DEV && new URLSearchParams(window.location.search).has("demo");
     if (window.pdfMuse || !demoRequested) return;
@@ -487,16 +494,13 @@ export function App() {
     setViewerError("");
     setLibraryError("");
     setUnavailableBookId(undefined);
-    setConversation([]);
-    setStreamingReply(undefined);
-    setAgentNotice("");
-    activeRunRef.current = undefined;
+    resetConversationState();
     void refreshConversation(openedBook.id);
     setPanMode(false);
     setPassage(undefined);
     setAttachedPassage(undefined);
     setSelectionFeedback(undefined);
-  }, [refreshConversation]);
+  }, [refreshConversation, resetConversationState]);
 
   const handleOpenResult = useCallback((result: OpenPdfBookResult, attemptedBookId?: string) => {
     if (result.ok) {
@@ -628,12 +632,9 @@ export function App() {
     setLibraryError("");
     setUnavailableBookId(undefined);
     setLibraryLoading(true);
-    setConversation([]);
-    setStreamingReply(undefined);
-    setAgentNotice("");
-    activeRunRef.current = undefined;
+    resetConversationState();
     void refreshLibrary();
-  }, [refreshLibrary]);
+  }, [refreshLibrary, resetConversationState]);
 
   const handleViewerState = useCallback((state: ViewerState) => {
     setViewerState(state);
@@ -726,7 +727,7 @@ export function App() {
           role: "reader",
           body: question,
           status: "complete",
-          ...(passage ? { passage: { page: passage.page, text: passage.text } } : {}),
+          ...(passage ? { passage: { page: passage.page, text: passage.text, rects: passage.rects } } : {}),
           createdAt: new Date().toISOString(),
         },
       ]);
@@ -780,8 +781,9 @@ export function App() {
       .reverse()
       .find((item) => item.role === "reader" && item.runId === message.runId);
     if (!readerQuestion) return;
+    // 重试沿用原 Selected Passage 的完整 Evidence 坐标。
     const passage = readerQuestion.passage
-      ? { bookId: book.id, page: readerQuestion.passage.page, text: readerQuestion.passage.text, rects: [] }
+      ? { bookId: book.id, page: readerQuestion.passage.page, text: readerQuestion.passage.text, rects: readerQuestion.passage.rects }
       : undefined;
     void askAgent(readerQuestion.body, passage);
   }, [askAgent, book, conversation]);
