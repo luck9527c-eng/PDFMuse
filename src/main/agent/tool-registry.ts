@@ -45,13 +45,13 @@ const bookSearchSchema = Type.Object({
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, description: "返回的命中数量上限，默认 6" })),
 });
 
-/** book_search：整本书精确检索，FTS 命中 + LIKE 兜底，返回带页码的原文摘录。 */
+/** book_search：整本书混合检索，返回带来源的 PDF 摘录或较早会话候选。 */
 function createBookSearchTool(): RegisteredTool {
   return {
     name: "book_search",
     title: "检索本书",
     description:
-      "在 Reader 当前阅读的 PDF 书籍全文中做精确检索。当问题可能涉及书中其他章节、或需要给出原文出处页码时调用。返回若干带页码的原文摘录。",
+      "在 Reader 当前阅读的 PDF 书籍中进行关键词与语义混合检索；当问题可能涉及其他章节、需要原文页码，或需要找回较早对话时调用。返回带来源的原文摘录。",
     parameters: bookSearchSchema,
     availability: "always",
     risk: "read-only",
