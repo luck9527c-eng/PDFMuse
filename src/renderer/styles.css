@@ -145,6 +145,41 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .passage-chip p { max-height: 34px; margin: 0; overflow: hidden; color: var(--muted); font-size: 10px; line-height: 1.55; }
 .passage-chip button { position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; display: grid; place-items: center; border: 0; background: transparent; cursor: pointer; }
 
+.conversation-loading { margin-bottom: 14px; color: var(--muted); font-size: 11px; }
+.passage-quote { margin-top: 7px; color: var(--green); font-size: 10px; font-weight: 700; }
+.message-failure { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 9px; padding: 7px 8px; border-radius: 5px; background: #f9ece7; color: #8a4b2f; font-size: 11px; }
+.message-failure span { min-width: 0; }
+.retry-command { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border: 1px solid #d9b6a4; border-radius: 4px; background: transparent; color: #8a4b2f; font-size: 10px; cursor: pointer; white-space: nowrap; }
+.message-interrupted { margin-top: 7px; color: var(--muted); font-size: 10px; }
+.agent-notice { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 12px 8px; padding: 8px 10px; border: 1px solid #d9b6a4; border-radius: 5px; background: #f9ece7; color: #8a4b2f; font-size: 11px; }
+.agent-notice button { display: grid; place-items: center; width: 22px; height: 22px; border: 0; background: transparent; color: inherit; cursor: pointer; }
+.send-button.stop { background: #8a4b2f; }
+.streaming-hint { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+.streaming-hint .spin { animation: pm-spin 1s linear infinite; }
+@keyframes pm-spin { to { transform: rotate(360deg); } }
+.streaming-cursor { display: inline-block; width: 7px; height: 13px; margin-left: 2px; vertical-align: -2px; background: var(--green); animation: pm-blink 1s step-end infinite; }
+@keyframes pm-blink { 50% { opacity: 0; } }
+
+.markdown-view { max-width: 100%; }
+.markdown-body { font-size: 12px; line-height: 1.75; word-break: break-word; }
+.markdown-body p { margin: 0 0 8px; }
+.markdown-body p:last-child { margin-bottom: 0; }
+.markdown-body ul, .markdown-body ol { margin: 4px 0 8px; padding-left: 18px; }
+.markdown-body li { margin-bottom: 3px; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 { margin: 10px 0 6px; color: var(--ink); font-size: 13px; font-weight: 700; }
+.markdown-body blockquote { margin: 6px 0; padding: 4px 10px; border-left: 3px solid var(--green); background: var(--green-soft); color: var(--muted); }
+.markdown-body code { padding: 1px 5px; border-radius: 4px; background: #efece4; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11px; }
+.markdown-body pre { margin: 8px 0; padding: 10px 11px; border-radius: 6px; background: #23261f; overflow-x: auto; }
+.markdown-body pre code { padding: 0; background: transparent; color: #e8e4d8; font-size: 11px; line-height: 1.6; }
+.markdown-body table { margin: 8px 0; max-width: 100%; border-collapse: collapse; font-size: 11px; }
+.markdown-body th, .markdown-body td { padding: 5px 8px; border: 1px solid var(--line); text-align: left; }
+.markdown-body th { background: var(--green-soft); font-weight: 700; }
+.markdown-body a { color: var(--green); text-decoration: underline; }
+.markdown-body img { max-width: 100%; }
+.formula-inline .katex { font-size: 1.02em; }
+.formula-display { display: block; margin: 8px 0; overflow-x: auto; text-align: center; }
+.formula-fallback { padding: 1px 5px; border-radius: 4px; background: #efece4; font-size: 11px; }
+
 .selection-popover { position: fixed; z-index: 60; transform: translateX(-50%); height: 37px; display: flex; align-items: center; gap: 2px; padding: 4px; border-radius: 6px; background: #20231f; color: #fff; box-shadow: 0 12px 28px rgba(0,0,0,.23); }
 .selection-popover button { height: 29px; display: flex; align-items: center; gap: 5px; padding: 0 8px; border: 0; border-radius: 4px; background: transparent; color: inherit; font-size: 11px; cursor: pointer; }
 .selection-popover button:hover { background: rgba(255,255,255,.1); }

@@ -1,0 +1,39 @@
+{
+  "name": "openclaw-agent-core",
+  "description": "Selective vendoring of OpenClaw agent-core, llm-core, and normalization-core for the PDFMuse Agent Host.",
+  "sourceRepository": "https://github.com/openclaw/openclaw",
+  "upstreamCommit": "a828190b2953483a4a181ff5d23c283e92713d47",
+  "license": "MIT",
+  "licenseFile": "LICENSE",
+  "vendoredPackages": [
+    {
+      "name": "@openclaw/agent-core",
+      "upstreamPath": "packages/agent-core",
+      "contents": "All non-test source files under src/ (agent loop, agent, types, validation, runtime deps, harness compaction/messages/session utilities)."
+    },
+    {
+      "name": "@openclaw/normalization-core",
+      "upstreamPath": "packages/normalization-core",
+      "contents": "Only the modules imported by agent-core: cjk-chars, error-coercion, number-coercion, record-coerce, result, string-coerce, utf16-slice."
+    }
+  ],
+  "notVendored": [
+    "All *.test.ts and *.test-support.ts files (fetch from the upstream commit when running Core contract tests during an upgrade).",
+    "OpenClaw Gateway, channels, nodes, plugin loader, SecretRef, workspace config, memory-host-sdk, and every other workspace package."
+  ],
+  "npmDependencies": [
+    { "name": "@openclaw/ai", "version": "2026.8.1", "reason": "Public provider runtime (streamSimple/completeSimple). Its root export re-exports @openclaw/llm-core from the same pinned commit, so llm-core is consumed from npm instead of being vendored (avoids duplicate EventStream class declarations). Matches the workspace version at the pinned commit; MIT; engines node>=22.19.0 satisfied by Electron 44 bundled Node 24.19.0." },
+    { "name": "typebox", "version": "1.3.18", "reason": "Public schema library required by agent-core at the pinned commit." }
+  ],
+  "patches": [
+    {
+      "id": "rewrite-workspace-imports",
+      "description": "Rewrote bare workspace imports inside vendored agent-core files so the sources compile and run inside dist-electron without a pnpm workspace: '@openclaw/llm-core' and '@openclaw/agent-core/src/llm.js' re-exports now point at '@openclaw/ai' (same types from the npm build); '@openclaw/normalization-core/<mod>' points at the vendored '../../normalization-core/src/<mod>.js' (depth-adjusted). No other changes.",
+      "files": "packages/agent-core/src/**/*.ts"
+    }
+  ],
+  "verification": {
+    "blobShaCheck": "agent-loop.ts, agent.ts, errors.ts verified against GitHub git blob SHAs at the pinned commit before patching.",
+    "date": "2026-09-03"
+  }
+}

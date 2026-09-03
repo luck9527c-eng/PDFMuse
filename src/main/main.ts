@@ -7,7 +7,11 @@ import { preflightDataHome } from "./data-home.js";
 import { createEmbeddingConnectionModule } from "./embedding-connection.js";
 import { createLibraryModule } from "./library.js";
 import { createModelConnectionModule } from "./model-connection.js";
+import { readAppConfig } from "./config-store.js";
+import { createAgentHost, type AgentHost } from "./agent/agent-host.js";
+import type { ResolvedModelConnection } from "./agent/model-runtime.js";
 import type {
+  AgentStreamEvent,
   SaveEmbeddingConnectionInput,
   SaveModelConnectionInput,
   StartupPreflight,
@@ -18,6 +22,13 @@ import type {
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 let startupPreflight: StartupPreflight;
 let closeLibrary: (() => void) | undefined;
+let closeAgentHost: (() => void) | undefined;
+
+function broadcastAgentEvent(event: AgentStreamEvent) {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send("agent:event", event);
+  }
+}
 
 function applicationDirectory() {
   const testDirectory = process.env.PDFMUSE_TEST_APPLICATION_DIRECTORY;
@@ -63,6 +74,23 @@ app.whenReady().then(async () => {
     const embeddingConnection = createEmbeddingConnectionModule(startupPreflight.dataHome);
     const library = createLibraryModule(startupPreflight.dataHome);
     closeLibrary = library.close;
+    const configPath = path.join(startupPreflight.dataHome, "config.json");
+    const agentHost: AgentHost = createAgentHost({
+      dataHome: startupPreflight.dataHome,
+      emit: broadcastAgentEvent,
+      loadModelConnection: async (): Promise<ResolvedModelConnection | undefined> => {
+        const config = await readAppConfig(configPath);
+        return config.chat
+          ? {
+            protocol: config.chat.protocol,
+            baseUrl: config.chat.baseUrl,
+            model: config.chat.model,
+            ...(config.chat.apiKey ? { apiKey: config.chat.apiKey } : {}),
+          }
+          : undefined;
+      },
+    });
+    closeAgentHost = agentHost.close;
     ipcMain.handle("library:list", () => library.list());
     ipcMain.handle("library:choose", async () => {
       const result = await dialog.showOpenDialog({
@@ -115,6 +143,9 @@ app.whenReady().then(async () => {
       "embedding-connection:test",
       (_event, input: TestEmbeddingConnectionInput) => embeddingConnection.test(input),
     );
+    ipcMain.handle("agent:get-conversation", (_event, bookId: unknown) => agentHost.getConversation(bookId));
+    ipcMain.handle("agent:start-run", (_event, input: unknown) => agentHost.start(input));
+    ipcMain.handle("agent:cancel-run", (_event, runId: unknown) => agentHost.cancel(runId));
   }
   createWindow();
   app.on("activate", () => {
@@ -125,6 +156,8 @@ app.whenReady().then(async () => {
 app.once("before-quit", () => {
   closeLibrary?.();
   closeLibrary = undefined;
+  closeAgentHost?.();
+  closeAgentHost = undefined;
 });
 
 app.on("window-all-closed", () => {

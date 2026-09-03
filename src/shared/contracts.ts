@@ -184,6 +184,72 @@ export type TestEmbeddingConnectionResult =
       message: string;
     };
 
+export type AgentMessageStatus = "complete" | "error" | "cancelled";
+
+export type ConversationMessage = {
+  id: string;
+  sessionId: string;
+  runId: string;
+  role: "reader" | "assistant";
+  body: string;
+  status: AgentMessageStatus;
+  errorMessage?: string;
+  passage?: { page: number; text: string };
+  createdAt: string;
+};
+
+export type ReadingFocus = {
+  currentPage: number;
+  selectedPassage?: SelectedPassage;
+};
+
+export type StartAgentRunInput = {
+  bookId: string;
+  question: string;
+  focus?: ReadingFocus;
+};
+
+export type StartAgentRunResult =
+  | {
+      ok: true;
+      runId: string;
+      sessionId: string;
+    }
+  | {
+      ok: false;
+      code: "VALIDATION_ERROR" | "MODEL_NOT_CONFIGURED";
+      message: string;
+    };
+
+export type AgentStreamEvent =
+  | {
+      stream: "lifecycle";
+      phase: "start" | "finishing" | "end" | "cancelled" | "error";
+      runId: string;
+      sessionId: string;
+    }
+  | {
+      stream: "assistant";
+      runId: string;
+      sessionId: string;
+      delta: string;
+    }
+  | {
+      stream: "message";
+      runId: string;
+      sessionId: string;
+      status: AgentMessageStatus;
+      errorMessage?: string;
+    }
+  | {
+      stream: "tool";
+      phase: "start" | "update" | "end";
+      runId: string;
+      callId: string;
+      name: string;
+      summary?: string;
+    };
+
 export interface PDFMuseApi {
   getStartupPreflight(): Promise<StartupPreflight>;
   listLibraryBooks(): Promise<LibraryBook[]>;
@@ -200,4 +266,8 @@ export interface PDFMuseApi {
   getEmbeddingConnection(): Promise<EmbeddingConnectionState>;
   saveEmbeddingConnection(input: SaveEmbeddingConnectionInput): Promise<SaveEmbeddingConnectionResult>;
   testEmbeddingConnection(input: TestEmbeddingConnectionInput): Promise<TestEmbeddingConnectionResult>;
+  getBookConversation(bookId: string): Promise<ConversationMessage[]>;
+  startAgentRun(input: StartAgentRunInput): Promise<StartAgentRunResult>;
+  cancelAgentRun(runId: string): Promise<void>;
+  onAgentEvent(listener: (event: AgentStreamEvent) => void): () => void;
 }

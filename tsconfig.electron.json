@@ -4,10 +4,16 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "outDir": "dist-electron",
-    "rootDir": "src",
+    "lib": ["ES2023"],
     "types": ["node", "electron"],
     "sourceMap": true
   },
-  "include": ["src/main", "src/preload", "src/shared"],
-  "exclude": ["src/**/*.test.ts"]
+  "include": [
+    "src/main",
+    "src/preload",
+    "src/shared",
+    "vendor/openclaw-agent-core/packages/agent-core/src",
+    "vendor/openclaw-agent-core/packages/normalization-core/src"
+  ],
+  "exclude": ["src/**/*.test.ts", "vendor/**/*.test.ts"]
 }

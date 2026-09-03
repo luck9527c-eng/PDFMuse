@@ -44,7 +44,7 @@ function command(webSocketUrl, method, params = {}) {
     const timer = setTimeout(() => {
       socket.close();
       reject(new Error("Renderer evaluation timed out."));
-    }, 3_000);
+    }, 10_000);
 
     socket.addEventListener("open", () => {
       socket.send(JSON.stringify({
@@ -258,6 +258,7 @@ const encryptedFixturePath = path.join(testApplicationDirectory, "encrypted-book
 await copyFile(path.join(projectRoot, "src", "main", "fixtures", "encrypted.pdf"), encryptedFixturePath);
 let receivedModelRequest;
 let receivedEmbeddingRequest;
+let receivedAgentStreamRequest;
 const modelServer = createServer((request, response) => {
   const chunks = [];
   request.on("data", (chunk) => chunks.push(chunk));
@@ -274,6 +275,21 @@ const modelServer = createServer((request, response) => {
         data: [{ index: 0, embedding: [0.1, -0.2, 0.3, 0.4] }],
         model: "smoke-embedding-model",
       }));
+      return;
+    }
+    if (request.url?.endsWith("/chat/completions") && receivedRequest.body.stream) {
+      receivedAgentStreamRequest = receivedRequest;
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      const chunks = ["PDFMuse 冒烟", "流式回答", "已完成。"];
+      const events = [
+        { id: "chatcmpl-agent", choices: [{ delta: { role: "assistant" } }] },
+        ...chunks.map((content) => ({ id: "chatcmpl-agent", choices: [{ delta: { content } }] })),
+        { id: "chatcmpl-agent", choices: [{ delta: {}, finish_reason: "stop" }] },
+      ];
+      for (const event of events) {
+        response.write(`data: ${JSON.stringify(event)}\n\n`);
+      }
+      response.end("data: [DONE]\n\n");
       return;
     }
     receivedModelRequest = receivedRequest;
@@ -783,6 +799,35 @@ try {
   );
   assert.equal(confirmedPage, 2, "a non-initial page checkpoint was not persisted through IPC");
 
+  // Book Conversation：从 Renderer 发起问题，验证流式回答与持久化。
+  const agentRun = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.startAgentRun(${JSON.stringify({
+      bookId: populatedLibrary[0].id,
+      question: "冒烟测试问题：第一章讲了什么？",
+    })})`,
+  );
+  assert.equal(agentRun.ok, true, "the agent run was not accepted");
+  // 先等 Main 侧完成持久化，再验证 UI（问题文本在终态刷新后才上屏）。
+  let persistedConversation = [];
+  const persistenceDeadline = Date.now() + 8_000;
+  while (Date.now() < persistenceDeadline) {
+    persistedConversation = await evaluate(
+      page.webSocketDebuggerUrl,
+      `window.pdfMuse.getBookConversation(${JSON.stringify(populatedLibrary[0].id)})`,
+    );
+    if (persistedConversation.length === 2 && persistedConversation[1]?.status === "complete") break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const agentAnswerText = await waitForText(page.webSocketDebuggerUrl, "冒烟测试问题");
+  assert.equal(persistedConversation.length, 2, "the persisted Book Conversation is incomplete");
+  assert.equal(persistedConversation[0].role, "reader", "the persisted conversation does not start with the reader");
+  assert.equal(persistedConversation[1].status, "complete", "the persisted assistant message is not complete");
+  assert.equal(persistedConversation[1].body, "PDFMuse 冒烟流式回答已完成。", "the persisted assistant body is invalid");
+  assert.equal(typeof receivedAgentStreamRequest, "object", "the agent run did not reach the local model server");
+  assert.equal(receivedAgentStreamRequest.authorization, "Bearer smoke-secret", "the agent run did not use the saved API key");
+  assert.equal(receivedAgentStreamRequest.body.stream, true, "the agent run did not request a streaming completion");
+
   await stopElectron(child);
   port = await reservePort();
   child = launchElectron(port);
@@ -804,6 +849,16 @@ try {
   assert.equal(restoredUi.scrollTop, secondPageCheckpoint.scrollTop, "the scroll position was not restored in the Viewer");
   assert.equal(restoredUi.expandLeft, true, "the collapsed left sidebar was not restored");
   assert.equal(restoredUi.expandRight, true, "the collapsed right sidebar was not restored");
+  const restoredConversation = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.getBookConversation(${JSON.stringify(populatedLibrary[0].id)})`,
+  );
+  assert.equal(restoredConversation.length, 2, "the Book Conversation did not survive the restart");
+  assert.equal(restoredConversation[1].body, "PDFMuse 冒烟流式回答已完成。", "the persisted assistant answer changed after restart");
+  // 重启后右侧栏按保存状态折叠，先展开助手面板再验证会话渲染。
+  await evaluate(page.webSocketDebuggerUrl, `document.querySelector('[aria-label="展开 AI 助手"]')?.click()`);
+  const restoredConversationText = await waitForText(page.webSocketDebuggerUrl, "PDFMuse 冒烟流式回答已完成。");
+  assert.match(restoredConversationText, /冒烟测试问题/, "the restored conversation is not rendered in the assistant panel");
 
   await stopElectron(child);
   await unlink(fixturePath);

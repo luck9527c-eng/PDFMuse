@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 
-import type { PDFMuseApi } from "../shared/contracts.js";
+import type { AgentStreamEvent, PDFMuseApi } from "../shared/contracts.js";
 
 const api: PDFMuseApi = {
   getStartupPreflight: () => ipcRenderer.invoke("app:get-startup-preflight"),
@@ -25,6 +25,14 @@ const api: PDFMuseApi = {
   getEmbeddingConnection: () => ipcRenderer.invoke("embedding-connection:get"),
   saveEmbeddingConnection: (input) => ipcRenderer.invoke("embedding-connection:save", input),
   testEmbeddingConnection: (input) => ipcRenderer.invoke("embedding-connection:test", input),
+  getBookConversation: (bookId) => ipcRenderer.invoke("agent:get-conversation", bookId),
+  startAgentRun: (input) => ipcRenderer.invoke("agent:start-run", input),
+  cancelAgentRun: (runId) => ipcRenderer.invoke("agent:cancel-run", runId),
+  onAgentEvent: (listener) => {
+    const channel = (_event: Electron.IpcRendererEvent, payload: AgentStreamEvent) => listener(payload);
+    ipcRenderer.on("agent:event", channel);
+    return () => ipcRenderer.removeListener("agent:event", channel);
+  },
 };
 
 contextBridge.exposeInMainWorld("pdfMuse", api);

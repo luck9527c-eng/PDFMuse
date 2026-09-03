@@ -13,21 +13,26 @@ import {
   Focus,
   Hand,
   Library,
+  Loader2,
   LockKeyhole,
   MessageSquareText,
   Minus,
   PanelLeftClose,
   PanelRightClose,
   Plus,
+  RefreshCw,
   Search,
   Send,
   Sparkles,
+  Square,
   Upload,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 
 import type {
+  AgentStreamEvent,
+  ConversationMessage,
   LibraryBook,
   OpenedPdfBook,
   OpenPdfBookResult,
@@ -36,12 +41,13 @@ import type {
   StartupPreflight,
 } from "../shared/contracts";
 import { IconButton } from "./components/IconButton";
+import { MarkdownView } from "./components/MarkdownView";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PdfViewer, type OutlineNode, type PdfViewerHandle, type ViewerSelection, type ViewerState } from "./pdf/PdfViewer";
 import { createReadingStateWriter } from "./reading-state-persistence";
 
-type Message = { role: "reader" | "assistant"; body: string };
 type PassagePopover = Extract<ViewerSelection, { kind: "selected" }>;
+type StreamingReply = { runId: string; sessionId: string; body: string };
 
 const browserPreflight: StartupPreflight = {
   ok: true,
@@ -384,7 +390,12 @@ export function App() {
   const [selectionFeedback, setSelectionFeedback] = useState<{ message: string; tone: "success" | "error" }>();
   const [draft, setDraft] = useState("");
   const [attachedPassage, setAttachedPassage] = useState<SelectedPassage>();
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [conversation, setConversation] = useState<ConversationMessage[]>([]);
+  const [streamingReply, setStreamingReply] = useState<StreamingReply>();
+  const [agentNotice, setAgentNotice] = useState("");
+  const [conversationLoading, setConversationLoading] = useState(false);
+  const conversationRef = useRef<HTMLDivElement>(null);
+  const activeRunRef = useRef<StreamingReply | undefined>(undefined);
 
   useEffect(() => {
     void (window.pdfMuse?.getStartupPreflight() ?? Promise.resolve(browserPreflight)).then(setPreflight);
@@ -401,6 +412,18 @@ export function App() {
       setLibraryError("无法读取书库，请重新启动 PDFMuse 后重试。");
     } finally {
       setLibraryLoading(false);
+    }
+  }, []);
+
+  const refreshConversation = useCallback(async (bookId: string) => {
+    if (!window.pdfMuse) return;
+    setConversationLoading(true);
+    try {
+      setConversation(await window.pdfMuse.getBookConversation(bookId));
+    } catch {
+      setAgentNotice("无法读取本书对话记录。");
+    } finally {
+      setConversationLoading(false);
     }
   }, []);
 
@@ -464,12 +487,16 @@ export function App() {
     setViewerError("");
     setLibraryError("");
     setUnavailableBookId(undefined);
-    setMessages([]);
+    setConversation([]);
+    setStreamingReply(undefined);
+    setAgentNotice("");
+    activeRunRef.current = undefined;
+    void refreshConversation(openedBook.id);
     setPanMode(false);
     setPassage(undefined);
     setAttachedPassage(undefined);
     setSelectionFeedback(undefined);
-  }, []);
+  }, [refreshConversation]);
 
   const handleOpenResult = useCallback((result: OpenPdfBookResult, attemptedBookId?: string) => {
     if (result.ok) {
@@ -601,6 +628,10 @@ export function App() {
     setLibraryError("");
     setUnavailableBookId(undefined);
     setLibraryLoading(true);
+    setConversation([]);
+    setStreamingReply(undefined);
+    setAgentNotice("");
+    activeRunRef.current = undefined;
     void refreshLibrary();
   }, [refreshLibrary]);
 
@@ -651,16 +682,77 @@ export function App() {
     stateWriterRef.current?.schedule({ bookId: book.id, state: readingStateRef.current });
   }, [book, leftOpen, rightOpen]);
 
+  // Agent 事件订阅：流式增量、消息终态与会话收尾都由 Main 推送。
+  useEffect(() => {
+    if (!window.pdfMuse) return;
+    return window.pdfMuse.onAgentEvent((event) => {
+      const active = activeRunRef.current;
+      if (active && event.runId === active.runId) {
+        if (event.stream === "assistant") {
+          activeRunRef.current = { ...active, body: active.body + event.delta };
+          setStreamingReply(activeRunRef.current);
+        } else if (event.stream === "lifecycle" && (event.phase === "end" || event.phase === "cancelled" || event.phase === "error")) {
+          activeRunRef.current = undefined;
+          setStreamingReply(undefined);
+          if (book) void refreshConversation(book.id);
+        }
+      }
+    });
+  }, [book, refreshConversation]);
+
+  const askAgent = useCallback(async (question: string, passage?: SelectedPassage) => {
+    if (!book || !window.pdfMuse || activeRunRef.current) return;
+    setAgentNotice("");
+    try {
+      const result = await window.pdfMuse.startAgentRun({
+        bookId: book.id,
+        question,
+        focus: {
+          currentPage: viewerState.page,
+          ...(passage ? { selectedPassage: passage } : {}),
+        },
+      });
+      if (!result.ok) {
+        setAgentNotice(result.message);
+        return;
+      }
+      // Reader 问题立即上屏；终态时 refreshConversation 会以持久化数据替换。
+      setConversation((current) => [
+        ...current,
+        {
+          id: `pending-${result.runId}`,
+          sessionId: result.sessionId,
+          runId: result.runId,
+          role: "reader",
+          body: question,
+          status: "complete",
+          ...(passage ? { passage: { page: passage.page, text: passage.text } } : {}),
+          createdAt: new Date().toISOString(),
+        },
+      ]);
+      activeRunRef.current = { runId: result.runId, sessionId: result.sessionId, body: "" };
+      setStreamingReply(activeRunRef.current);
+    } catch {
+      setAgentNotice("无法发起回答，请重试。");
+    }
+  }, [book, viewerState.page]);
+
+  const stopAgent = useCallback(async () => {
+    const active = activeRunRef.current;
+    if (!active || !window.pdfMuse) return;
+    try {
+      await window.pdfMuse.cancelAgentRun(active.runId);
+    } catch {
+      // 取消失败时等待运行自然结束。
+    }
+  }, []);
+
   const explain = useCallback((selectedPassage: SelectedPassage) => {
-    setAttachedPassage(selectedPassage);
-    setMessages([
-      { role: "reader", body: "请解释这段内容。" },
-      { role: "assistant", body: "已选原文已进入阅读上下文。真实回答将在后续任务中接入；当前不会生成虚构答案。" },
-    ]);
     setRightOpen(true);
     setPassage(undefined);
     window.getSelection()?.removeAllRanges();
-  }, []);
+    void askAgent("请解释这段内容。", selectedPassage);
+  }, [askAgent]);
 
   const askAboutPassage = useCallback((selectedPassage: SelectedPassage) => {
     setAttachedPassage(selectedPassage);
@@ -681,16 +773,42 @@ export function App() {
     }
   }, []);
 
+  const retryRun = useCallback((message: ConversationMessage) => {
+    if (!book) return;
+    const readerQuestion = conversation
+      .slice(0, conversation.findIndex((item) => item.id === message.id))
+      .reverse()
+      .find((item) => item.role === "reader" && item.runId === message.runId);
+    if (!readerQuestion) return;
+    const passage = readerQuestion.passage
+      ? { bookId: book.id, page: readerQuestion.passage.page, text: readerQuestion.passage.text, rects: [] }
+      : undefined;
+    void askAgent(readerQuestion.body, passage);
+  }, [askAgent, book, conversation]);
+
   const sendDraft = useCallback(() => {
     const question = draft.trim();
-    if (!question) return;
-    setMessages((current) => [
-      ...current,
-      { role: "reader", body: question },
-      { role: "assistant", body: "问题草稿和阅读焦点已保留。配置对话模型后即可从这里开始流式回答。" },
-    ]);
+    if (!question || activeRunRef.current) return;
+    const passage = attachedPassage;
     setDraft("");
-  }, [draft]);
+    setAttachedPassage(undefined);
+    void askAgent(question, passage);
+  }, [askAgent, attachedPassage, draft]);
+
+  const passageByRun = useMemo(() => {
+    const map = new Map<string, { page: number; text: string }>();
+    for (const message of conversation) {
+      if (message.role === "reader" && message.passage) map.set(message.runId, message.passage);
+    }
+    return map;
+  }, [conversation]);
+
+  // 流式输出期间保持对话底部可见。
+  useEffect(() => {
+    const container = conversationRef.current;
+    if (!container) return;
+    container.scrollTop = container.scrollHeight;
+  }, [conversation, streamingReply]);
 
   if (!preflight) return <div className="boot-state">正在检查数据目录...</div>;
   if (!preflight.ok) {
@@ -796,22 +914,60 @@ export function App() {
           <aside className="assistant-panel">
             <div className="sidebar-resize-handle right" role="separator" aria-label="调整右侧栏宽度" aria-orientation="vertical" onPointerDown={(event) => beginSidebarResize("right", event)} />
             <header className="assistant-header"><div><span className="assistant-title"><Sparkles size={16} />AI 助手</span><span className="assistant-context">本书对话 · 当前 PDF 书籍</span></div></header>
-            <div className="conversation">
-              {messages.length === 0 ? (
+            <div className="conversation" ref={conversationRef}>
+              {conversation.length === 0 && !streamingReply && !conversationLoading ? (
                 <div className="conversation-empty"><Bot size={24} /><strong>从原文开始</strong><span>选中文字后解释，或直接询问这本 PDF 书籍。</span></div>
-              ) : messages.map((message, index) => (
-                <article className={`message ${message.role}`} key={`${message.role}-${index}`}>
-                  <div className="message-role">{message.role === "reader" ? "你" : "PDFMuse"}</div>
-                  <p>{message.body}</p>
-                  {message.role === "assistant" && <button className="evidence-tag" onClick={() => viewerRef.current?.goToPage(viewerState.page)}>参考：PDF 第 {viewerState.page} 页</button>}
-                </article>
-              ))}
+              ) : (
+                <>
+                  {conversationLoading && conversation.length === 0 && <div className="conversation-loading">正在读取对话...</div>}
+                  {conversation.map((message) => (
+                    <article className={`message ${message.role}`} key={message.id}>
+                      <div className="message-role">{message.role === "reader" ? "你" : "PDFMuse"}</div>
+                      {message.role === "reader" ? (
+                        <>
+                          <p>{message.body}</p>
+                          {message.passage && <div className="passage-quote">引用原文 · 第 {message.passage.page} 页</div>}
+                        </>
+                      ) : (
+                        <>
+                          {message.body ? <MarkdownView markdown={message.body} /> : null}
+                          {message.status === "error" && (
+                            <div className="message-failure" role="alert">
+                              <span>{message.errorMessage ?? "回答生成失败。"}</span>
+                              <button className="secondary-command retry-command" onClick={() => retryRun(message)}><RefreshCw size={12} />重试</button>
+                            </div>
+                          )}
+                          {message.status === "cancelled" && message.body && <div className="message-interrupted">回答已停止，以上为已生成内容。</div>}
+                          {passageByRun.get(message.runId) && (
+                            <button className="evidence-tag" onClick={() => viewerRef.current?.goToPage(passageByRun.get(message.runId)!.page)}>参考：PDF 第 {passageByRun.get(message.runId)!.page} 页</button>
+                          )}
+                        </>
+                      )}
+                    </article>
+                  ))}
+                  {streamingReply && (
+                    <article className="message assistant streaming">
+                      <div className="message-role">PDFMuse</div>
+                      {streamingReply.body ? <MarkdownView markdown={streamingReply.body} /> : <div className="streaming-hint"><Loader2 size={13} className="spin" />正在生成回答...</div>}
+                      {streamingReply.body && <span className="streaming-cursor" aria-hidden />}
+                    </article>
+                  )}
+                </>
+              )}
             </div>
+            {agentNotice && (
+              <div className="agent-notice" role="alert">
+                <span>{agentNotice}</span>
+                <button aria-label="关闭提示" onClick={() => setAgentNotice("")}><X size={13} /></button>
+              </div>
+            )}
             <div className="composer-wrap">
               {attachedPassage && <div className="passage-chip"><span>已选原文 · 第 {attachedPassage.page} 页</span><p>{attachedPassage.text}</p><button aria-label="移除已选原文" onClick={() => setAttachedPassage(undefined)}><X size={14} /></button></div>}
               <div className="composer">
                 <textarea ref={composerRef} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendDraft(); } }} placeholder="询问这本 PDF 书籍..." rows={2} />
-                <button className="send-button" aria-label="发送问题" disabled={!draft.trim()} onClick={sendDraft}><Send size={17} /></button>
+                {streamingReply
+                  ? <button className="send-button stop" aria-label="停止回答" onClick={() => void stopAgent()}><Square size={14} /></button>
+                  : <button className="send-button" aria-label="发送问题" disabled={!draft.trim()} onClick={sendDraft}><Send size={17} /></button>}
               </div>
             </div>
           </aside>
