@@ -143,6 +143,7 @@ export function createAgentHost(options: AgentHostOptions) {
   // 每个 Book Conversation 一条串行 lane；lane 尾部为空时移除，避免长期驻留。
   const sessionLanes = new Map<string, Promise<void>>();
   const activeRuns = new Map<string, ActiveRun>();
+  const runBooks = new Map<string, { bookId: string; sessionId: string }>();
   const cancelledBeforeStart = new Set<string>();
   const pendingApprovals = new Map<string, { runId: string; bookId: string; resolve: (approved: boolean) => void }>();
 
@@ -246,6 +247,10 @@ export function createAgentHost(options: AgentHostOptions) {
           status: message.status,
         });
       }
+    }
+    if (cancelledBeforeStart.delete(runId)) {
+      options.emit({ stream: "lifecycle", phase: "cancelled", runId, sessionId });
+      return;
     }
     const readerMessage = store.appendMessage({ sessionId, runId, role: "reader", body: question, status: "complete", focus });
     await options.indexConversationMessage?.(bookId, {
@@ -463,6 +468,7 @@ export function createAgentHost(options: AgentHostOptions) {
       const runId = randomUUID();
       const focus = isReadingFocus(input.focus) ? input.focus : undefined;
       const profile = await (options.loadReaderProfile?.() ?? "");
+      runBooks.set(runId, { bookId: input.bookId, sessionId });
       void enqueue(sessionId, () => executeRun({
         runId,
         sessionId,
@@ -472,7 +478,7 @@ export function createAgentHost(options: AgentHostOptions) {
         attachments,
         connection,
         profile,
-      }));
+      }).finally(() => runBooks.delete(runId)));
       return { ok: true, runId, sessionId };
     },
 
@@ -486,6 +492,27 @@ export function createAgentHost(options: AgentHostOptions) {
       }
       // 尚未排到的运行：记录取消意图，执行前直接跳过。
       cancelledBeforeStart.add(runId);
+    },
+    async cancelBook(bookId: string) {
+      const runs = [...runBooks.entries()].filter(([, run]) => run.bookId === bookId);
+      for (const [runId] of runs) {
+        const active = activeRuns.get(runId);
+        if (active) {
+          active.cancelledByUser = true;
+          active.agent.abort("book-removed");
+        } else {
+          cancelledBeforeStart.add(runId);
+        }
+      }
+      for (const [approvalId, pending] of pendingApprovals) {
+        if (pending.bookId === bookId) {
+          pendingApprovals.delete(approvalId);
+          pending.resolve(false);
+        }
+      }
+      const sessionId = runs[0]?.[1].sessionId ?? store.findSession(bookId)?.id;
+      const lane = sessionId ? sessionLanes.get(sessionId) : undefined;
+      if (lane) await lane;
     },
     approveTool(input: { approvalId: string; approved: boolean }) {
       const pending = pendingApprovals.get(input.approvalId);

@@ -82,6 +82,17 @@ export type OpenPdfBookResult =
       bookId?: string;
     };
 
+export type LibraryMutationResult =
+  | {
+      ok: true;
+      bookId: string;
+    }
+  | {
+      ok: false;
+      code: "NOT_FOUND" | "WRITE_ERROR";
+      message: string;
+    };
+
 export type ModelProtocol = "openai" | "anthropic";
 
 export function isModelProtocol(value: unknown): value is ModelProtocol {
@@ -427,6 +438,8 @@ export interface PDFMuseApi {
   openRecentLibraryBook(): Promise<OpenPdfBookResult | null>;
   openLibraryBook(bookId: string): Promise<OpenPdfBookResult>;
   relocateLibraryBook(bookId: string): Promise<OpenPdfBookResult | null>;
+  removeLibraryBook(bookId: string): Promise<LibraryMutationResult>;
+  deleteLibraryBookData(bookId: string): Promise<LibraryMutationResult>;
   unlockPdfBook(challengeId: string, password: string, rememberPassword: boolean): Promise<OpenPdfBookResult>;
   updateLibraryBookState(bookId: string, state: ReadingState): Promise<void>;
   getModelConnection(): Promise<ModelConnectionState>;

@@ -11,6 +11,7 @@ import {
 
 import type {
   LibraryBook,
+  LibraryMutationResult,
   OpenedPdfBook,
   OpenPdfBookResult,
   ReadingState,
@@ -30,13 +31,16 @@ type BookRow = {
   left_sidebar_open: number;
   right_sidebar_open: number;
   saved_password: string | null;
+  in_library: number;
   updated_at: string;
 };
+
+const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
 
 const readingColumns = `
   id, title, file_name, current_path, page_count, current_page,
   scroll_top, zoom_mode, zoom_scale, left_sidebar_open, right_sidebar_open,
-  updated_at, saved_password
+  updated_at, saved_password, in_library
 `;
 
 function toLibraryBook(row: BookRow): LibraryBook {
@@ -69,6 +73,10 @@ function passwordFailure(
   bookId?: string,
 ): OpenPdfBookResult {
   return { ok: false, code: "PASSWORD_REQUIRED", message, challengeId, ...(bookId ? { bookId } : {}) };
+}
+
+function mutationFailure(code: "NOT_FOUND" | "WRITE_ERROR", message: string): LibraryMutationResult {
+  return { ok: false, code, message };
 }
 
 function toReadingState(row: BookRow): ReadingState {
@@ -135,6 +143,7 @@ export function createLibraryModule(dataHome: string) {
       left_sidebar_open INTEGER NOT NULL DEFAULT 1 CHECK (left_sidebar_open IN (0, 1)),
       right_sidebar_open INTEGER NOT NULL DEFAULT 1 CHECK (right_sidebar_open IN (0, 1)),
       saved_password TEXT,
+      in_library INTEGER NOT NULL DEFAULT 1 CHECK (in_library IN (0, 1)),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -151,16 +160,18 @@ export function createLibraryModule(dataHome: string) {
     ["left_sidebar_open", "ALTER TABLE library_books ADD COLUMN left_sidebar_open INTEGER NOT NULL DEFAULT 1"],
     ["right_sidebar_open", "ALTER TABLE library_books ADD COLUMN right_sidebar_open INTEGER NOT NULL DEFAULT 1"],
     ["saved_password", "ALTER TABLE library_books ADD COLUMN saved_password TEXT"],
+    ["in_library", "ALTER TABLE library_books ADD COLUMN in_library INTEGER NOT NULL DEFAULT 1"],
   ] as const;
   for (const [column, statement] of migrations) {
     if (!existingColumns.has(column)) database.exec(statement);
   }
   const schemaVersion = database.prepare("PRAGMA user_version").get() as { user_version: number };
-  if (schemaVersion.user_version < 3) database.exec("PRAGMA user_version = 3;");
+  if (schemaVersion.user_version < 4) database.exec("PRAGMA user_version = 4;");
 
   const listStatement = database.prepare(`
     SELECT id, title, file_name, current_path, page_count, current_page, updated_at
     FROM library_books
+    WHERE in_library = 1
     ORDER BY updated_at DESC, id ASC
   `);
   const findStatement = database.prepare(`
@@ -169,7 +180,12 @@ export function createLibraryModule(dataHome: string) {
     WHERE id = ?
   `);
   const recentStatement = database.prepare(`
-    SELECT id FROM library_books ORDER BY updated_at DESC, id ASC LIMIT 1
+    SELECT id FROM library_books WHERE in_library = 1 ORDER BY updated_at DESC, id ASC LIMIT 1
+  `);
+  const findActiveStatement = database.prepare(`
+    SELECT ${readingColumns}
+    FROM library_books
+    WHERE id = ? AND in_library = 1
   `);
   const upsertStatement = database.prepare(`
     INSERT INTO library_books (
@@ -180,6 +196,7 @@ export function createLibraryModule(dataHome: string) {
       file_name = excluded.file_name,
       current_path = excluded.current_path,
       page_count = excluded.page_count,
+      in_library = 1,
       updated_at = excluded.updated_at
   `);
   const touchStatement = database.prepare(`
@@ -201,6 +218,12 @@ export function createLibraryModule(dataHome: string) {
   `);
   const savePasswordStatement = database.prepare(`
     UPDATE library_books SET saved_password = ? WHERE id = ?
+  `);
+  const removeFromLibraryStatement = database.prepare(`
+    UPDATE library_books SET in_library = 0, updated_at = ? WHERE id = ? AND in_library = 1
+  `);
+  const tableExistsStatement = database.prepare(`
+    SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?
   `);
   type PendingOpen = {
     filePath: string;
@@ -310,6 +333,11 @@ export function createLibraryModule(dataHome: string) {
       return (listStatement.all() as BookRow[]).map(toLibraryBook);
     },
 
+    has(bookId: unknown) {
+      return typeof bookId === "string" && BOOK_ID_PATTERN.test(bookId)
+        && Boolean(findActiveStatement.get(bookId));
+    },
+
     async openPath(inputPath: unknown): Promise<OpenPdfBookResult> {
       if (typeof inputPath !== "string" || path.extname(inputPath).toLowerCase() !== ".pdf") {
         return failure("INVALID_FILE_TYPE", "请选择 PDF 文件。其他文件类型不会加入书库。");
@@ -325,10 +353,10 @@ export function createLibraryModule(dataHome: string) {
     },
 
     async openKnown(bookId: unknown): Promise<OpenPdfBookResult> {
-      if (typeof bookId !== "string" || !/^[a-f0-9]{64}$/.test(bookId)) {
+      if (typeof bookId !== "string" || !BOOK_ID_PATTERN.test(bookId)) {
         return failure("FILE_UNAVAILABLE", "书库记录无效，无法打开此 PDF 书籍。");
       }
-      const row = findStatement.get(bookId) as BookRow | undefined;
+      const row = findActiveStatement.get(bookId) as BookRow | undefined;
       if (!row) return failure("FILE_UNAVAILABLE", "书库中没有找到此 PDF 书籍。", bookId);
       let bytes: Uint8Array;
       try {
@@ -345,13 +373,13 @@ export function createLibraryModule(dataHome: string) {
     },
 
     async relocate(bookId: unknown, inputPath: unknown): Promise<OpenPdfBookResult> {
-      if (typeof bookId !== "string" || !/^[a-f0-9]{64}$/.test(bookId)) {
+      if (typeof bookId !== "string" || !BOOK_ID_PATTERN.test(bookId)) {
         return failure("FILE_UNAVAILABLE", "书库记录无效，无法重新定位此 PDF 书籍。");
       }
       if (typeof inputPath !== "string" || path.extname(inputPath).toLowerCase() !== ".pdf") {
         return failure("INVALID_FILE_TYPE", "请选择对应的 PDF 原文件。", bookId);
       }
-      const knownBook = findStatement.get(bookId) as BookRow | undefined;
+      const knownBook = findActiveStatement.get(bookId) as BookRow | undefined;
       if (!knownBook) {
         return failure("FILE_UNAVAILABLE", "书库中没有找到此 PDF 书籍。", bookId);
       }
@@ -397,7 +425,7 @@ export function createLibraryModule(dataHome: string) {
     },
 
     updateReadingState(bookId: unknown, state: unknown) {
-      if (typeof bookId !== "string" || !/^[a-f0-9]{64}$/.test(bookId)
+      if (typeof bookId !== "string" || !BOOK_ID_PATTERN.test(bookId)
         || !isReadingState(state)) {
         return;
       }
@@ -411,6 +439,60 @@ export function createLibraryModule(dataHome: string) {
         new Date().toISOString(),
         bookId,
       );
+    },
+
+    removeFromLibrary(bookId: unknown): LibraryMutationResult {
+      if (typeof bookId !== "string" || !BOOK_ID_PATTERN.test(bookId)) {
+        return mutationFailure("NOT_FOUND", "书库中没有找到这本 PDF 书籍。");
+      }
+      try {
+        const result = removeFromLibraryStatement.run(new Date().toISOString(), bookId);
+        return result.changes > 0
+          ? { ok: true, bookId }
+          : mutationFailure("NOT_FOUND", "书库中没有找到这本 PDF 书籍。");
+      } catch (error) {
+        console.error("移出书库失败", error);
+        return mutationFailure("WRITE_ERROR", "无法将这本书移出书库，请稍后重试。");
+      }
+    },
+
+    deleteBookData(bookId: unknown): LibraryMutationResult {
+      if (typeof bookId !== "string" || !BOOK_ID_PATTERN.test(bookId) || !findStatement.get(bookId)) {
+        return mutationFailure("NOT_FOUND", "书库中没有找到这本 PDF 书籍。");
+      }
+      const hasTable = (name: string) => Boolean(tableExistsStatement.get(name));
+      try {
+        database.exec("BEGIN IMMEDIATE");
+        if (hasTable("agent_messages") && hasTable("agent_sessions")) {
+          database.prepare(`
+            DELETE FROM agent_messages
+            WHERE session_id IN (SELECT id FROM agent_sessions WHERE book_id = ?)
+          `).run(bookId);
+        }
+        if (hasTable("agent_sessions")) database.prepare("DELETE FROM agent_sessions WHERE book_id = ?").run(bookId);
+        for (const table of [
+          "background_jobs",
+          "book_outline_pages",
+          "book_outlines",
+          "recognized_pages",
+          "semantic_embeddings",
+          "book_pages_fts",
+          "book_pages",
+          "memory_fts",
+          "memory_audit",
+          "memory_proposals",
+          "book_memories",
+        ]) {
+          if (hasTable(table)) database.prepare(`DELETE FROM ${table} WHERE book_id = ?`).run(bookId);
+        }
+        database.prepare("DELETE FROM library_books WHERE id = ?").run(bookId);
+        database.exec("COMMIT");
+        return { ok: true, bookId };
+      } catch (error) {
+        try { database.exec("ROLLBACK"); } catch { /* 事务未启动时无需回滚。 */ }
+        console.error("删除本书产品数据失败", error);
+        return mutationFailure("WRITE_ERROR", "无法删除本书数据，现有数据保持不变，请稍后重试。");
+      }
     },
 
     close() {

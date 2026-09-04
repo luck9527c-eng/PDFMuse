@@ -254,6 +254,9 @@ const damagedPdfPath = path.join(testApplicationDirectory, "damaged.pdf");
 await writeFile(damagedPdfPath, "%PDF-1.7\ninvalid");
 const fixturePath = path.join(testApplicationDirectory, "smoke-book.pdf");
 await copyFile(path.join(projectRoot, "src", "main", "fixtures", "navigation.pdf"), fixturePath);
+const lifecycleFixturePath = path.join(testApplicationDirectory, "lifecycle-book.pdf");
+await copyFile(path.join(projectRoot, "src", "main", "fixtures", "three-page.pdf"), lifecycleFixturePath);
+const lifecycleSourceBefore = await readFile(lifecycleFixturePath);
 const encryptedFixturePath = path.join(testApplicationDirectory, "encrypted-book.pdf");
 await copyFile(path.join(projectRoot, "src", "main", "fixtures", "encrypted.pdf"), encryptedFixturePath);
 let receivedModelRequest;
@@ -1004,7 +1007,69 @@ try {
   assert.match(state.text, /PDFMuse Navigation Fixture/, "a remembered password did not reopen the encrypted PDF");
   assert.doesNotMatch(state.text, /打开加密 PDF/, "a remembered password still requested manual entry");
   assert.equal(await evaluate(page.webSocketDebuggerUrl, "Boolean(document.querySelector('.workspace'))"), true, "the remembered encrypted PDF did not restore the reading workspace");
-  console.log("Electron smoke test passed: Library, PDF controls, Selected Passage, encrypted books, settings, and reading recovery are available.");
+
+  await evaluate(page.webSocketDebuggerUrl, `document.querySelector('[aria-label="返回书库"]')?.click()`);
+  await waitForText(page.webSocketDebuggerUrl, "书库");
+  await dropSmokeFile(page.webSocketDebuggerUrl, lifecycleFixturePath);
+  await waitForText(page.webSocketDebuggerUrl, "AI 助手");
+  const lifecycleBook = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.listLibraryBooks().then((books) => books.find((book) => book.path === ${JSON.stringify(lifecycleFixturePath)}))`,
+  );
+  assert.match(lifecycleBook.id, /^[a-f0-9]{64}$/, "the lifecycle fixture was not added by content identity");
+  const lifecycleManageLabel = JSON.stringify(`管理《${lifecycleBook.title}》`);
+  await evaluate(page.webSocketDebuggerUrl, `document.querySelector('[aria-label="返回书库"]')?.click()`);
+  await waitForText(page.webSocketDebuggerUrl, "书库");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => {
+      const label = ${lifecycleManageLabel};
+      [...document.querySelectorAll('button')].find((button) => button.getAttribute('aria-label') === label)?.click();
+    })()`,
+  );
+  const manageText = await waitForText(page.webSocketDebuggerUrl, "移出书库");
+  assert.match(manageText, /两种操作都不会修改或删除 PDF 原文件/, "the Library actions do not explain source-file safety");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => [...document.querySelectorAll('.library-manage-dialog button')].find((button) => button.textContent.trim() === '移出')?.click())()`,
+  );
+  await waitForText(page.webSocketDebuggerUrl, "书库");
+  const removedLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
+  assert.equal(removedLibrary.some((book) => book.id === lifecycleBook.id), false, "removing a book left it visible in the Library");
+
+  await dropSmokeFile(page.webSocketDebuggerUrl, lifecycleFixturePath);
+  await waitForText(page.webSocketDebuggerUrl, "AI 助手");
+  const restoredLifecycleBook = await evaluate(
+    page.webSocketDebuggerUrl,
+    `window.pdfMuse.listLibraryBooks().then((books) => books.find((book) => book.path === ${JSON.stringify(lifecycleFixturePath)}))`,
+  );
+  assert.equal(restoredLifecycleBook.id, lifecycleBook.id, "reopening a removed book did not restore the same content identity");
+  await evaluate(page.webSocketDebuggerUrl, `document.querySelector('[aria-label="返回书库"]')?.click()`);
+  await waitForText(page.webSocketDebuggerUrl, "书库");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => {
+      const label = ${lifecycleManageLabel};
+      [...document.querySelectorAll('button')].find((button) => button.getAttribute('aria-label') === label)?.click();
+    })()`,
+  );
+  await waitForText(page.webSocketDebuggerUrl, "删除本书数据");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => [...document.querySelectorAll('.library-manage-dialog button')].find((button) => button.textContent.trim() === '删除数据')?.click())()`,
+  );
+  const confirmDeleteText = await waitForText(page.webSocketDebuggerUrl, "永久删除本书数据");
+  assert.match(confirmDeleteText, /此操作无法撤销/, "deleting book data did not require explicit confirmation");
+  await evaluate(
+    page.webSocketDebuggerUrl,
+    `(() => [...document.querySelectorAll('.library-manage-dialog button')].find((button) => button.textContent.includes('永久删除本书数据'))?.click())()`,
+  );
+  await waitForText(page.webSocketDebuggerUrl, "书库");
+  const deletedLibrary = await evaluate(page.webSocketDebuggerUrl, "window.pdfMuse.listLibraryBooks()");
+  assert.equal(deletedLibrary.some((book) => book.id === lifecycleBook.id), false, "deleting book data left the Library record behind");
+  assert.deepEqual(await readFile(lifecycleFixturePath), lifecycleSourceBefore, "deleting product data changed the PDF source file");
+
+  console.log("Electron smoke test passed: Library lifecycle, PDF controls, Selected Passage, encrypted books, settings, and reading recovery are available.");
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   if (diagnostics.trim()) console.error(diagnostics.trim());

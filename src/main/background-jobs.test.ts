@@ -127,6 +127,25 @@ describe("background jobs", () => {
     expect(module.list(BOOK_A)[0]).toMatchObject({ id: scheduled.job.id, status: "completed", attempts: 2 });
   });
 
+  it("cancels every job for a book and waits for the running executor to settle", async () => {
+    let executorSettled = false;
+    module = createBackgroundJobModule(dataHome, {
+      outline: async (_job, context) => {
+        await new Promise<void>((resolve) => context.signal.addEventListener("abort", () => setTimeout(resolve, 20), { once: true }));
+        executorSettled = true;
+        throw new Error("cancelled");
+      },
+    });
+    module.schedule({ bookId: BOOK_A, kind: "outline" });
+    module.schedule({ bookId: BOOK_A, kind: "index" });
+    await waitFor(() => module?.list(BOOK_A).some((job) => job.status === "running") ?? false);
+
+    await module.cancelBook(BOOK_A);
+
+    expect(executorSettled).toBe(true);
+    expect(module.list(BOOK_A).every((job) => job.status === "cancelled")).toBe(true);
+  });
+
   it("fails unsupported task types with a Chinese diagnostic", async () => {
     module = createBackgroundJobModule(dataHome);
     const scheduled = module.schedule({ bookId: BOOK_A, kind: "ocr" });

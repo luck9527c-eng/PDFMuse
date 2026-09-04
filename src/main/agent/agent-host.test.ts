@@ -337,6 +337,30 @@ describe("agent host", () => {
     expect(conversation[0]?.body).toBe("长问题");
   });
 
+  it("cancels active and queued runs for a book before data removal", async () => {
+    const fake = createFakeStreamFn(({ push, request }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "text_delta", contentIndex: 0, delta: "处理中" });
+      request.options?.signal?.addEventListener("abort", () => {
+        push({ type: "error", reason: "aborted", error: assistantMessage("处理中", "aborted") });
+      });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    await startRun("第一问");
+    await startRun("排队中的第二问");
+    await waitFor(() => events.some((event) => event.stream === "assistant"));
+    await host.cancelBook(BOOK_ID);
+
+    expect(fake.requests).toHaveLength(1);
+    expect(lifecyclePhase(events).filter((phase) => phase === "cancelled")).toHaveLength(2);
+    expect(host.getConversation(BOOK_ID).map((message) => message.body)).toEqual([
+      "第一问",
+      "处理中",
+      "排队中的第二问",
+    ]);
+  });
+
   it("marks the assistant message as error on timeout", async () => {
     const fake = createFakeStreamFn(({ push, request }) => {
       push({ type: "start", partial: assistantMessage("") });

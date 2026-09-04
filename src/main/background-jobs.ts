@@ -106,7 +106,13 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
   // A process crash must not leave work permanently marked as running.
   database.prepare("UPDATE background_jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(now());
 
-  const active = new Map<string, { controller: AbortController; action?: "pause" | "cancel" }>();
+  const active = new Map<string, {
+    bookId: string;
+    controller: AbortController;
+    settled: Promise<void>;
+    resolveSettled(): void;
+    action?: "pause" | "cancel";
+  }>();
   let pumping = false;
   let closed = false;
 
@@ -154,7 +160,9 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
           }
           const job = toJob(row);
           const controller = new AbortController();
-          active.set(row.id, { controller });
+          let resolveSettled: () => void = () => undefined;
+          const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+          active.set(row.id, { bookId: row.book_id, controller, settled, resolveSettled });
           update(row.id, "status = ?, attempts = attempts + 1, error_message = NULL", ["running"]);
           const running = toJob(rowFor(row.id)!);
           try {
@@ -175,6 +183,7 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
               update(row.id, "status = ?, error_message = ?", ["failed", FAILURE_MESSAGES[row.kind]]);
             }
           } finally {
+            active.get(row.id)?.resolveSettled();
             active.delete(row.id);
           }
         }
@@ -252,9 +261,34 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
       else return { ok: false, code: "CONFLICT", message: "当前任务无法取消。" };
       return { ok: true, job: toJob(rowFor(id)!) };
     },
+    async cancelBook(bookId: string) {
+      if (!BOOK_ID_PATTERN.test(bookId) || closed) return;
+      const jobs = (database.prepare(`
+        SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, error_message, created_at, updated_at
+        FROM background_jobs WHERE book_id = ? AND status IN ('queued', 'running', 'paused')
+      `).all(bookId) as JobRow[]);
+      const waits: Promise<void>[] = [];
+      for (const job of jobs) {
+        if (job.status === "running") {
+          const state = active.get(job.id);
+          if (state) {
+            state.action = "cancel";
+            update(job.id, "status = ?", ["cancelled"]);
+            state.controller.abort();
+            waits.push(state.settled);
+            continue;
+          }
+        }
+        update(job.id, "status = ?", ["cancelled"]);
+      }
+      await Promise.all(waits);
+    },
     close() {
       closed = true;
-      for (const state of active.values()) state.controller.abort();
+      for (const state of active.values()) {
+        state.controller.abort();
+        state.resolveSettled();
+      }
       active.clear();
       database.close();
     },

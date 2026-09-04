@@ -20,6 +20,7 @@ import { createReaderProfileModule } from "./reader-profile.js";
 import type {
   AgentStreamEvent,
   BackgroundJobMutationResult,
+  LibraryMutationResult,
   ScheduleBackgroundJobInput,
   SaveEmbeddingConnectionInput,
   SaveModelConnectionInput,
@@ -87,6 +88,10 @@ app.whenReady().then(async () => {
     const modelConnection = createModelConnectionModule(startupPreflight.dataHome);
     const embeddingConnection = createEmbeddingConnectionModule(startupPreflight.dataHome);
     const library = createLibraryModule(startupPreflight.dataHome);
+    const mutatingBookIds = new Set<string>();
+    const isOwnedBook = (bookId: unknown): bookId is string => (
+      typeof bookId === "string" && !mutatingBookIds.has(bookId) && library.has(bookId)
+    );
     closeLibrary = library.close;
     const configPath = path.join(startupPreflight.dataHome, "config.json");
     const readerProfile = createReaderProfileModule(startupPreflight.dataHome);
@@ -159,7 +164,7 @@ app.whenReady().then(async () => {
       },
       loadReaderProfile: async () => (await readerProfile.get()).content,
       memory,
-      isKnownBook: (bookId) => library.list().some((book) => book.id === bookId),
+      isKnownBook: isOwnedBook,
       buildTools: (context) => toolRegistry.buildAgentTools(() => ({
         bookId: context.bookId,
         focus: context.focus,
@@ -172,6 +177,26 @@ app.whenReady().then(async () => {
       },
     });
     closeAgentHost = agentHost.close;
+    const invalidLibraryMutation = (): LibraryMutationResult => ({
+      ok: false,
+      code: "NOT_FOUND",
+      message: "书库中没有找到这本 PDF 书籍。",
+    });
+    const mutateLibraryBook = async (bookId: unknown, mode: "remove" | "delete") => {
+      if (!isOwnedBook(bookId)) return invalidLibraryMutation();
+      mutatingBookIds.add(bookId);
+      try {
+        await Promise.all([
+          agentHost.cancelBook(bookId),
+          backgroundJobs.cancelBook(bookId),
+        ]);
+        return mode === "remove"
+          ? library.removeFromLibrary(bookId)
+          : library.deleteBookData(bookId);
+      } finally {
+        mutatingBookIds.delete(bookId);
+      }
+    };
     ipcMain.handle("library:list", () => library.list());
     ipcMain.handle("library:choose", async () => {
       const result = await dialog.showOpenDialog({
@@ -202,6 +227,8 @@ app.whenReady().then(async () => {
       if (result.canceled || !selectedPath) return null;
       return library.relocate(bookId, selectedPath);
     });
+    ipcMain.handle("library:remove", (_event, bookId: unknown) => mutateLibraryBook(bookId, "remove"));
+    ipcMain.handle("library:delete-data", (_event, bookId: unknown) => mutateLibraryBook(bookId, "delete"));
     ipcMain.handle(
       "library:update-state",
       (_event, bookId: unknown, state: unknown) => library.updateReadingState(bookId, state),
@@ -249,7 +276,6 @@ app.whenReady().then(async () => {
       }
       return result;
     });
-    const isOwnedBook = (bookId: unknown): bookId is string => typeof bookId === "string" && library.list().some((book) => book.id === bookId);
     ipcMain.handle("outline:get", (_event, bookId: unknown) => (
       isOwnedBook(bookId) ? bookOutline.get(bookId) : undefined
     ));

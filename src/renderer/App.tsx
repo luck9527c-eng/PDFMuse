@@ -2,6 +2,7 @@ import * as Tooltip from "@radix-ui/react-tooltip";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
   BookOpen,
+  BookMinus,
   Bot,
   Check,
   ChevronDown,
@@ -14,6 +15,7 @@ import {
   Focus,
   Hand,
   ImagePlus,
+  EllipsisVertical,
   Library,
   Loader2,
   LockKeyhole,
@@ -31,6 +33,7 @@ import {
   Sparkles,
   Square,
   Upload,
+  Trash2,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
@@ -265,6 +268,8 @@ type LibraryViewProps = {
   onDropFile(file?: File): Promise<void>;
   onOpenBook(bookId: string): Promise<void>;
   onRelocate(bookId: string): Promise<void>;
+  onRemove(bookId: string): Promise<void>;
+  onDeleteData(bookId: string): Promise<void>;
 };
 
 function LibraryView({
@@ -277,9 +282,13 @@ function LibraryView({
   onDropFile,
   onOpenBook,
   onRelocate,
+  onRemove,
+  onDeleteData,
 }: LibraryViewProps) {
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [managedBook, setManagedBook] = useState<LibraryBook>();
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const run = async (action: () => Promise<void>) => {
     if (busy) return;
@@ -297,6 +306,16 @@ function LibraryView({
     const files = Array.from(event.dataTransfer.files);
     if (files.length !== 1) return void run(() => onDropFile());
     void run(() => onDropFile(files[0]!));
+  };
+
+  const closeBookManager = () => {
+    setManagedBook(undefined);
+    setConfirmDelete(false);
+  };
+
+  const runBookMutation = async (action: () => Promise<void>) => {
+    await run(action);
+    closeBookManager();
   };
 
   return (
@@ -342,25 +361,34 @@ function LibraryView({
           ) : (
             <div className="library-grid">
               {books.map((item) => (
-                <button
+                <div
                   className="library-book"
                   key={item.id}
-                  disabled={busy}
-                  onClick={() => void run(() => onOpenBook(item.id))}
-                  aria-label={`打开《${item.title}》`}
                 >
-                  <span className={`library-cover cover-${Number.parseInt(item.id.slice(0, 2), 16) % 4}`}>
-                    <span className="cover-label">PDFMuse</span>
-                    <strong>{item.title}</strong>
-                    <span className="cover-rule" />
-                    <small>PDF · {item.pageCount} 页</small>
-                  </span>
-                  <span className="library-book-info">
-                    <strong title={item.title}>{item.title}</strong>
-                    <span>读至第 {item.currentPage} 页，共 {item.pageCount} 页</span>
-                    <span>{formatUpdatedAt(item.updatedAt)}</span>
-                  </span>
-                </button>
+                  <button
+                    className="library-book-open"
+                    disabled={busy}
+                    onClick={() => void run(() => onOpenBook(item.id))}
+                    aria-label={`打开《${item.title}》`}
+                  >
+                    <span className={`library-cover cover-${Number.parseInt(item.id.slice(0, 2), 16) % 4}`}>
+                      <span className="cover-label">PDFMuse</span>
+                      <strong>{item.title}</strong>
+                      <span className="cover-rule" />
+                      <small>PDF · {item.pageCount} 页</small>
+                    </span>
+                    <span className="library-book-info">
+                      <strong title={item.title}>{item.title}</strong>
+                      <span>读至第 {item.currentPage} 页，共 {item.pageCount} 页</span>
+                      <span>{formatUpdatedAt(item.updatedAt)}</span>
+                    </span>
+                  </button>
+                  <IconButton
+                    label={`管理《${item.title}》`}
+                    disabled={busy}
+                    onClick={() => { setManagedBook(item); setConfirmDelete(false); }}
+                  ><EllipsisVertical /></IconButton>
+                </div>
               ))}
             </div>
           )}
@@ -368,6 +396,40 @@ function LibraryView({
           <div className="library-drop-hint"><Upload size={15} />也可以将一个 PDF 文件拖到窗口中</div>
         </section>
         {dragging && <div className="drop-overlay"><Upload size={30} /><strong>松开以加入书库</strong><span>仅接受一个 PDF 文件</span></div>}
+        <Dialog.Root open={Boolean(managedBook)} onOpenChange={(open) => { if (!open && !busy) closeBookManager(); }}>
+          <Dialog.Portal>
+            <Dialog.Overlay className="dialog-overlay" />
+            <Dialog.Content className="library-manage-dialog" aria-describedby="library-manage-description">
+              {confirmDelete ? (
+                <>
+                  <Dialog.Title>确认删除本书数据</Dialog.Title>
+                  <Dialog.Description id="library-manage-description">
+                    PDFMuse 将永久删除《{managedBook?.title}》的阅读位置、对话、记忆、OCR 结果、目录和索引。PDF 原文件不会被修改或删除。
+                  </Dialog.Description>
+                  <div className="library-manage-warning">此操作无法撤销。</div>
+                  <div className="library-manage-actions">
+                    <button className="secondary-command" disabled={busy} onClick={() => setConfirmDelete(false)}>返回</button>
+                    <button className="danger-command" disabled={busy} onClick={() => managedBook && void runBookMutation(() => onDeleteData(managedBook.id))}><Trash2 size={16} />永久删除本书数据</button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <Dialog.Title>管理《{managedBook?.title}》</Dialog.Title>
+                  <Dialog.Description id="library-manage-description">选择如何处理这本书。两种操作都不会修改或删除 PDF 原文件。</Dialog.Description>
+                  <div className="library-manage-option">
+                    <div><strong>移出书库</strong><p>从当前书库隐藏，阅读位置、对话、记忆和索引继续保留。以后重新打开同一 PDF 即可恢复。</p></div>
+                    <button className="secondary-command" disabled={busy} onClick={() => managedBook && void runBookMutation(() => onRemove(managedBook.id))}><BookMinus size={16} />移出</button>
+                  </div>
+                  <div className="library-manage-option destructive">
+                    <div><strong>删除本书数据</strong><p>删除 PDFMuse 保存的本书阅读数据，PDF 原文件保持原样。</p></div>
+                    <button className="danger-command" disabled={busy} onClick={() => setConfirmDelete(true)}><Trash2 size={16} />删除数据</button>
+                  </div>
+                  <div className="library-manage-actions"><button className="secondary-command" disabled={busy} onClick={closeBookManager}>关闭</button></div>
+                </>
+              )}
+            </Dialog.Content>
+          </Dialog.Portal>
+        </Dialog.Root>
       </main>
     </Tooltip.Provider>
   );
@@ -774,6 +836,36 @@ export function App() {
     }
   }, [handleOpenResult]);
 
+  const removeLibraryBook = useCallback(async (bookId: string) => {
+    if (!window.pdfMuse) return;
+    try {
+      const result = await window.pdfMuse.removeLibraryBook(bookId);
+      if (!result.ok) setLibraryError(result.message);
+      else {
+        setLibraryError("");
+        setUnavailableBookId(undefined);
+        await refreshLibrary();
+      }
+    } catch {
+      setLibraryError("无法将这本书移出书库，请稍后重试。");
+    }
+  }, [refreshLibrary]);
+
+  const deleteLibraryBookData = useCallback(async (bookId: string) => {
+    if (!window.pdfMuse) return;
+    try {
+      const result = await window.pdfMuse.deleteLibraryBookData(bookId);
+      if (!result.ok) setLibraryError(result.message);
+      else {
+        setLibraryError("");
+        setUnavailableBookId(undefined);
+        await refreshLibrary();
+      }
+    } catch {
+      setLibraryError("无法删除本书数据，请稍后重试。");
+    }
+  }, [refreshLibrary]);
+
   const recognizeCurrentPage = useCallback(async () => {
     if (!book || !window.pdfMuse || ocrLoading) return;
     setOcrLoading(true);
@@ -1126,7 +1218,7 @@ export function App() {
   }
   if (!startupReady) return <div className="boot-state">正在恢复最近阅读...</div>;
   if (!book) {
-    return <><LibraryView books={libraryBooks} error={libraryError} loading={libraryLoading} unavailableBookId={unavailableBookId} warnings={preflight.warnings} onChoose={openBook} onDropFile={openDroppedBook} onOpenBook={openLibraryBook} onRelocate={relocateLibraryBook} /><PasswordDialog request={passwordRequest} onCancel={() => setPasswordRequest(undefined)} onUnlock={unlockPdf} /></>;
+    return <><LibraryView books={libraryBooks} error={libraryError} loading={libraryLoading} unavailableBookId={unavailableBookId} warnings={preflight.warnings} onChoose={openBook} onDropFile={openDroppedBook} onOpenBook={openLibraryBook} onRelocate={relocateLibraryBook} onRemove={removeLibraryBook} onDeleteData={deleteLibraryBookData} /><PasswordDialog request={passwordRequest} onCancel={() => setPasswordRequest(undefined)} onUnlock={unlockPdf} /></>;
   }
 
   return (

@@ -5,7 +5,13 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { createBookIndex } from "./agent/book-index.js";
+import { createMemoryModule } from "./agent/memory.js";
+import { createSessionStore } from "./agent/session-store.js";
+import { createBackgroundJobModule } from "./background-jobs.js";
+import { createBookOutlineModule } from "./book-outline.js";
 import { createLibraryModule } from "./library.js";
+import { createOcrModule, type OcrEngine } from "./ocr.js";
 
 const workspaces: string[] = [];
 const fixturePath = path.resolve("data", "qa-sample.pdf");
@@ -81,9 +87,22 @@ describe("Library Module", () => {
     const library = createLibraryModule(dataHome);
 
     const first = await library.openPath(firstPath);
+    if (!first.ok) throw new Error(first.message);
+    library.updateReadingState(first.book.id, {
+      page: 1,
+      scrollTop: 240,
+      zoomMode: "custom",
+      zoomScale: 140,
+      leftSidebarOpen: false,
+      rightSidebarOpen: true,
+    });
     const second = await library.openPath(secondPath);
 
-    expect(first.ok && second.ok && first.book.id).toBe(second.ok ? second.book.id : undefined);
+    expect(second.ok && first.book.id).toBe(second.ok ? second.book.id : undefined);
+    expect(second).toMatchObject({
+      ok: true,
+      book: { readingState: { scrollTop: 240, zoomMode: "custom", zoomScale: 140, leftSidebarOpen: false } },
+    });
     expect(library.list()).toHaveLength(1);
     expect(library.list()[0]).toMatchObject({
       title: "第二名称",
@@ -169,6 +188,117 @@ describe("Library Module", () => {
       code: "CONTENT_CHANGED",
     });
     expect(library.list()[0]?.id).toBe(added.book.id);
+    library.close();
+  });
+
+  it("同一路径换成另一份有效 PDF 时建立新身份且不沿用旧状态", async () => {
+    const { workspace, dataHome } = await createWorkspace();
+    const sourcePath = path.join(workspace, "会更新的书.pdf");
+    await copyFile(multiPageFixturePath, sourcePath);
+    const library = createLibraryModule(dataHome);
+    const original = await library.openPath(sourcePath);
+    if (!original.ok) throw new Error(original.message);
+    library.updateReadingState(original.book.id, {
+      page: 3,
+      scrollTop: 500,
+      zoomMode: "custom",
+      zoomScale: 175,
+      leftSidebarOpen: false,
+      rightSidebarOpen: false,
+    });
+
+    await copyFile(fixturePath, sourcePath);
+    const replacement = await library.openPath(sourcePath);
+
+    expect(replacement.ok).toBe(true);
+    if (replacement.ok) {
+      expect(replacement.book.id).not.toBe(original.book.id);
+      expect(replacement.book.readingState).toMatchObject({ page: 1, scrollTop: 0, zoomScale: 100 });
+    }
+    expect(library.list()).toHaveLength(2);
+    expect(library.list().map((book) => book.id)).toEqual(expect.arrayContaining([original.book.id, replacement.ok ? replacement.book.id : ""]));
+    library.close();
+  });
+
+  it("移出书库后保留本书数据并在重新打开时恢复", async () => {
+    const { workspace, dataHome } = await createWorkspace();
+    const sourcePath = path.join(workspace, "暂时移出.pdf");
+    await copyFile(multiPageFixturePath, sourcePath);
+    const sourceBefore = await readFile(sourcePath);
+    const library = createLibraryModule(dataHome);
+    const opened = await library.openPath(sourcePath);
+    if (!opened.ok) throw new Error(opened.message);
+    library.updateReadingState(opened.book.id, {
+      page: 2,
+      scrollTop: 320,
+      zoomMode: "custom",
+      zoomScale: 125,
+      leftSidebarOpen: true,
+      rightSidebarOpen: false,
+    });
+
+    expect(library.removeFromLibrary(opened.book.id)).toEqual({ ok: true, bookId: opened.book.id });
+    expect(library.list()).toEqual([]);
+    await expect(library.openKnown(opened.book.id)).resolves.toMatchObject({ ok: false, code: "FILE_UNAVAILABLE" });
+
+    const restored = await library.openPath(sourcePath);
+    expect(restored).toMatchObject({
+      ok: true,
+      book: { id: opened.book.id, readingState: { page: 2, scrollTop: 320, zoomScale: 125, rightSidebarOpen: false } },
+    });
+    expect(await readFile(sourcePath)).toEqual(sourceBefore);
+    library.close();
+  });
+
+  it("删除本书产品数据时清理所有模块记录但不触碰 PDF 原文件", async () => {
+    const { workspace, dataHome } = await createWorkspace();
+    const sourcePath = path.join(workspace, "彻底清理.pdf");
+    await copyFile(multiPageFixturePath, sourcePath);
+    const sourceBefore = await readFile(sourcePath);
+    const library = createLibraryModule(dataHome);
+    const opened = await library.openPath(sourcePath);
+    if (!opened.ok) throw new Error(opened.message);
+    const bookId = opened.book.id;
+    const sessionStore = createSessionStore(dataHome);
+    const memory = createMemoryModule(dataHome);
+    const bookIndex = createBookIndex(dataHome);
+    const ocrEngine: OcrEngine = {
+      name: "测试引擎",
+      model: "测试模型",
+      async recognize(input) {
+        return { width: input.width, height: input.height, orientation: 0, lines: [] };
+      },
+    };
+    const ocr = createOcrModule(dataHome, ocrEngine);
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: async () => ({ pageCount: 1, hasValidEmbeddedOutline: false, getNativeLines: async () => [], close: async () => undefined }),
+    });
+    const jobs = createBackgroundJobModule(dataHome, { index: async () => undefined });
+
+    const session = sessionStore.ensureSession(bookId);
+    sessionStore.appendMessage({ sessionId: session.id, runId: "run-1", role: "reader", body: "保留到删除前", status: "complete" });
+    memory.propose({ bookId, content: "待删除的记忆", source: "conversation" });
+    await bookIndex.ensureIndexed(bookId, async () => ({ bytes: opened.book.bytes }));
+    await ocr.recognizePage({ bookId, page: 1, imageData: "AA==", width: 10, height: 10 });
+    await outline.rebuild(bookId, async () => ({ bytes: opened.book.bytes }));
+    jobs.schedule({ bookId, kind: "index" });
+
+    expect(library.deleteBookData(bookId)).toEqual({ ok: true, bookId });
+    expect(library.list()).toEqual([]);
+    expect(sessionStore.findSession(bookId)).toBeUndefined();
+    expect(memory.listProposals(bookId)).toEqual([]);
+    expect(bookIndex.stats(bookId)).toEqual({ indexedPages: 0, totalPages: 0 });
+    expect(ocr.getPage(bookId, 1)).toBeUndefined();
+    expect(outline.get(bookId)).toBeUndefined();
+    expect(jobs.list(bookId)).toEqual([]);
+    expect(await readFile(sourcePath)).toEqual(sourceBefore);
+
+    jobs.close();
+    outline.close();
+    ocr.close();
+    bookIndex.close();
+    memory.close();
+    sessionStore.close();
     library.close();
   });
 
