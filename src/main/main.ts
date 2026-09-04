@@ -12,6 +12,7 @@ import { createAgentHost, type AgentHost } from "./agent/agent-host.js";
 import { createBookIndex } from "./agent/book-index.js";
 import type { ResolvedModelConnection } from "./agent/model-runtime.js";
 import { createToolRegistry } from "./agent/tool-registry.js";
+import { createMemoryModule } from "./agent/memory.js";
 import { createReaderProfileModule } from "./reader-profile.js";
 import type {
   AgentStreamEvent,
@@ -27,6 +28,7 @@ let startupPreflight: StartupPreflight;
 let closeLibrary: (() => void) | undefined;
 let closeAgentHost: (() => void) | undefined;
 let closeBookIndex: (() => void) | undefined;
+let closeMemory: (() => void) | undefined;
 
 function broadcastAgentEvent(event: AgentStreamEvent) {
   for (const window of BrowserWindow.getAllWindows()) {
@@ -91,7 +93,9 @@ app.whenReady().then(async () => {
       },
     });
     closeBookIndex = bookIndex.close;
-    const toolRegistry = createToolRegistry();
+    const memory = createMemoryModule(startupPreflight.dataHome);
+    closeMemory = memory.close;
+    const toolRegistry = createToolRegistry({ memoryConfigured: true });
     const agentHost: AgentHost = createAgentHost({
       dataHome: startupPreflight.dataHome,
       emit: broadcastAgentEvent,
@@ -107,12 +111,14 @@ app.whenReady().then(async () => {
           : undefined;
       },
       loadReaderProfile: async () => (await readerProfile.get()).content,
+      memory,
       isKnownBook: (bookId) => library.list().some((book) => book.id === bookId),
       buildTools: (context) => toolRegistry.buildAgentTools(() => ({
         bookId: context.bookId,
         focus: context.focus,
         reportEvidence: context.reportEvidence,
         bookIndex,
+        memory: context.memory,
       })),
       indexConversationMessage: async (bookId, message) => {
         await bookIndex.indexConversationMessage(bookId, message);
@@ -172,6 +178,30 @@ app.whenReady().then(async () => {
       (_event, input: TestEmbeddingConnectionInput) => embeddingConnection.test(input),
     );
     ipcMain.handle("agent:get-conversation", (_event, bookId: unknown) => agentHost.getConversation(bookId));
+    const isOwnedBook = (bookId: unknown): bookId is string => typeof bookId === "string" && library.list().some((book) => book.id === bookId);
+    ipcMain.handle("memory:list-proposals", (_event, bookId: unknown) => isOwnedBook(bookId) ? memory.listProposals(bookId) : []);
+    ipcMain.handle("memory:list", (_event, bookId: unknown) => isOwnedBook(bookId) ? memory.listMemories(bookId) : []);
+    ipcMain.handle("memory:audit", (_event, bookId: unknown) => isOwnedBook(bookId) ? memory.listAudit(bookId) : []);
+    ipcMain.handle("memory:review-proposal", (_event, input: unknown) => {
+      if (!input || typeof input !== "object") return { ok: false, code: "VALIDATION_ERROR", message: "记忆审核操作无效。" };
+      const value = input as { bookId?: unknown; proposalId?: unknown; action?: unknown };
+      if (!isOwnedBook(value.bookId) || typeof value.proposalId !== "string" || (value.action !== "approve" && value.action !== "reject")) {
+        return { ok: false, code: "VALIDATION_ERROR", message: "记忆审核操作无效。" };
+      }
+      return memory.review({ bookId: value.bookId, proposalId: value.proposalId, action: value.action }, value.bookId);
+    });
+    ipcMain.handle("memory:revoke", (_event, input: unknown) => {
+      if (!input || typeof input !== "object") return { ok: false, code: "VALIDATION_ERROR", message: "撤销记忆操作无效。" };
+      const value = input as { bookId?: unknown; memoryId?: unknown };
+      if (!isOwnedBook(value.bookId) || typeof value.memoryId !== "string") return { ok: false, code: "VALIDATION_ERROR", message: "撤销记忆操作无效。" };
+      return memory.revoke(value.memoryId, value.bookId);
+    });
+    ipcMain.handle("agent:approve-tool", (_event, input: unknown) => {
+      if (!input || typeof input !== "object") return { ok: false, message: "审批操作无效。" };
+      const value = input as { approvalId?: unknown; approved?: unknown };
+      if (typeof value.approvalId !== "string" || typeof value.approved !== "boolean") return { ok: false, message: "审批操作无效。" };
+      return agentHost.approveTool({ approvalId: value.approvalId, approved: value.approved });
+    });
     ipcMain.handle("agent:start-run", (_event, input: unknown) => agentHost.start(input));
     ipcMain.handle("agent:cancel-run", (_event, runId: unknown) => agentHost.cancel(runId));
     ipcMain.handle("reader-profile:get", () => readerProfile.get());
@@ -190,6 +220,8 @@ app.once("before-quit", () => {
   closeAgentHost = undefined;
   closeBookIndex?.();
   closeBookIndex = undefined;
+  closeMemory?.();
+  closeMemory = undefined;
 });
 
 app.on("window-all-closed", () => {

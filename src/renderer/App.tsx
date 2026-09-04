@@ -3,6 +3,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import {
   BookOpen,
   Bot,
+  Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -34,6 +35,9 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import type {
   AgentStreamEvent,
   AgentImageAttachment,
+  BookMemory,
+  MemoryProposal,
+  MemoryAuditEntry,
   ConversationMessage,
   LibraryBook,
   OpenedPdfBook,
@@ -52,6 +56,7 @@ import { createReadingStateWriter } from "./reading-state-persistence";
 type PassagePopover = Extract<ViewerSelection, { kind: "selected" }>;
 type StreamingReply = { runId: string; sessionId: string; body: string };
 type ComposerSubmission = { runId: string; question: string; passage?: SelectedPassage; attachments: AgentImageAttachment[] };
+type PendingApproval = { approvalId: string; runId: string; toolName?: string };
 
 const TOOL_TITLES: Record<string, string> = {
   book_search: "检索本书",
@@ -400,6 +405,10 @@ export function App() {
   const [attachedPassage, setAttachedPassage] = useState<SelectedPassage>();
   const [attachments, setAttachments] = useState<AgentImageAttachment[]>([]);
   const [conversation, setConversation] = useState<ConversationMessage[]>([]);
+  const [memoryProposals, setMemoryProposals] = useState<MemoryProposal[]>([]);
+  const [bookMemories, setBookMemories] = useState<BookMemory[]>([]);
+  const [memoryAudit, setMemoryAudit] = useState<MemoryAuditEntry[]>([]);
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval>();
   const [streamingReply, setStreamingReply] = useState<StreamingReply>();
   const [toolStatus, setToolStatus] = useState<string>();
   const [agentNotice, setAgentNotice] = useState("");
@@ -444,8 +453,24 @@ export function App() {
     }
   }, []);
 
+  const refreshMemoryProposals = useCallback(async (bookId: string) => {
+    if (!window.pdfMuse) return;
+    try {
+      const proposals = await window.pdfMuse.listMemoryProposals(bookId);
+      setMemoryProposals(proposals.filter((proposal) => proposal.status === "pending"));
+      setBookMemories(await window.pdfMuse.listBookMemories(bookId));
+      setMemoryAudit(await window.pdfMuse.listMemoryAudit(bookId));
+    } catch {
+      setAgentNotice("无法读取待确认的本书记忆。");
+    }
+  }, []);
+
   const resetConversationState = useCallback(() => {
     setConversation([]);
+    setMemoryProposals([]);
+    setBookMemories([]);
+    setMemoryAudit([]);
+    setPendingApproval(undefined);
     setStreamingReply(undefined);
     setToolStatus(undefined);
     setAgentNotice("");
@@ -514,12 +539,13 @@ export function App() {
     setUnavailableBookId(undefined);
     resetConversationState();
     void refreshConversation(openedBook.id);
+    void refreshMemoryProposals(openedBook.id);
     setPanMode(false);
     setPassage(undefined);
     setAttachedPassage(undefined);
     setAttachments([]);
     setSelectionFeedback(undefined);
-  }, [refreshConversation, resetConversationState]);
+  }, [refreshConversation, refreshMemoryProposals, resetConversationState]);
 
   const handleOpenResult = useCallback((result: OpenPdfBookResult, attemptedBookId?: string) => {
     if (result.ok) {
@@ -714,6 +740,8 @@ export function App() {
         } else if (event.stream === "tool") {
           const title = TOOL_TITLES[event.name] ?? event.name;
           setToolStatus(event.phase === "end" ? `${title}完成` : `${title}中...`);
+        } else if (event.stream === "lifecycle" && event.phase === "waiting-approval" && event.approvalId) {
+          setPendingApproval({ approvalId: event.approvalId, runId: event.runId, toolName: event.toolName });
         } else if (event.stream === "lifecycle" && (event.phase === "end" || event.phase === "cancelled" || event.phase === "error")) {
           const submission = pendingComposerRef.current;
           if (submission?.runId === event.runId) {
@@ -729,13 +757,15 @@ export function App() {
             pendingComposerRef.current = undefined;
           }
           activeRunRef.current = undefined;
+          setPendingApproval(undefined);
           setStreamingReply(undefined);
           setToolStatus(undefined);
           if (book) void refreshConversation(book.id);
+          if (book) void refreshMemoryProposals(book.id);
         }
       }
     });
-  }, [book, refreshConversation]);
+  }, [book, refreshConversation, refreshMemoryProposals]);
 
   const askAgent = useCallback(async (question: string, passage?: SelectedPassage, imageAttachments: AgentImageAttachment[] = []) => {
     if (!book || !window.pdfMuse || activeRunRef.current) return undefined;
@@ -787,10 +817,44 @@ export function App() {
     }
   }, []);
 
+  const resolveAgentApproval = useCallback(async (approved: boolean) => {
+    if (!window.pdfMuse || !pendingApproval) return;
+    const result = await window.pdfMuse.approveAgentTool({ approvalId: pendingApproval.approvalId, approved });
+    if (!result.ok) setAgentNotice(result.message);
+    setPendingApproval(undefined);
+  }, [pendingApproval]);
+
+  const reviewMemoryProposal = useCallback(async (proposalId: string, action: "approve" | "reject") => {
+    if (!window.pdfMuse || !book) return;
+    try {
+      const result = await window.pdfMuse.reviewMemoryProposal({ bookId: book.id, proposalId, action });
+      if (!result.ok) {
+        setAgentNotice(result.message);
+        return;
+      }
+      await refreshMemoryProposals(book.id);
+    } catch {
+      setAgentNotice("无法更新本书记忆，请重试。");
+    }
+  }, [book, refreshMemoryProposals]);
+
+  const revokeBookMemory = useCallback(async (memoryId: string) => {
+    if (!window.pdfMuse || !book) return;
+    try {
+      const result = await window.pdfMuse.revokeBookMemory({ bookId: book.id, memoryId });
+      if (!result.ok) {
+        setAgentNotice(result.message);
+        return;
+      }
+      await refreshMemoryProposals(book.id);
+    } catch {
+      setAgentNotice("无法撤销本书记忆，请重试。");
+    }
+  }, [book, refreshMemoryProposals]);
+
   const explain = useCallback((selectedPassage: SelectedPassage) => {
     setRightOpen(true);
     setPassage(undefined);
-    window.getSelection()?.removeAllRanges();
     void askAgent("请解释这段内容。", selectedPassage);
   }, [askAgent]);
 
@@ -798,13 +862,11 @@ export function App() {
     setAttachedPassage(selectedPassage);
     setRightOpen(true);
     setPassage(undefined);
-    window.getSelection()?.removeAllRanges();
     requestAnimationFrame(() => composerRef.current?.focus());
   }, []);
 
   const copyPassage = useCallback(async (selectedPassage: SelectedPassage) => {
     setPassage(undefined);
-    window.getSelection()?.removeAllRanges();
     try {
       await navigator.clipboard.writeText(selectedPassage.text);
       setSelectionFeedback({ message: "已复制选中原文。", tone: "success" });
@@ -1073,6 +1135,54 @@ export function App() {
               </div>
             )}
             <div className="composer-wrap">
+              {pendingApproval && (
+                <section className="memory-proposals approval-request" aria-label="等待确认">
+                  <div className="memory-proposals-title">智能体请求保存一条本书记忆</div>
+                  <p>确认后会创建待审核候选，仍需在下方再次审核后才会进入本书记忆。</p>
+                  <div className="memory-proposal-actions">
+                    <button aria-label="允许智能体提议记忆" title="允许" onClick={() => void resolveAgentApproval(true)}><Check size={13} />允许</button>
+                    <button aria-label="拒绝智能体提议记忆" title="拒绝" onClick={() => void resolveAgentApproval(false)}><X size={13} />拒绝</button>
+                  </div>
+                </section>
+              )}
+              {memoryProposals.length > 0 && (
+                <section className="memory-proposals" aria-label="待确认的本书记忆">
+                  <div className="memory-proposals-title">待确认的本书记忆</div>
+                  {memoryProposals.map((proposal) => (
+                    <article className="memory-proposal" key={proposal.id}>
+                      <p title={proposal.content}>{proposal.content}</p>
+                      <small>{proposal.source === "pdf" ? "PDF 原文" : proposal.source === "conversation" ? "较早对话" : proposal.source === "summary" ? "会话摘要" : "网页资料"} · 待核实</small>
+                      <div className="memory-proposal-actions">
+                        <button aria-label="确认记忆" title="确认记忆" onClick={() => void reviewMemoryProposal(proposal.id, "approve")}><Check size={13} />确认</button>
+                        <button aria-label="拒绝记忆" title="拒绝记忆" onClick={() => void reviewMemoryProposal(proposal.id, "reject")}><X size={13} />拒绝</button>
+                      </div>
+                    </article>
+                  ))}
+                </section>
+              )}
+              {bookMemories.length > 0 && (
+                <section className="book-memories" aria-label="本书记忆">
+                  <div className="memory-proposals-title">本书记忆</div>
+                  {bookMemories.map((memory) => (
+                    <article className="book-memory" key={memory.id}>
+                      <p title={memory.content}>{memory.content}</p>
+                      <small>{memory.source === "pdf" ? "PDF 原文" : memory.source === "conversation" ? "较早对话" : memory.source === "summary" ? "会话摘要" : "网页资料"} · {memory.trust === "trusted" ? "已确认" : "待核实"}</small>
+                      <button aria-label="撤销本条记忆" title="撤销本条记忆" onClick={() => void revokeBookMemory(memory.id)}><X size={12} />撤销</button>
+                    </article>
+                  ))}
+                </section>
+              )}
+              {memoryAudit.length > 0 && (
+                <details className="memory-audit">
+                  <summary>记忆变更记录</summary>
+                  {memoryAudit.slice(0, 8).map((entry) => (
+                    <div className="memory-audit-row" key={entry.id}>
+                      <span>{entry.action === "proposal_created" ? "创建候选" : entry.action === "proposal_approved" ? "确认记忆" : entry.action === "proposal_rejected" ? "拒绝候选" : entry.action === "memory_revoked" ? "撤销记忆" : entry.action}</span>
+                      <time>{new Date(entry.createdAt).toLocaleString("zh-CN")}</time>
+                    </div>
+                  ))}
+                </details>
+              )}
               {attachedPassage && <div className="passage-chip"><span>已选原文 · 第 {attachedPassage.page} 页</span><p>{attachedPassage.text}</p><button aria-label="移除已选原文" onClick={() => setAttachedPassage(undefined)}><X size={14} /></button></div>}
               {attachments.length > 0 && (
                 <div className="attachment-strip" aria-label="截图附件">

@@ -14,6 +14,7 @@ export {
   type AgentState,
   type AgentTool,
   type AgentToolResult,
+  type BeforeToolCallContext,
   type CompactionSettings,
   type StreamFn,
 } from "../../../vendor/openclaw-agent-core/packages/agent-core/src/index.js";

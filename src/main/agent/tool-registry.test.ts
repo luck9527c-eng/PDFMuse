@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createBookIndex } from "./book-index.js";
 import { createLibraryModule } from "../library.js";
 import { createToolRegistry } from "./tool-registry.js";
+import { createMemoryModule } from "./memory.js";
 
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
 
@@ -30,10 +31,11 @@ describe("tool registry", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
-  function context(reportEvidence: (evidence: unknown[]) => void = () => undefined) {
+  function context(reportEvidence: (evidence: unknown[]) => void = () => undefined, memory?: ReturnType<typeof createMemoryModule>) {
     return {
       bookId,
       bookIndex,
+      memory,
       reportEvidence: reportEvidence as (evidence: never[]) => void,
     };
   }
@@ -42,6 +44,21 @@ describe("tool registry", () => {
     const registry = createToolRegistry();
     expect(registry.toolNames()).toEqual(["book_search"]);
     expect(registry.toolNames()).toEqual(createToolRegistry({ embeddingConfigured: false }).toolNames());
+  });
+
+  it("exposes memory tools only when the memory module is configured", async () => {
+    const memory = createMemoryModule(dataHome);
+    try {
+      const registry = createToolRegistry({ memoryConfigured: true });
+      expect(registry.toolNames()).toEqual(["book_search", "memory_search", "memory_propose"]);
+      const tool = registry.buildAgentTools(() => context(() => undefined, memory)).find((item) => item.name === "memory_propose");
+      expect(tool).toBeDefined();
+      const result = await tool!.execute("call-memory", { content: "Reader 认可的核心概念", source: "conversation" });
+      expect((result.content[0] as { text: string }).text).toContain("待确认");
+      expect(memory.listProposals(bookId)[0]?.status).toBe("pending");
+    } finally {
+      memory.close();
+    }
   });
 
   it("executes book_search with indexing, evidence and a model-facing summary", async () => {

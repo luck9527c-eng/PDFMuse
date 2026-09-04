@@ -1,4 +1,4 @@
-import type { AgentImageAttachment, ReadingFocus } from "../../shared/contracts.js";
+import type { AgentImageAttachment, MemorySearchResult, ReadingFocus } from "../../shared/contracts.js";
 import type { AssistantMessage, ImageContent, Message, UserMessage } from "./openclaw-core.js";
 
 const SYSTEM_PROMPT = [
@@ -79,6 +79,7 @@ export function historyToLlmMessages(
   limit = 12,
   attachments: readonly AgentImageAttachment[] = [],
   summary?: string,
+  memories: readonly MemorySearchResult[] = [],
 ): Message[] {
   const recent = historyMessagesToLlmMessages(history).slice(-limit);
   const messages: Message[] = [];
@@ -86,6 +87,13 @@ export function historyToLlmMessages(
     messages.push({ role: "user", content: `【Conversation Summary】\n${summary.trim()}`, timestamp: 0 });
   }
   messages.push(...recent);
+  if (memories.length > 0) {
+    messages.push({
+      role: "user",
+      content: `【相关本书记忆（仅供参考）】\n${memories.slice(0, 6).map((memory) => `- ${memory.content}`).join("\n")}`,
+      timestamp: 0,
+    });
+  }
   const imageBlocks: ImageContent[] = attachments.map((attachment) => ({
     type: "image",
     data: attachment.data,

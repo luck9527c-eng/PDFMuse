@@ -139,6 +139,22 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .evidence-tags .evidence-tag { margin-top: 0; }
 .tool-status { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--green); font-size: 10px; }
 .composer-wrap { padding: 11px 12px 13px; border-top: 1px solid var(--line); }
+.memory-proposals { margin-bottom: 9px; padding: 8px; border: 1px solid #d8c9a7; border-radius: 5px; background: #fbf6e9; }
+.memory-proposals-title { margin-bottom: 6px; color: #795c24; font-size: 10px; font-weight: 800; }
+.memory-proposal { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 7px; padding-top: 6px; border-top: 1px solid #eadfca; }
+.memory-proposal:first-of-type { padding-top: 0; border-top: 0; }
+.memory-proposal p { min-width: 0; max-height: 34px; margin: 0; overflow: hidden; color: var(--ink); font-size: 10px; line-height: 1.55; word-break: break-word; }
+.memory-proposal-actions { display: flex; gap: 4px; }
+.memory-proposal-actions button { display: inline-flex; align-items: center; gap: 3px; min-height: 25px; padding: 3px 6px; border: 1px solid #d8c9a7; border-radius: 4px; background: transparent; color: #795c24; font-size: 10px; cursor: pointer; white-space: nowrap; }
+.memory-proposal-actions button:first-child { border-color: #a8c6af; color: var(--green); }
+.book-memories { margin-bottom: 9px; padding: 8px; border: 1px solid #c6d8cd; border-radius: 5px; background: #f2f7f3; }
+.book-memory { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 7px; padding-top: 6px; border-top: 1px solid #dbe8df; }
+.book-memory:first-of-type { padding-top: 0; border-top: 0; }
+.memory-audit { margin-top: 8px; font-size: 11px; color: var(--muted); }
+.memory-audit summary { cursor: pointer; }
+.memory-audit-row { display: flex; justify-content: space-between; gap: 8px; padding-top: 4px; }
+.book-memory p { min-width: 0; max-height: 34px; margin: 0; overflow: hidden; color: var(--ink); font-size: 10px; line-height: 1.55; word-break: break-word; }
+.book-memory button { display: inline-flex; align-items: center; gap: 3px; min-height: 25px; padding: 3px 6px; border: 1px solid #c6d8cd; border-radius: 4px; background: transparent; color: var(--green); font-size: 10px; cursor: pointer; white-space: nowrap; }
 .composer { display: grid; grid-template-columns: minmax(0, 1fr) 38px; align-items: end; gap: 7px; }
 .composer textarea { min-height: 48px; max-height: 120px; resize: vertical; padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); font-size: 12px; line-height: 1.5; }
 .send-button { width: 38px; height: 38px; display: grid; place-items: center; border: 0; border-radius: 6px; background: var(--green); color: #fff; cursor: pointer; }

@@ -186,6 +186,73 @@ export type TestEmbeddingConnectionResult =
 
 export type AgentMessageStatus = "complete" | "error" | "cancelled";
 
+export type MemorySource = "pdf" | "conversation" | "summary" | "web";
+export type MemoryTrust = "trusted" | "untrusted";
+export type MemoryProposalStatus = "pending" | "approved" | "rejected" | "revoked";
+
+export type BookMemory = {
+  id: string;
+  bookId: string;
+  content: string;
+  source: MemorySource;
+  sourceId?: string;
+  page?: number;
+  trust: MemoryTrust;
+  createdAt: string;
+  confirmedAt: string;
+  revokedAt?: string;
+};
+
+export type MemoryProposal = {
+  id: string;
+  bookId: string;
+  content: string;
+  source: MemorySource;
+  sourceId?: string;
+  page?: number;
+  trust: MemoryTrust;
+  status: MemoryProposalStatus;
+  createdAt: string;
+  reviewedAt?: string;
+  memoryId?: string;
+};
+
+export type MemorySearchResult = BookMemory & { score: number };
+
+export type ProposeMemoryInput = {
+  bookId: string;
+  content: string;
+  source?: MemorySource;
+  sourceId?: string;
+  page?: number;
+  provenance?: "agent" | "reader" | "pdf-evidence" | "conversation" | "summary" | "web";
+};
+
+export type MemoryMutationResult =
+  | { ok: true; memory?: BookMemory; proposal?: MemoryProposal }
+  | { ok: false; code: "VALIDATION_ERROR" | "NOT_FOUND" | "CONFLICT"; message: string };
+
+export type MemoryProposalReviewInput = {
+  bookId: string;
+  proposalId: string;
+  action: "approve" | "reject";
+};
+
+export type MemoryRevokeInput = {
+  bookId: string;
+  memoryId: string;
+};
+
+export type MemoryAuditEntry = {
+  id: string;
+  bookId: string;
+  proposalId?: string;
+  memoryId?: string;
+  action: string;
+  details?: string;
+  createdAt: string;
+};
+
 /** 回答引用的 PDF Evidence：来自当前书的可信检索结果，可点击跳回原文。 */
 export type ConversationEvidence = {
   source: "pdf";
@@ -245,9 +312,11 @@ export type StartAgentRunResult =
 export type AgentStreamEvent =
   | {
       stream: "lifecycle";
-      phase: "start" | "finishing" | "end" | "cancelled" | "error";
+      phase: "start" | "finishing" | "end" | "cancelled" | "error" | "waiting-approval";
       runId: string;
       sessionId: string;
+      approvalId?: string;
+      toolName?: string;
     }
   | {
       stream: "assistant";
@@ -306,6 +375,12 @@ export interface PDFMuseApi {
   saveEmbeddingConnection(input: SaveEmbeddingConnectionInput): Promise<SaveEmbeddingConnectionResult>;
   testEmbeddingConnection(input: TestEmbeddingConnectionInput): Promise<TestEmbeddingConnectionResult>;
   getBookConversation(bookId: string): Promise<ConversationMessage[]>;
+  listMemoryProposals(bookId: string): Promise<MemoryProposal[]>;
+  listBookMemories(bookId: string): Promise<BookMemory[]>;
+  listMemoryAudit(bookId: string): Promise<MemoryAuditEntry[]>;
+  reviewMemoryProposal(input: MemoryProposalReviewInput): Promise<MemoryMutationResult>;
+  revokeBookMemory(input: MemoryRevokeInput): Promise<MemoryMutationResult>;
+  approveAgentTool(input: { approvalId: string; approved: boolean }): Promise<{ ok: true } | { ok: false; message: string }>;
   startAgentRun(input: StartAgentRunInput): Promise<StartAgentRunResult>;
   cancelAgentRun(runId: string): Promise<void>;
   onAgentEvent(listener: (event: AgentStreamEvent) => void): () => void;

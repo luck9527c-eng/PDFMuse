@@ -20,10 +20,12 @@ import {
   shouldCompact,
   type AgentEvent,
   type AgentTool,
+  type BeforeToolCallContext,
   type CompactionSettings,
   type StreamFn,
 } from "./openclaw-core.js";
 import { createSessionStore, type SessionStore } from "./session-store.js";
+import type { MemoryModule } from "./memory.js";
 
 export type AgentHostOptions = {
   dataHome: string;
@@ -37,7 +39,9 @@ export type AgentHostOptions = {
     bookId: string;
     focus?: ReadingFocus;
     reportEvidence(evidence: ConversationEvidence[]): void;
+    memory?: MemoryModule;
   }): AgentTool[];
+  memory?: MemoryModule;
   /** 将已完成的会话消息交给检索模块；失败不得阻断回答。 */
   indexConversationMessage?(bookId: string, message: {
     id: string;
@@ -140,6 +144,7 @@ export function createAgentHost(options: AgentHostOptions) {
   const sessionLanes = new Map<string, Promise<void>>();
   const activeRuns = new Map<string, ActiveRun>();
   const cancelledBeforeStart = new Set<string>();
+  const pendingApprovals = new Map<string, { runId: string; bookId: string; resolve: (approved: boolean) => void }>();
 
   store.abandonInterruptedMessages("程序中断，回答未完成。");
 
@@ -250,7 +255,8 @@ export function createAgentHost(options: AgentHostOptions) {
       status: readerMessage.status,
     });
 
-    const llmMessages = historyToLlmMessages(history, question, focus, historyLimit, attachments, compacted.summary);
+    const relatedMemories = options.memory?.search(bookId, question, 6) ?? [];
+    const llmMessages = historyToLlmMessages(history, question, focus, historyLimit, attachments, compacted.summary, relatedMemories);
     const questionMessage = llmMessages[llmMessages.length - 1];
     if (!questionMessage) return;
 
@@ -263,7 +269,7 @@ export function createAgentHost(options: AgentHostOptions) {
         if (!duplicate) collectedEvidence.push(item);
       }
     };
-    const tools = options.buildTools?.({ bookId: input.bookId, focus, reportEvidence }) ?? [];
+    const tools = options.buildTools?.({ bookId: input.bookId, focus, reportEvidence, memory: options.memory }) ?? [];
 
     const agent = new Agent({
       initialState: {
@@ -273,6 +279,20 @@ export function createAgentHost(options: AgentHostOptions) {
         tools,
       },
       streamFn: makeStreamFn(connection),
+      beforeToolCall: async (context: BeforeToolCallContext, signal?: AbortSignal) => {
+        if (context.toolCall.name !== "memory_propose") return undefined;
+        const approvalId = randomUUID();
+        const approved = await new Promise<boolean>((resolve) => {
+          pendingApprovals.set(approvalId, { runId, bookId, resolve });
+          options.emit({ stream: "lifecycle", phase: "waiting-approval", runId, sessionId, approvalId, toolName: "memory_propose" });
+          const onAbort = () => {
+            pendingApprovals.delete(approvalId);
+            resolve(false);
+          };
+          signal?.addEventListener("abort", onAbort, { once: true });
+        });
+        return approved ? undefined : { block: true, reason: "Reader 未确认这条记忆候选。" };
+      },
     });
 
     const run: ActiveRun = { sessionId, agent, cancelledByUser: false, timedOut: false };
@@ -353,6 +373,12 @@ export function createAgentHost(options: AgentHostOptions) {
     } finally {
       clearTimeout(timeout);
       activeRuns.delete(runId);
+      for (const [approvalId, pending] of pendingApprovals) {
+        if (pending.runId === runId) {
+          pendingApprovals.delete(approvalId);
+          pending.resolve(false);
+        }
+      }
     }
 
     if (assistantMessageId) {
@@ -460,6 +486,13 @@ export function createAgentHost(options: AgentHostOptions) {
       }
       // 尚未排到的运行：记录取消意图，执行前直接跳过。
       cancelledBeforeStart.add(runId);
+    },
+    approveTool(input: { approvalId: string; approved: boolean }) {
+      const pending = pendingApprovals.get(input.approvalId);
+      if (!pending) return { ok: false as const, message: "审批已失效，请重新发起操作。" };
+      pendingApprovals.delete(input.approvalId);
+      pending.resolve(input.approved === true);
+      return { ok: true as const };
     },
 
     getConversation(bookId: unknown): ConversationMessage[] {
