@@ -14,7 +14,7 @@ import {
 } from "pdfjs-dist/web/pdf_viewer.mjs";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
-import type { OpenedPdfBook, ReadingZoomMode, SelectedPassage } from "../../shared/contracts";
+import type { OpenedPdfBook, ReadingZoomMode, RecognizedPageText, SelectedPassage } from "../../shared/contracts";
 import { normalizePageRects } from "./selection-geometry";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -47,6 +47,7 @@ export interface PdfViewerHandle {
   fitPage(): void;
   find(query: string, findPrevious?: boolean): void;
   getThumbnail(page: number): Promise<string | undefined>;
+  getPageImage(page: number, scale?: number): Promise<{ data: string; width: number; height: number } | undefined>;
 }
 
 export type ViewerSelection =
@@ -66,6 +67,7 @@ type Props = {
   onStateChange(state: ViewerState): void;
   onSelectionChange(selection?: ViewerSelection): void;
   onError(message: string): void;
+  recognizedPage?: RecognizedPageText;
 };
 
 async function resolveOutline(
@@ -99,7 +101,7 @@ async function resolveOutline(
 }
 
 export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
-  { book, panMode, onStateChange, onSelectionChange, onError },
+  { book, panMode, onStateChange, onSelectionChange, onError, recognizedPage },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -205,6 +207,20 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       }).catch(() => undefined);
       adapter.thumbnailCache.set(pageNumber, rendering);
       return rendering;
+    },
+    getPageImage(pageNumber, scale = 1.5) {
+      const adapter = adapterRef.current;
+      if (!adapter?.document || pageNumber < 1 || pageNumber > adapter.document.numPages) return Promise.resolve(undefined);
+      return adapter.document.getPage(pageNumber).then(async (page) => {
+        const viewport = page.getViewport({ scale });
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.ceil(viewport.width);
+        canvas.height = Math.ceil(viewport.height);
+        const context = canvas.getContext("2d", { alpha: false });
+        if (!context) return undefined;
+        await page.render({ canvas, canvasContext: context, viewport }).promise;
+        return { data: canvas.toDataURL("image/png").replace(/^data:image\/png;base64,/, ""), width: canvas.width, height: canvas.height };
+      }).catch(() => undefined);
     },
   }));
 
@@ -474,6 +490,33 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       void loadingTask.destroy();
     };
   }, [book, onError, onSelectionChange, onStateChange]);
+
+  useEffect(() => {
+    const viewerElement = viewerElementRef.current;
+    if (!viewerElement) return;
+    viewerElement.querySelectorAll("[data-pdfmuse-ocr]").forEach((node) => node.remove());
+    if (!recognizedPage) return;
+    const page = viewerElement.querySelector<HTMLElement>(`.page[data-page-number="${recognizedPage.page}"]`);
+    if (!page) return;
+    const layer = document.createElement("div");
+    layer.dataset.pdfmuseOcr = "true";
+    layer.className = "ocr-text-layer";
+    layer.setAttribute("aria-label", `第 ${recognizedPage.page} 页识别文字`);
+    for (const line of recognizedPage.lines) {
+      const xs = line.polygon.map((point) => point.x);
+      const ys = line.polygon.map((point) => point.y);
+      if (xs.length < 3 || ys.length < 3 || !line.text.trim()) continue;
+      const span = document.createElement("span");
+      span.textContent = line.text;
+      span.title = `识别置信度 ${Math.round(line.confidence * 100)}%`;
+      span.style.left = `${Math.max(0, Math.min(100, Math.min(...xs) / recognizedPage.width * 100))}%`;
+      span.style.top = `${Math.max(0, Math.min(100, Math.min(...ys) / recognizedPage.height * 100))}%`;
+      span.style.width = `${Math.max(0.5, Math.min(100, (Math.max(...xs) - Math.min(...xs)) / recognizedPage.width * 100))}%`;
+      span.style.height = `${Math.max(0.5, Math.min(100, (Math.max(...ys) - Math.min(...ys)) / recognizedPage.height * 100))}%`;
+      layer.appendChild(span);
+    }
+    page.appendChild(layer);
+  }, [recognizedPage]);
 
   return (
     <div className={`pdf-container ${panMode ? "pan-mode" : ""}`} ref={containerRef}>

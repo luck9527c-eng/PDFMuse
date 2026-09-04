@@ -279,6 +279,34 @@ export type ReadingFocus = {
   selectedPassage?: SelectedPassage;
 };
 
+export type OcrPoint = { x: number; y: number };
+export type RecognizedTextLine = {
+  text: string;
+  confidence: number;
+  polygon: OcrPoint[];
+};
+export type RecognizedPageText = {
+  bookId: string;
+  page: number;
+  width: number;
+  height: number;
+  orientation: number;
+  lines: RecognizedTextLine[];
+  engine: string;
+  model: string;
+  createdAt: string;
+};
+export type OcrPageRequest = {
+  bookId: string;
+  page: number;
+  imageData: string;
+  width: number;
+  height: number;
+};
+export type OcrPageResult =
+  | { ok: true; page: RecognizedPageText }
+  | { ok: false; code: "VALIDATION_ERROR" | "UNAVAILABLE" | "FAILED" | "CANCELLED"; message: string };
+
 /** 当前问题的图片附件；data 仅保存不含 data: 前缀的 Base64。 */
 export type AgentImageAttachment = {
   id: string;
@@ -375,6 +403,8 @@ export interface PDFMuseApi {
   saveEmbeddingConnection(input: SaveEmbeddingConnectionInput): Promise<SaveEmbeddingConnectionResult>;
   testEmbeddingConnection(input: TestEmbeddingConnectionInput): Promise<TestEmbeddingConnectionResult>;
   getBookConversation(bookId: string): Promise<ConversationMessage[]>;
+  recognizePage(input: OcrPageRequest): Promise<OcrPageResult>;
+  getRecognizedPage(bookId: string, page: number): Promise<RecognizedPageText | undefined>;
   listMemoryProposals(bookId: string): Promise<MemoryProposal[]>;
   listBookMemories(bookId: string): Promise<BookMemory[]>;
   listMemoryAudit(bookId: string): Promise<MemoryAuditEntry[]>;

@@ -24,6 +24,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  ScanText,
   Send,
   Sparkles,
   Square,
@@ -36,6 +37,8 @@ import type {
   AgentStreamEvent,
   AgentImageAttachment,
   BookMemory,
+  OcrPageResult,
+  RecognizedPageText,
   MemoryProposal,
   MemoryAuditEntry,
   ConversationMessage,
@@ -407,6 +410,9 @@ export function App() {
   const [conversation, setConversation] = useState<ConversationMessage[]>([]);
   const [memoryProposals, setMemoryProposals] = useState<MemoryProposal[]>([]);
   const [bookMemories, setBookMemories] = useState<BookMemory[]>([]);
+  const [recognizedPage, setRecognizedPage] = useState<RecognizedPageText>();
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [ocrNotice, setOcrNotice] = useState("");
   const [memoryAudit, setMemoryAudit] = useState<MemoryAuditEntry[]>([]);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval>();
   const [streamingReply, setStreamingReply] = useState<StreamingReply>();
@@ -470,6 +476,8 @@ export function App() {
     setMemoryProposals([]);
     setBookMemories([]);
     setMemoryAudit([]);
+    setRecognizedPage(undefined);
+    setOcrNotice("");
     setPendingApproval(undefined);
     setStreamingReply(undefined);
     setToolStatus(undefined);
@@ -669,6 +677,32 @@ export function App() {
     }
   }, [handleOpenResult]);
 
+  const recognizeCurrentPage = useCallback(async () => {
+    if (!book || !window.pdfMuse || ocrLoading) return;
+    setOcrLoading(true);
+    setOcrNotice("");
+    try {
+      const image = await viewerRef.current?.getPageImage(viewerState.page, 1.5);
+      if (!image) {
+        setOcrNotice("当前页面尚未准备好，请稍后重试。");
+        return;
+      }
+      const result: OcrPageResult = await window.pdfMuse.recognizePage({
+        bookId: book.id,
+        page: viewerState.page,
+        imageData: image.data,
+        width: image.width,
+        height: image.height,
+      });
+      if (result.ok) setRecognizedPage(result.page);
+      else setOcrNotice(result.message);
+    } catch {
+      setOcrNotice("当前页识别失败，请稍后重试。");
+    } finally {
+      setOcrLoading(false);
+    }
+  }, [book, ocrLoading, viewerState.page]);
+
   const showLibrary = useCallback(() => {
     stateWriterRef.current?.flush();
     setBook(undefined);
@@ -680,6 +714,18 @@ export function App() {
     resetConversationState();
     void refreshLibrary();
   }, [refreshLibrary, resetConversationState]);
+
+  useEffect(() => {
+    if (!book || !window.pdfMuse) {
+      setRecognizedPage(undefined);
+      return;
+    }
+    let disposed = false;
+    void window.pdfMuse.getRecognizedPage(book.id, viewerState.page).then((page) => {
+      if (!disposed) setRecognizedPage(page);
+    });
+    return () => { disposed = true; };
+  }, [book, viewerState.page]);
 
   const handleViewerState = useCallback((state: ViewerState) => {
     setViewerState(state);
@@ -1054,6 +1100,7 @@ export function App() {
             <span className="toolbar-divider" />
             <IconButton aria-pressed={panMode} label={panMode ? "关闭拖拽浏览" : "开启拖拽浏览"} onClick={() => setPanMode((value) => !value)}><Hand /></IconButton>
             <IconButton label="在 PDF 中查找" onClick={() => setFindOpen((value) => !value)}><Search /></IconButton>
+            <IconButton label={ocrLoading ? "正在识别当前页" : "识别当前页文字"} disabled={ocrLoading} onClick={() => void recognizeCurrentPage}><ScanText /></IconButton>
           </div>
           {findOpen && (
             <form className="find-bar" onSubmit={(event) => { event.preventDefault(); viewerRef.current?.find(findQuery); }}>
@@ -1065,7 +1112,8 @@ export function App() {
               <IconButton type="button" label="关闭查找" onClick={() => { viewerRef.current?.find(""); setFindQuery(""); setFindOpen(false); }}><X /></IconButton>
             </form>
           )}
-          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} panMode={panMode} onStateChange={handleViewerState} onSelectionChange={handleViewerSelection} onError={setViewerError} />}
+          {ocrNotice && <div className="reader-notice" role="status"><span>{ocrNotice}</span><button aria-label="关闭识别提示" onClick={() => setOcrNotice("")}><X size={14} /></button></div>}
+          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} panMode={panMode} recognizedPage={recognizedPage} onStateChange={handleViewerState} onSelectionChange={handleViewerSelection} onError={setViewerError} />}
         </main>
 
         {rightOpen && (

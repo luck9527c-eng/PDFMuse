@@ -13,6 +13,7 @@ import { createBookIndex } from "./agent/book-index.js";
 import type { ResolvedModelConnection } from "./agent/model-runtime.js";
 import { createToolRegistry } from "./agent/tool-registry.js";
 import { createMemoryModule } from "./agent/memory.js";
+import { createOcrModule } from "./ocr.js";
 import { createReaderProfileModule } from "./reader-profile.js";
 import type {
   AgentStreamEvent,
@@ -29,6 +30,7 @@ let closeLibrary: (() => void) | undefined;
 let closeAgentHost: (() => void) | undefined;
 let closeBookIndex: (() => void) | undefined;
 let closeMemory: (() => void) | undefined;
+let closeOcr: (() => void) | undefined;
 
 function broadcastAgentEvent(event: AgentStreamEvent) {
   for (const window of BrowserWindow.getAllWindows()) {
@@ -95,6 +97,8 @@ app.whenReady().then(async () => {
     closeBookIndex = bookIndex.close;
     const memory = createMemoryModule(startupPreflight.dataHome);
     closeMemory = memory.close;
+    const ocr = createOcrModule(startupPreflight.dataHome);
+    closeOcr = ocr.close;
     const toolRegistry = createToolRegistry({ memoryConfigured: true });
     const agentHost: AgentHost = createAgentHost({
       dataHome: startupPreflight.dataHome,
@@ -178,6 +182,15 @@ app.whenReady().then(async () => {
       (_event, input: TestEmbeddingConnectionInput) => embeddingConnection.test(input),
     );
     ipcMain.handle("agent:get-conversation", (_event, bookId: unknown) => agentHost.getConversation(bookId));
+    ipcMain.handle("ocr:get-page", (_event, bookId: unknown, page: unknown) => (
+      isOwnedBook(bookId) && typeof page === "number" ? ocr.getPage(bookId, page) : undefined
+    ));
+    ipcMain.handle("ocr:recognize-page", async (_event, input: unknown) => {
+      if (!input || typeof input !== "object") return { ok: false, code: "VALIDATION_ERROR", message: "OCR 页面请求无效。" };
+      const value = input as { bookId?: unknown };
+      if (!isOwnedBook(value.bookId)) return { ok: false, code: "VALIDATION_ERROR", message: "当前 PDF 书籍不可用。" };
+      return ocr.recognizePage(input as Parameters<typeof ocr.recognizePage>[0]);
+    });
     const isOwnedBook = (bookId: unknown): bookId is string => typeof bookId === "string" && library.list().some((book) => book.id === bookId);
     ipcMain.handle("memory:list-proposals", (_event, bookId: unknown) => isOwnedBook(bookId) ? memory.listProposals(bookId) : []);
     ipcMain.handle("memory:list", (_event, bookId: unknown) => isOwnedBook(bookId) ? memory.listMemories(bookId) : []);
@@ -222,6 +235,8 @@ app.once("before-quit", () => {
   closeBookIndex = undefined;
   closeMemory?.();
   closeMemory = undefined;
+  closeOcr?.();
+  closeOcr = undefined;
 });
 
 app.on("window-all-closed", () => {
