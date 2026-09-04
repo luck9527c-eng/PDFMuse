@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "engine": "PaddleOCR",
+  "engineVersion": "3.7.0",
+  "model": "PP-OCRv5",
+  "files": [
+    { "path": "ocr-runtime/python.exe", "sha256": "" },
+    { "path": "ocr-worker/paddleocr_worker.py", "sha256": "" },
+    { "path": "ocr-models/det", "sha256": "" },
+    { "path": "ocr-models/rec", "sha256": "" }
+  ]
+}

@@ -896,6 +896,23 @@ export function App() {
     }
   }, [book, ocrLoading, viewerState.page]);
 
+  const findInBook = useCallback(async (query: string, previous = false) => {
+    const normalized = query.trim();
+    viewerRef.current?.find(normalized, previous);
+    if (!normalized || !book || !window.pdfMuse) return;
+    try {
+      const result = await window.pdfMuse.searchBook(book.id, normalized, 20);
+      const pages = result.hits.filter((hit) => hit.source === "pdf" && typeof hit.page === "number").map((hit) => hit.page as number);
+      if (pages.length > 0 && !pages.includes(viewerState.page)) {
+        viewerRef.current?.goToPage(previous ? pages[pages.length - 1]! : pages[0]!);
+      }
+      if (pages.length > 0 && result.note) setOcrNotice(result.note);
+      else if (pages.length > 0 && viewerState.findTotal === 0) setOcrNotice(`识别文字命中 ${pages.length} 页，已跳转到${previous ? "最后" : "第一"}个结果。`);
+    } catch {
+      // PDF.js 原生查找仍然可用，索引查询失败不阻断阅读。
+    }
+  }, [book, viewerState.findTotal, viewerState.page]);
+
   const showLibrary = useCallback(() => {
     activeBookIdRef.current = undefined;
     stateWriterRef.current?.flush();
@@ -1321,11 +1338,11 @@ export function App() {
             </div>
           )}
           {findOpen && (
-            <form className="find-bar" onSubmit={(event) => { event.preventDefault(); viewerRef.current?.find(findQuery); }}>
+            <form className="find-bar" onSubmit={(event) => { event.preventDefault(); void findInBook(findQuery); }}>
               <Search size={15} />
               <input autoFocus value={findQuery} onChange={(event) => setFindQuery(event.target.value)} placeholder="查找文字" />
               <span className="find-count">{viewerState.findTotal > 0 ? `${viewerState.findCurrent} / ${viewerState.findTotal}` : "0 / 0"}</span>
-              <IconButton type="button" label="上一个结果" onClick={() => viewerRef.current?.find(findQuery, true)}><ChevronLeft /></IconButton>
+              <IconButton type="button" label="上一个结果" onClick={() => void findInBook(findQuery, true)}><ChevronLeft /></IconButton>
               <IconButton type="submit" label="下一个结果"><ChevronRight /></IconButton>
               <IconButton type="button" label="关闭查找" onClick={() => { viewerRef.current?.find(""); setFindQuery(""); setFindOpen(false); }}><X /></IconButton>
             </form>

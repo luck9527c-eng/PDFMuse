@@ -274,6 +274,10 @@ app.whenReady().then(async () => {
     ipcMain.handle("ocr:get-page", (_event, bookId: unknown, page: unknown) => (
       isOwnedBook(bookId) && typeof page === "number" ? ocr.getPage(bookId, page) : undefined
     ));
+    ipcMain.handle("book:search", async (_event, bookId: unknown, query: unknown, limit: unknown) => {
+      if (!isOwnedBook(bookId) || typeof query !== "string") return { status: "unavailable", hits: [], indexedPages: 0, totalPages: 0, note: "当前 PDF 书籍不可用。" };
+      return bookIndex.search(bookId, query, typeof limit === "number" ? limit : 20);
+    });
     ipcMain.handle("ocr:recognize-page", async (_event, input: unknown) => {
       if (!input || typeof input !== "object") return { ok: false, code: "VALIDATION_ERROR", message: "OCR 页面请求无效。" };
       const value = input as { bookId?: unknown };
