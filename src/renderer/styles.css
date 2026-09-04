@@ -101,6 +101,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .reader-notice.selection-feedback.success { border-left-color: var(--green); background: var(--green-soft); color: var(--green); }
 .reader-notice + .selection-feedback { top: 112px; }
 .reader-toolbar { position: absolute; z-index: 12; top: 10px; left: 50%; transform: translateX(-50%); min-width: max-content; height: 43px; display: flex; align-items: center; gap: 2px; padding: 4px; border: 1px solid var(--line); border-radius: 7px; background: rgba(255,254,251,.96); box-shadow: 0 7px 20px rgba(43,42,37,.1); }
+.background-job-control { position: absolute; z-index: 12; right: 10px; bottom: 10px; min-width: 0; height: 39px; display: flex; align-items: center; gap: 2px; padding: 4px; border: 1px solid var(--line); border-radius: 6px; background: rgba(255,254,251,.96); box-shadow: 0 7px 20px rgba(43,42,37,.1); }
+.background-job-status { max-width: 168px; height: 29px; display: flex; align-items: center; gap: 5px; padding: 0 5px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.background-job-status > span { overflow: hidden; text-overflow: ellipsis; }
+.background-job-status > span:last-child:not(:first-child) { flex: none; }
+.background-job-status.running svg { color: var(--green); animation: pm-spin 1s linear infinite; }
+.background-job-status.failed { color: var(--coral); }
+.background-job-status.paused { color: #765c1a; }
 .toolbar-divider { width: 1px; height: 21px; margin: 0 3px; background: var(--line); }
 .page-control { height: 30px; display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .page-control input { width: 35px; height: 26px; padding: 0 4px; border: 1px solid var(--line); border-radius: 4px; background: white; text-align: center; color: var(--ink); font-size: 10px; }

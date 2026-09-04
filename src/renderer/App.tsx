@@ -19,8 +19,10 @@ import {
   LockKeyhole,
   MessageSquareText,
   Minus,
+  Pause,
   PanelLeftClose,
   PanelRightClose,
+  Play,
   Plus,
   RefreshCw,
   Search,
@@ -36,6 +38,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import type {
   AgentStreamEvent,
   AgentImageAttachment,
+  BackgroundJob,
   BookMemory,
   OcrPageResult,
   RecognizedPageText,
@@ -63,6 +66,21 @@ type PendingApproval = { approvalId: string; runId: string; toolName?: string };
 
 const TOOL_TITLES: Record<string, string> = {
   book_search: "检索本书",
+};
+
+const BACKGROUND_JOB_KIND_LABELS: Record<BackgroundJob["kind"], string> = {
+  ocr: "文字识别",
+  embedding: "语义索引",
+  index: "全文索引",
+};
+
+const BACKGROUND_JOB_STATUS_LABELS: Record<BackgroundJob["status"], string> = {
+  queued: "等待中",
+  running: "处理中",
+  paused: "已暂停",
+  completed: "已完成",
+  cancelled: "已取消",
+  failed: "失败",
 };
 
 const browserPreflight: StartupPreflight = {
@@ -413,6 +431,7 @@ export function App() {
   const [recognizedPage, setRecognizedPage] = useState<RecognizedPageText>();
   const [ocrLoading, setOcrLoading] = useState(false);
   const [ocrNotice, setOcrNotice] = useState("");
+  const [backgroundJobs, setBackgroundJobs] = useState<BackgroundJob[]>([]);
   const [memoryAudit, setMemoryAudit] = useState<MemoryAuditEntry[]>([]);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval>();
   const [streamingReply, setStreamingReply] = useState<StreamingReply>();
@@ -471,6 +490,15 @@ export function App() {
     }
   }, []);
 
+  const refreshBackgroundJobs = useCallback(async (bookId: string) => {
+    if (!window.pdfMuse) return;
+    try {
+      setBackgroundJobs(await window.pdfMuse.listBackgroundJobs(bookId));
+    } catch {
+      setBackgroundJobs([]);
+    }
+  }, []);
+
   const resetConversationState = useCallback(() => {
     setConversation([]);
     setMemoryProposals([]);
@@ -478,6 +506,7 @@ export function App() {
     setMemoryAudit([]);
     setRecognizedPage(undefined);
     setOcrNotice("");
+    setBackgroundJobs([]);
     setPendingApproval(undefined);
     setStreamingReply(undefined);
     setToolStatus(undefined);
@@ -548,12 +577,56 @@ export function App() {
     resetConversationState();
     void refreshConversation(openedBook.id);
     void refreshMemoryProposals(openedBook.id);
+    const pdfMuseApi = window.pdfMuse;
+    if (pdfMuseApi) {
+      void (async () => {
+        await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "index", priority: 10, total: openedBook.pageCount });
+        const embedding = await pdfMuseApi.getEmbeddingConnection();
+        if (embedding.baseUrl && embedding.model) {
+          await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "embedding", priority: 0, total: openedBook.pageCount });
+        }
+        await refreshBackgroundJobs(openedBook.id);
+      })().catch(() => undefined);
+    }
     setPanMode(false);
     setPassage(undefined);
     setAttachedPassage(undefined);
     setAttachments([]);
     setSelectionFeedback(undefined);
-  }, [refreshConversation, refreshMemoryProposals, resetConversationState]);
+  }, [refreshBackgroundJobs, refreshConversation, refreshMemoryProposals, resetConversationState]);
+
+  useEffect(() => {
+    if (!book || !window.pdfMuse) return;
+    void refreshBackgroundJobs(book.id);
+    const timer = window.setInterval(() => void refreshBackgroundJobs(book.id), 1_500);
+    return () => window.clearInterval(timer);
+  }, [book, refreshBackgroundJobs]);
+
+  const visibleBackgroundJob = useMemo(() => {
+    const rank: Record<BackgroundJob["status"], number> = {
+      running: 0,
+      queued: 1,
+      paused: 2,
+      failed: 3,
+      completed: 4,
+      cancelled: 5,
+    };
+    const latestByKind = backgroundJobs.filter((job, index, jobs) => (
+      jobs.findIndex((candidate) => candidate.kind === job.kind) === index
+    ));
+    return latestByKind.sort((left, right) => rank[left.status] - rank[right.status])[0];
+  }, [backgroundJobs]);
+
+  const mutateBackgroundJob = useCallback(async (action: "pause" | "resume" | "cancel") => {
+    if (!book || !visibleBackgroundJob || !window.pdfMuse) return;
+    const method = action === "pause"
+      ? window.pdfMuse.pauseBackgroundJob
+      : action === "resume"
+        ? window.pdfMuse.resumeBackgroundJob
+        : window.pdfMuse.cancelBackgroundJob;
+    await method(visibleBackgroundJob.id);
+    await refreshBackgroundJobs(book.id);
+  }, [book, refreshBackgroundJobs, visibleBackgroundJob]);
 
   const handleOpenResult = useCallback((result: OpenPdfBookResult, attemptedBookId?: string) => {
     if (result.ok) {
@@ -1102,6 +1175,30 @@ export function App() {
             <IconButton label="在 PDF 中查找" onClick={() => setFindOpen((value) => !value)}><Search /></IconButton>
             <IconButton label={ocrLoading ? "正在识别当前页" : "识别当前页文字"} disabled={ocrLoading} onClick={() => void recognizeCurrentPage}><ScanText /></IconButton>
           </div>
+          {visibleBackgroundJob && (
+            <div className="background-job-control">
+                <span
+                  className={`background-job-status ${visibleBackgroundJob.status}`}
+                  title={visibleBackgroundJob.errorMessage}
+                  role="status"
+                >
+                  {visibleBackgroundJob.status === "running" && <Loader2 size={13} />}
+                  <span>{BACKGROUND_JOB_KIND_LABELS[visibleBackgroundJob.kind]} · {BACKGROUND_JOB_STATUS_LABELS[visibleBackgroundJob.status]}</span>
+                  {visibleBackgroundJob.total > 0 && visibleBackgroundJob.status !== "failed" && (
+                    <span>{visibleBackgroundJob.progress}/{visibleBackgroundJob.total}</span>
+                  )}
+                </span>
+                {(visibleBackgroundJob.status === "running" || visibleBackgroundJob.status === "queued") && (
+                  <IconButton label="暂停后台任务" onClick={() => void mutateBackgroundJob("pause")}><Pause /></IconButton>
+                )}
+                {visibleBackgroundJob.status === "paused" && (
+                  <IconButton label="继续后台任务" onClick={() => void mutateBackgroundJob("resume")}><Play /></IconButton>
+                )}
+                {(visibleBackgroundJob.status === "running" || visibleBackgroundJob.status === "queued" || visibleBackgroundJob.status === "paused") && (
+                  <IconButton label="取消后台任务" onClick={() => void mutateBackgroundJob("cancel")}><X /></IconButton>
+                )}
+            </div>
+          )}
           {findOpen && (
             <form className="find-bar" onSubmit={(event) => { event.preventDefault(); viewerRef.current?.find(findQuery); }}>
               <Search size={15} />

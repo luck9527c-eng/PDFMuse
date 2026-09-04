@@ -391,6 +391,28 @@ try {
   assert.match(readerText, /AI 助手/, "dropping a valid PDF did not open the reading workspace");
   const outlineText = await waitForText(page.webSocketDebuggerUrl, "Section One");
   assert.match(outlineText, /Chapter One/, "the embedded Book Outline is unavailable");
+  const backgroundState = await evaluate(
+    page.webSocketDebuggerUrl,
+    `(async () => {
+      const [book] = await window.pdfMuse.listLibraryBooks();
+      const deadline = Date.now() + 2500;
+      let jobs = [];
+      while (Date.now() < deadline) {
+        jobs = await window.pdfMuse.listBackgroundJobs(book.id);
+        if (jobs.some((job) => job.kind === 'index')) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const unknownBookId = 'f'.repeat(64);
+      return {
+        jobs,
+        unknownJobs: await window.pdfMuse.listBackgroundJobs(unknownBookId),
+        unknownSchedule: await window.pdfMuse.scheduleBackgroundJob({ bookId: unknownBookId, kind: 'index' }),
+      };
+    })()`,
+  );
+  assert.equal(backgroundState.jobs.some((job) => job.kind === "index"), true, "opening a book did not schedule its background index");
+  assert.deepEqual(backgroundState.unknownJobs, [], "background jobs leaked across the Library boundary");
+  assert.equal(backgroundState.unknownSchedule.ok, false, "an unknown book could schedule a background job");
   const readerControls = await evaluate(
     page.webSocketDebuggerUrl,
     `new Promise((resolve, reject) => {

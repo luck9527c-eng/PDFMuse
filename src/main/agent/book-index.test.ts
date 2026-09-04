@@ -89,6 +89,32 @@ describe("book index", () => {
     expect(loads).toBe(0);
   });
 
+  it("continues from the last committed page after interruption", async () => {
+    const controller = new AbortController();
+    const firstProgress: number[] = [];
+    const partial = await index.ensureIndexed(
+      bookId,
+      async () => ({ bytes: fixtureBytes }),
+      controller.signal,
+      (page) => {
+        firstProgress.push(page);
+        if (page === 1) controller.abort();
+      },
+    );
+    expect(partial.indexedPages).toBe(1);
+    expect(index.stats(bookId).indexedPages).toBe(1);
+
+    const resumedProgress: number[] = [];
+    const completed = await index.ensureIndexed(
+      bookId,
+      async () => ({ bytes: fixtureBytes }),
+      undefined,
+      (page) => resumedProgress.push(page),
+    );
+    expect(completed.indexedPages).toBe(3);
+    expect(resumedProgress).toEqual([2, 3]);
+  });
+
   it("uses semantic embeddings to find a synonym and applies reading focus", async () => {
     index.close();
     const provider: EmbeddingProvider = {

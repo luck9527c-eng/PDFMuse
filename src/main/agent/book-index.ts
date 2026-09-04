@@ -176,6 +176,8 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   `);
 
   const embeddingBatchSize = Math.max(1, options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE);
+  const indexing = new Map<string, Promise<{ indexedPages: number; totalPages: number; note?: string }>>();
+  const embeddingRuns = new Map<string, Promise<boolean>>();
 
   const indexedPagesStatement = database.prepare(
     "SELECT COUNT(*) AS count FROM book_pages WHERE book_id = ?",
@@ -192,6 +194,9 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   );
   const clearFtsStatement = database.prepare(
     "DELETE FROM book_pages_fts WHERE book_id = ?",
+  );
+  const clearPagesStatement = database.prepare(
+    "DELETE FROM book_pages WHERE book_id = ?",
   );
   const searchStatement = database.prepare(`
     SELECT page, text
@@ -340,17 +345,18 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     }
   }
 
-  async function ensureIndexed(
+  async function performEnsureIndexed(
     bookId: string,
     loadBook: () => Promise<{ bytes: Uint8Array; password?: string }>,
     signal?: AbortSignal,
+    onProgress?: (indexedPages: number, totalPages: number) => void,
   ): Promise<{ indexedPages: number; totalPages: number; note?: string }> {
     const row = bookRowStatement.get(bookId) as BookRow | undefined;
     if (!row) return { indexedPages: 0, totalPages: 0, note: "书库中没有这本书的索引来源。" };
     const existing = indexedPagesBeforeStatement.get(bookId) as { max_page: number | null; count: number };
     if (existing.count >= row.page_count && existing.max_page === row.page_count) {
       const provider = await embeddingProvider();
-      if (provider) await ensurePdfEmbeddings(bookId, provider, signal);
+      if (provider) await ensureEmbeddings(bookId, signal);
       return { indexedPages: existing.count, totalPages: row.page_count };
     }
     const source = await loadBook();
@@ -358,33 +364,70 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       data: source.bytes.slice(),
       ...(source.password ? { password: source.password } : {}),
     });
-    let indexed = 0;
+    const contiguous = existing.count === (existing.max_page ?? 0);
+    let indexed = contiguous ? existing.count : 0;
     try {
       const document = await loadingTask.promise;
-      database.exec("BEGIN");
-      try {
-        clearFtsStatement.run(bookId);
-        for (let page = 1; page <= document.numPages; page += 1) {
-          if (signal?.aborted) break;
-          const text = await extractPageText(document, page);
+      if (!contiguous) {
+        database.exec("BEGIN");
+        try {
+          clearPagesStatement.run(bookId);
+          clearFtsStatement.run(bookId);
+          database.exec("COMMIT");
+        } catch (error) {
+          database.exec("ROLLBACK");
+          throw error;
+        }
+      }
+      for (let page = indexed + 1; page <= document.numPages; page += 1) {
+        if (signal?.aborted) break;
+        const text = await extractPageText(document, page);
+        database.exec("BEGIN");
+        try {
           insertPageStatement.run(bookId, page, text);
           if (text) insertFtsStatement.run(bookId, page, tokenizeForIndex(text));
-          indexed = page;
+          database.exec("COMMIT");
+        } catch (error) {
+          database.exec("ROLLBACK");
+          throw error;
         }
-        database.exec("COMMIT");
-      } catch (error) {
-        database.exec("ROLLBACK");
-        throw error;
+        indexed = page;
+        onProgress?.(indexed, document.numPages);
       }
     } finally {
       await loadingTask.destroy();
     }
     const provider = await embeddingProvider();
-    if (provider) await ensurePdfEmbeddings(bookId, provider, signal);
+    if (provider) await ensureEmbeddings(bookId, signal);
     const partial = indexed < row.page_count
       ? { note: `索引尚未完成（已索引 ${indexed}/${row.page_count} 页），当前只在已索引范围内检索。` }
       : {};
     return { indexedPages: indexed, totalPages: row.page_count, ...partial };
+  }
+
+  function ensureIndexed(
+    bookId: string,
+    loadBook: () => Promise<{ bytes: Uint8Array; password?: string }>,
+    signal?: AbortSignal,
+    onProgress?: (indexedPages: number, totalPages: number) => void,
+  ) {
+    const current = indexing.get(bookId);
+    if (current) return current;
+    const run = performEnsureIndexed(bookId, loadBook, signal, onProgress)
+      .finally(() => indexing.delete(bookId));
+    indexing.set(bookId, run);
+    return run;
+  }
+
+  function ensureEmbeddings(bookId: string, signal?: AbortSignal) {
+    const current = embeddingRuns.get(bookId);
+    if (current) return current;
+    const run = (async () => {
+      const provider = await embeddingProvider();
+      return provider ? ensurePdfEmbeddings(bookId, provider, signal) : false;
+    })().finally(() => embeddingRuns.delete(bookId));
+    embeddingRuns.set(bookId, run);
+    return run;
   }
 
   function likePattern(query: string) {
@@ -567,6 +610,8 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     },
 
     ensureIndexed,
+
+    ensureEmbeddings,
 
     indexConversationMessage,
 

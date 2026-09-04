@@ -307,6 +307,32 @@ export type OcrPageResult =
   | { ok: true; page: RecognizedPageText }
   | { ok: false; code: "VALIDATION_ERROR" | "UNAVAILABLE" | "FAILED" | "CANCELLED"; message: string };
 
+export type BackgroundJobKind = "ocr" | "embedding" | "index";
+export type BackgroundJobStatus = "queued" | "running" | "paused" | "completed" | "cancelled" | "failed";
+export type BackgroundJob = {
+  id: string;
+  bookId: string;
+  kind: BackgroundJobKind;
+  priority: number;
+  status: BackgroundJobStatus;
+  progress: number;
+  total: number;
+  checkpoint?: string;
+  attempts: number;
+  errorMessage?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+export type ScheduleBackgroundJobInput = {
+  bookId: string;
+  kind: BackgroundJobKind;
+  priority?: number;
+  total?: number;
+};
+export type BackgroundJobMutationResult =
+  | { ok: true; job: BackgroundJob }
+  | { ok: false; code: "VALIDATION_ERROR" | "NOT_FOUND" | "CONFLICT"; message: string };
+
 /** 当前问题的图片附件；data 仅保存不含 data: 前缀的 Base64。 */
 export type AgentImageAttachment = {
   id: string;
@@ -405,6 +431,11 @@ export interface PDFMuseApi {
   getBookConversation(bookId: string): Promise<ConversationMessage[]>;
   recognizePage(input: OcrPageRequest): Promise<OcrPageResult>;
   getRecognizedPage(bookId: string, page: number): Promise<RecognizedPageText | undefined>;
+  listBackgroundJobs(bookId?: string): Promise<BackgroundJob[]>;
+  scheduleBackgroundJob(input: ScheduleBackgroundJobInput): Promise<BackgroundJobMutationResult>;
+  pauseBackgroundJob(jobId: string): Promise<BackgroundJobMutationResult>;
+  resumeBackgroundJob(jobId: string): Promise<BackgroundJobMutationResult>;
+  cancelBackgroundJob(jobId: string): Promise<BackgroundJobMutationResult>;
   listMemoryProposals(bookId: string): Promise<MemoryProposal[]>;
   listBookMemories(bookId: string): Promise<BookMemory[]>;
   listMemoryAudit(bookId: string): Promise<MemoryAuditEntry[]>;

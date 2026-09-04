@@ -14,9 +14,12 @@ import type { ResolvedModelConnection } from "./agent/model-runtime.js";
 import { createToolRegistry } from "./agent/tool-registry.js";
 import { createMemoryModule } from "./agent/memory.js";
 import { createOcrModule } from "./ocr.js";
+import { createBackgroundJobModule } from "./background-jobs.js";
 import { createReaderProfileModule } from "./reader-profile.js";
 import type {
   AgentStreamEvent,
+  BackgroundJobMutationResult,
+  ScheduleBackgroundJobInput,
   SaveEmbeddingConnectionInput,
   SaveModelConnectionInput,
   StartupPreflight,
@@ -31,6 +34,7 @@ let closeAgentHost: (() => void) | undefined;
 let closeBookIndex: (() => void) | undefined;
 let closeMemory: (() => void) | undefined;
 let closeOcr: (() => void) | undefined;
+let closeBackgroundJobs: (() => void) | undefined;
 
 function broadcastAgentEvent(event: AgentStreamEvent) {
   for (const window of BrowserWindow.getAllWindows()) {
@@ -99,6 +103,31 @@ app.whenReady().then(async () => {
     closeMemory = memory.close;
     const ocr = createOcrModule(startupPreflight.dataHome);
     closeOcr = ocr.close;
+    const backgroundJobs = createBackgroundJobModule(startupPreflight.dataHome, {
+      index: async (job, context) => {
+        const result = await bookIndex.ensureIndexed(
+          job.bookId,
+          () => bookIndex.loadBookByBookId(job.bookId),
+          context.signal,
+          (progress, total) => context.checkpoint(`page:${progress}`, progress, total),
+        );
+        context.checkpoint(`page:${result.indexedPages}`, result.indexedPages, result.totalPages);
+        if (context.signal.aborted) throw new Error("索引任务已暂停或取消。");
+      },
+      embedding: async (job, context) => {
+        const config = await readAppConfig(configPath);
+        if (!config.embedding) throw new Error("尚未配置嵌入模型，当前继续使用全文检索。");
+        if (context.signal.aborted) throw new Error("嵌入任务已暂停或取消。");
+        const completed = await bookIndex.ensureEmbeddings(job.bookId, context.signal);
+        if (!completed) throw new Error("语义索引生成失败，当前继续使用全文检索。");
+        const stats = bookIndex.stats(job.bookId);
+        context.checkpoint(`page:${stats.indexedPages}`, stats.indexedPages, stats.totalPages);
+      },
+      ocr: async () => {
+        throw new Error("OCR 工作进程资源尚未安装，暂时只能识别当前页。");
+      },
+    });
+    closeBackgroundJobs = backgroundJobs.close;
     const toolRegistry = createToolRegistry({ memoryConfigured: true });
     const agentHost: AgentHost = createAgentHost({
       dataHome: startupPreflight.dataHome,
@@ -192,6 +221,36 @@ app.whenReady().then(async () => {
       return ocr.recognizePage(input as Parameters<typeof ocr.recognizePage>[0]);
     });
     const isOwnedBook = (bookId: unknown): bookId is string => typeof bookId === "string" && library.list().some((book) => book.id === bookId);
+    const invalidBackgroundJob = (): BackgroundJobMutationResult => ({
+      ok: false,
+      code: "NOT_FOUND",
+      message: "后台任务不存在，或不属于当前书库。",
+    });
+    const mutateOwnedJob = (jobId: unknown, action: "pause" | "resume" | "cancel") => {
+      if (typeof jobId !== "string") return invalidBackgroundJob();
+      const job = backgroundJobs.get(jobId);
+      if (!job || !isOwnedBook(job.bookId)) return invalidBackgroundJob();
+      return backgroundJobs[action](jobId);
+    };
+    ipcMain.handle("background-jobs:list", (_event, bookId: unknown) => {
+      if (bookId !== undefined) return isOwnedBook(bookId) ? backgroundJobs.list(bookId) : [];
+      return backgroundJobs.list().filter((job) => isOwnedBook(job.bookId));
+    });
+    ipcMain.handle("background-jobs:schedule", (_event, input: unknown) => {
+      if (!input || typeof input !== "object") return invalidBackgroundJob();
+      const value = input as Partial<ScheduleBackgroundJobInput>;
+      if (!isOwnedBook(value.bookId)) return invalidBackgroundJob();
+      const book = library.list().find((item) => item.id === value.bookId)!;
+      return backgroundJobs.schedule({
+        bookId: value.bookId,
+        kind: value.kind as ScheduleBackgroundJobInput["kind"],
+        priority: value.priority,
+        total: book.pageCount,
+      });
+    });
+    ipcMain.handle("background-jobs:pause", (_event, jobId: unknown) => mutateOwnedJob(jobId, "pause"));
+    ipcMain.handle("background-jobs:resume", (_event, jobId: unknown) => mutateOwnedJob(jobId, "resume"));
+    ipcMain.handle("background-jobs:cancel", (_event, jobId: unknown) => mutateOwnedJob(jobId, "cancel"));
     ipcMain.handle("memory:list-proposals", (_event, bookId: unknown) => isOwnedBook(bookId) ? memory.listProposals(bookId) : []);
     ipcMain.handle("memory:list", (_event, bookId: unknown) => isOwnedBook(bookId) ? memory.listMemories(bookId) : []);
     ipcMain.handle("memory:audit", (_event, bookId: unknown) => isOwnedBook(bookId) ? memory.listAudit(bookId) : []);
@@ -227,6 +286,8 @@ app.whenReady().then(async () => {
 });
 
 app.once("before-quit", () => {
+  closeBackgroundJobs?.();
+  closeBackgroundJobs = undefined;
   closeLibrary?.();
   closeLibrary = undefined;
   closeAgentHost?.();
