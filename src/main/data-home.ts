@@ -1,7 +1,4 @@
-import { constants } from "node:fs";
-import { createHash } from "node:crypto";
 import {
-  access,
   mkdir,
   readFile,
   rename,
@@ -35,35 +32,6 @@ async function verifyWritable(directory: string) {
   const probePath = path.join(directory, `.pdfmuse-write-probe-${process.pid}`);
   await writeFile(probePath, "pdfmuse", { flag: "wx" });
   await unlink(probePath);
-}
-
-async function hasOcrResources(applicationDirectory: string) {
-  const worker = path.join(applicationDirectory, "resources", "ocr-worker", "paddleocr_worker.py");
-  const runtime = path.join(applicationDirectory, "resources", "ocr-runtime", process.platform === "win32" ? "python.exe" : "python");
-  const models = path.join(applicationDirectory, "resources", "ocr-models");
-  const manifestPath = path.join(applicationDirectory, "resources", "ocr-manifest.json");
-
-  try {
-    await Promise.all([access(worker, constants.R_OK), access(runtime, constants.X_OK), access(models, constants.R_OK)]);
-    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as { engine?: string; engineVersion?: string; model?: string; files?: Array<{ path?: string; sha256?: string }> };
-    if (manifest.engine !== "PaddleOCR" || manifest.model !== "PP-OCRv5" || !Array.isArray(manifest.files)) return false;
-    for (const entry of manifest.files) {
-      if (!entry.path || !entry.sha256) return false;
-      const target = path.join(applicationDirectory, "resources", entry.path);
-      await access(target, constants.R_OK);
-      // File hashes are checked for files; model directories are existence-checked and hashed by the release pipeline.
-      try {
-        const bytes = await readFile(target);
-        const digest = createHash("sha256").update(bytes).digest("hex");
-        if (digest !== entry.sha256) return false;
-      } catch {
-        // Directories are validated by access above; the installer manifest owns their recursive hash.
-      }
-    }
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 export async function preflightDataHome(applicationDirectory: string): Promise<StartupPreflight> {
@@ -127,10 +95,6 @@ export async function preflightDataHome(applicationDirectory: string): Promise<S
   }).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "EEXIST") throw error;
   });
-
-  if (!(await hasOcrResources(applicationDirectory))) {
-    warnings.push("尚未安装 OCR 工作进程资源。");
-  }
 
   return { ok: true, dataHome, warnings };
 }

@@ -753,7 +753,7 @@ try {
   assert.match(settingsText, /API 密钥/, "API key editor is unavailable");
   assert.match(settingsText, /测试嵌入连接/, "embedding connection test command is unavailable");
   assert.match(settingsText, /保存嵌入配置/, "embedding connection save command is unavailable");
-  assert.match(settingsText, /尚未安装 OCR 工作进程资源/, "startup warnings are unavailable in settings");
+  assert.doesNotMatch(settingsText, /OCR 工作进程资源/, "deferred OCR resources leaked into first-release settings");
   const protocolOptions = await evaluate(
     page.webSocketDebuggerUrl,
     `Array.from(document.querySelectorAll('select option')).map((option) => option.textContent)`,

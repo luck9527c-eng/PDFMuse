@@ -79,7 +79,7 @@ export function createWorkerOcrEngine(options: WorkerOcrOptions = {}): OcrEngine
   };
 }
 
-function unavailableEngine(): OcrEngine {
+export function createUnavailableOcrEngine(): OcrEngine {
   return {
     name: "未安装",
     model: "未安装",
@@ -90,7 +90,7 @@ function unavailableEngine(): OcrEngine {
   };
 }
 
-export function createOcrModule(dataHome: string, engine: OcrEngine = createWorkerOcrEngine()) {
+export function createOcrModule(dataHome: string, engine: OcrEngine = createUnavailableOcrEngine()) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
   database.exec(`
     CREATE TABLE IF NOT EXISTS recognized_pages (

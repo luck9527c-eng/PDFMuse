@@ -26,7 +26,7 @@ describe("preflightDataHome", () => {
     expect(result).toEqual({
       ok: true,
       dataHome: path.join(applicationDirectory, "data"),
-      warnings: ["尚未安装 OCR 工作进程资源。"],
+      warnings: [],
     });
     await expect(readFile(path.join(result.dataHome, "READER_PROFILE.md"), "utf8")).resolves.toContain(
       "# 读者画像",

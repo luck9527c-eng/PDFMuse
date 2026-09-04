@@ -28,7 +28,6 @@ import {
   Plus,
   RefreshCw,
   Search,
-  ScanText,
   Send,
   Sparkles,
   Square,
@@ -43,8 +42,6 @@ import type {
   AgentImageAttachment,
   BackgroundJob,
   BookMemory,
-  OcrPageResult,
-  RecognizedPageText,
   MemoryProposal,
   MemoryAuditEntry,
   ConversationMessage,
@@ -493,9 +490,7 @@ export function App() {
   const [conversation, setConversation] = useState<ConversationMessage[]>([]);
   const [memoryProposals, setMemoryProposals] = useState<MemoryProposal[]>([]);
   const [bookMemories, setBookMemories] = useState<BookMemory[]>([]);
-  const [recognizedPage, setRecognizedPage] = useState<RecognizedPageText>();
-  const [ocrLoading, setOcrLoading] = useState(false);
-  const [ocrNotice, setOcrNotice] = useState("");
+  const [searchNotice, setSearchNotice] = useState("");
   const [backgroundJobs, setBackgroundJobs] = useState<BackgroundJob[]>([]);
   const [generatedOutline, setGeneratedOutline] = useState<OutlineNode[]>();
   const [memoryAudit, setMemoryAudit] = useState<MemoryAuditEntry[]>([]);
@@ -577,8 +572,7 @@ export function App() {
     setMemoryProposals([]);
     setBookMemories([]);
     setMemoryAudit([]);
-    setRecognizedPage(undefined);
-    setOcrNotice("");
+    setSearchNotice("");
     setBackgroundJobs([]);
     setGeneratedOutline(undefined);
     setPendingApproval(undefined);
@@ -657,10 +651,6 @@ export function App() {
       void (async () => {
         await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "index", priority: 10, total: openedBook.pageCount });
         await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "outline", priority: 5, total: openedBook.pageCount });
-        const preflight = await pdfMuseApi.getStartupPreflight();
-        if (preflight.ok && !preflight.warnings.some((warning) => warning.includes("OCR"))) {
-          await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "ocr", priority: 20, total: openedBook.pageCount, maxAttempts: 3, inputVersion: "PaddleOCR:PP-OCRv5:3.7.0", startPage: openedBook.currentPage });
-        }
         const embedding = await pdfMuseApi.getEmbeddingConnection();
         if (embedding.baseUrl && embedding.model) {
           await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "embedding", priority: 0, total: openedBook.pageCount });
@@ -692,6 +682,7 @@ export function App() {
       cancelled: 5,
     };
     const latestByKind = backgroundJobs.filter((job, index, jobs) => (
+      job.kind !== "ocr" &&
       jobs.findIndex((candidate) => candidate.kind === job.kind) === index
     ));
     return latestByKind.sort((left, right) => rank[left.status] - rank[right.status])[0];
@@ -870,32 +861,6 @@ export function App() {
     }
   }, [refreshLibrary]);
 
-  const recognizeCurrentPage = useCallback(async () => {
-    if (!book || !window.pdfMuse || ocrLoading) return;
-    setOcrLoading(true);
-    setOcrNotice("");
-    try {
-      const image = await viewerRef.current?.getPageImage(viewerState.page, 1.5);
-      if (!image) {
-        setOcrNotice("当前页面尚未准备好，请稍后重试。");
-        return;
-      }
-      const result: OcrPageResult = await window.pdfMuse.recognizePage({
-        bookId: book.id,
-        page: viewerState.page,
-        imageData: image.data,
-        width: image.width,
-        height: image.height,
-      });
-      if (result.ok) setRecognizedPage(result.page);
-      else setOcrNotice(result.message);
-    } catch {
-      setOcrNotice("当前页识别失败，请稍后重试。");
-    } finally {
-      setOcrLoading(false);
-    }
-  }, [book, ocrLoading, viewerState.page]);
-
   const findInBook = useCallback(async (query: string, previous = false) => {
     const normalized = query.trim();
     viewerRef.current?.find(normalized, previous);
@@ -906,8 +871,8 @@ export function App() {
       if (pages.length > 0 && !pages.includes(viewerState.page)) {
         viewerRef.current?.goToPage(previous ? pages[pages.length - 1]! : pages[0]!);
       }
-      if (pages.length > 0 && result.note) setOcrNotice(result.note);
-      else if (pages.length > 0 && viewerState.findTotal === 0) setOcrNotice(`识别文字命中 ${pages.length} 页，已跳转到${previous ? "最后" : "第一"}个结果。`);
+      if (pages.length > 0 && result.note) setSearchNotice(result.note);
+      else if (pages.length > 0 && viewerState.findTotal === 0) setSearchNotice(`全文索引命中 ${pages.length} 页，已跳转到${previous ? "最后" : "第一"}个结果。`);
     } catch {
       // PDF.js 原生查找仍然可用，索引查询失败不阻断阅读。
     }
@@ -925,18 +890,6 @@ export function App() {
     resetConversationState();
     void refreshLibrary();
   }, [refreshLibrary, resetConversationState]);
-
-  useEffect(() => {
-    if (!book || !window.pdfMuse) {
-      setRecognizedPage(undefined);
-      return;
-    }
-    let disposed = false;
-    void window.pdfMuse.getRecognizedPage(book.id, viewerState.page).then((page) => {
-      if (!disposed) setRecognizedPage(page);
-    });
-    return () => { disposed = true; };
-  }, [book, viewerState.page]);
 
   const handleViewerState = useCallback((state: ViewerState) => {
     setViewerState(state);
@@ -1311,7 +1264,6 @@ export function App() {
             <span className="toolbar-divider" />
             <IconButton aria-pressed={panMode} label={panMode ? "关闭拖拽浏览" : "开启拖拽浏览"} onClick={() => setPanMode((value) => !value)}><Hand /></IconButton>
             <IconButton label="在 PDF 中查找" onClick={() => setFindOpen((value) => !value)}><Search /></IconButton>
-            <IconButton label={ocrLoading ? "正在识别当前页" : "识别当前页文字"} disabled={ocrLoading} onClick={() => void recognizeCurrentPage}><ScanText /></IconButton>
           </div>
           {visibleBackgroundJob && (
             <div className="background-job-control">
@@ -1347,8 +1299,8 @@ export function App() {
               <IconButton type="button" label="关闭查找" onClick={() => { viewerRef.current?.find(""); setFindQuery(""); setFindOpen(false); }}><X /></IconButton>
             </form>
           )}
-          {ocrNotice && <div className="reader-notice" role="status"><span>{ocrNotice}</span><button aria-label="关闭识别提示" onClick={() => setOcrNotice("")}><X size={14} /></button></div>}
-          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} panMode={panMode} recognizedPage={recognizedPage} onStateChange={handleViewerState} onSelectionChange={handleViewerSelection} onError={setViewerError} />}
+          {searchNotice && <div className="reader-notice" role="status"><span>{searchNotice}</span><button aria-label="关闭查找提示" onClick={() => setSearchNotice("")}><X size={14} /></button></div>}
+          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} panMode={panMode} onStateChange={handleViewerState} onSelectionChange={handleViewerSelection} onError={setViewerError} />}
         </main>
 
         {rightOpen && (

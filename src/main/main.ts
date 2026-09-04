@@ -13,7 +13,7 @@ import { createBookIndex } from "./agent/book-index.js";
 import type { ResolvedModelConnection } from "./agent/model-runtime.js";
 import { createToolRegistry } from "./agent/tool-registry.js";
 import { createMemoryModule } from "./agent/memory.js";
-import { createOcrModule, createWorkerOcrEngine } from "./ocr.js";
+import { createOcrModule, createUnavailableOcrEngine } from "./ocr.js";
 import { createBackgroundJobModule } from "./background-jobs.js";
 import { createBookOutlineModule } from "./book-outline.js";
 import { createReaderProfileModule } from "./reader-profile.js";
@@ -108,12 +108,7 @@ app.whenReady().then(async () => {
     closeBookIndex = bookIndex.close;
     const memory = createMemoryModule(startupPreflight.dataHome);
     closeMemory = memory.close;
-    const ocr = createOcrModule(startupPreflight.dataHome, createWorkerOcrEngine({
-      command: path.join(applicationDirectory(), "resources", "ocr-runtime", process.platform === "win32" ? "python.exe" : "python"),
-      args: [path.join(applicationDirectory(), "resources", "ocr-worker", "paddleocr_worker.py")],
-      model: "PP-OCRv5",
-      engineVersion: "3.7.0",
-    }));
+    const ocr = createOcrModule(startupPreflight.dataHome, createUnavailableOcrEngine());
     closeOcr = ocr.close;
     const bookOutline = createBookOutlineModule(startupPreflight.dataHome);
     closeBookOutline = bookOutline.close;
@@ -136,23 +131,6 @@ app.whenReady().then(async () => {
         if (!completed) throw new Error("语义索引生成失败，当前继续使用全文检索。");
         const stats = bookIndex.stats(job.bookId);
         context.checkpoint(`page:${stats.indexedPages}`, stats.indexedPages, stats.totalPages);
-      },
-      ocr: async (job, context) => {
-        const book = library.list().find((item) => item.id === job.bookId);
-        if (!book) throw new Error("当前 PDF 书籍不可用。");
-        const checkpoint = job.checkpoint?.match(/^page:(\d+)$/);
-        const startPage = Math.max(1, Number(checkpoint?.[1] ?? 0) + 1);
-        for (let page = startPage; page <= book.pageCount; page += 1) {
-          if (context.signal.aborted) throw new Error("OCR 任务已暂停或取消。");
-          if (!ocr.isPageCompatible(job.bookId, page, "3.7.0", "PP-OCRv5")) {
-            const image = await bookIndex.renderPageForOcr(job.bookId, page);
-            const result = await ocr.recognizePage({ bookId: job.bookId, page, ...image }, context.signal);
-            if (!result.ok) throw new Error(result.message);
-            bookIndex.indexRecognizedPage(job.bookId, page, result.page.lines);
-            bookOutline.invalidate(job.bookId, page);
-          }
-          context.checkpoint(`page:${page}`, page, book.pageCount);
-        }
       },
       outline: async (job, context) => {
         const result = await bookOutline.rebuild(
