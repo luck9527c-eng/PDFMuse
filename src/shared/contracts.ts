@@ -305,6 +305,8 @@ export type RecognizedPageText = {
   lines: RecognizedTextLine[];
   engine: string;
   model: string;
+  inputHash: string;
+  engineVersion: string;
   createdAt: string;
 };
 export type OcrPageRequest = {
@@ -337,6 +339,8 @@ export type BackgroundJob = {
   total: number;
   checkpoint?: string;
   attempts: number;
+  maxAttempts: number;
+  inputVersion?: string;
   errorMessage?: string;
   createdAt: string;
   updatedAt: string;
@@ -346,6 +350,9 @@ export type ScheduleBackgroundJobInput = {
   kind: BackgroundJobKind;
   priority?: number;
   total?: number;
+  inputVersion?: string;
+  maxAttempts?: number;
+  startPage?: number;
 };
 export type BackgroundJobMutationResult =
   | { ok: true; job: BackgroundJob }

@@ -24,6 +24,7 @@ describe("OCR module", () => {
     const engine: OcrEngine = {
       name: "测试引擎",
       model: "测试模型",
+      version: "1.2.3",
       async recognize(input) {
         return {
           width: input.width,
@@ -36,8 +37,11 @@ describe("OCR module", () => {
     const module = createOcrModule(dataHome, engine);
     close = module.close;
     const result = await module.recognizePage({ bookId: BOOK_ID, page: 2, imageData: "aGVsbG8=", width: 600, height: 800 });
-    expect(result).toMatchObject({ ok: true, page: { bookId: BOOK_ID, page: 2, engine: "测试引擎" } });
+    expect(result).toMatchObject({ ok: true, page: { bookId: BOOK_ID, page: 2, engine: "测试引擎", engineVersion: "1.2.3" } });
+    if (result.ok) expect(result.page.inputHash).toMatch(/^[a-f0-9]{64}$/);
     expect(module.getPage(BOOK_ID, 2)?.lines[0]?.text).toBe("扫描页文字");
+    expect(module.isPageCompatible(BOOK_ID, 2, "1.2.3", "测试模型")).toBe(true);
+    expect(module.isPageCompatible(BOOK_ID, 2, "旧版本", "测试模型")).toBe(false);
     expect(await module.recognizePage({ bookId: "bad", page: 2, imageData: "x", width: 1, height: 1 })).toMatchObject({ ok: false, code: "VALIDATION_ERROR" });
   });
 

@@ -12,6 +12,7 @@ import type { ReadingFocus } from "../../shared/contracts.js";
  * 英文单词保持原样由 unicode61 分词。
  */
 const CJK_PATTERN = /[\u3000-\u9fff\uff00-\uffef]/;
+const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
 
 export function tokenizeForIndex(text: string) {
   return Array.from(text)
@@ -142,6 +143,17 @@ async function extractPageText(document: Awaited<ReturnType<typeof getDocument>[
   }
 }
 
+function readRecognizedText(database: DatabaseSync, bookId: string, page: number) {
+  try {
+    const row = database.prepare("SELECT lines_json FROM recognized_pages WHERE book_id = ? AND page = ?").get(bookId, page) as { lines_json: string } | undefined;
+    if (!row) return "";
+    const lines = JSON.parse(row.lines_json) as Array<{ text?: unknown }>;
+    return lines.filter((line) => typeof line.text === "string").map((line) => line.text as string).join(" ").replace(/\s+/g, " ").trim();
+  } catch {
+    return "";
+  }
+}
+
 export function createBookIndex(dataHome: string, options: BookIndexOptions = {}) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
   database.exec(`
@@ -192,6 +204,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   const insertFtsStatement = database.prepare(
     "INSERT INTO book_pages_fts (book_id, page, tokens) VALUES (?, ?, ?)",
   );
+  const deleteFtsPageStatement = database.prepare("DELETE FROM book_pages_fts WHERE book_id = ? AND page = ?");
   const clearFtsStatement = database.prepare(
     "DELETE FROM book_pages_fts WHERE book_id = ?",
   );
@@ -381,10 +394,12 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       }
       for (let page = indexed + 1; page <= document.numPages; page += 1) {
         if (signal?.aborted) break;
-        const text = await extractPageText(document, page);
+        const nativeText = await extractPageText(document, page);
+        const text = nativeText.length >= 16 ? nativeText : (readRecognizedText(database, bookId, page) || nativeText);
         database.exec("BEGIN");
         try {
           insertPageStatement.run(bookId, page, text);
+          deleteFtsPageStatement.run(bookId, page);
           if (text) insertFtsStatement.run(bookId, page, tokenizeForIndex(text));
           database.exec("COMMIT");
         } catch (error) {
@@ -403,6 +418,46 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       ? { note: `索引尚未完成（已索引 ${indexed}/${row.page_count} 页），当前只在已索引范围内检索。` }
       : {};
     return { indexedPages: indexed, totalPages: row.page_count, ...partial };
+  }
+
+  function indexRecognizedPage(bookId: string, page: number, lines: readonly { text: string }[]) {
+    const text = lines.map((line) => line.text).join(" ").replace(/\s+/g, " ").trim();
+    if (!BOOK_ID_PATTERN.test(bookId) || !Number.isSafeInteger(page) || page <= 0) return false;
+    try {
+      database.exec("BEGIN");
+      insertPageStatement.run(bookId, page, text);
+      deleteFtsPageStatement.run(bookId, page);
+      if (text) insertFtsStatement.run(bookId, page, tokenizeForIndex(text));
+      database.prepare("DELETE FROM semantic_embeddings WHERE book_id = ? AND source = 'pdf' AND page = ?").run(bookId, page);
+      database.exec("COMMIT");
+      return true;
+    } catch {
+      try { database.exec("ROLLBACK"); } catch { /* noop */ }
+      return false;
+    }
+  }
+
+  async function renderPageForOcr(bookId: string, pageNumber: number) {
+    const { createCanvas } = await import("@napi-rs/canvas");
+    const source = await loadBookBytesForIndex(bookId);
+    const loadingTask = getDocument({ data: source.bytes.slice(), ...(source.password ? { password: source.password } : {}) });
+    try {
+      const document = await loadingTask.promise;
+      const page = await document.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1.5 });
+      const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+      const context = canvas.getContext("2d");
+      await page.render({ canvas: canvas as never, canvasContext: context as never, viewport }).promise;
+      return { imageData: canvas.toBuffer("image/png").toString("base64"), width: canvas.width, height: canvas.height };
+    } finally {
+      await loadingTask.destroy();
+    }
+  }
+
+  async function loadBookBytesForIndex(bookId: string) {
+    const row = bookRowStatement.get(bookId) as BookRow | undefined;
+    if (!row) throw new Error("书库中没有这本书。");
+    return loadBookBytes(row.current_path, row.saved_password ?? undefined);
   }
 
   function ensureIndexed(
@@ -612,6 +667,10 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     ensureIndexed,
 
     ensureEmbeddings,
+
+    indexRecognizedPage,
+
+    renderPageForOcr,
 
     indexConversationMessage,
 

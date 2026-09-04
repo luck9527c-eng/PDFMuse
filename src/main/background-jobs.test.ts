@@ -157,4 +157,18 @@ describe("background jobs", () => {
     });
   });
 
+  it("automatically retries transient failures up to the configured attempt limit", async () => {
+    let runs = 0;
+    module = createBackgroundJobModule(dataHome, {
+      ocr: async () => {
+        runs += 1;
+        if (runs < 3) throw new Error("temporary");
+      },
+    });
+    const scheduled = module.schedule({ bookId: BOOK_A, kind: "ocr", maxAttempts: 3, inputVersion: "ocr-v1" });
+    if (!scheduled.ok) throw new Error("任务未创建。");
+    await waitFor(() => module?.get(scheduled.job.id)?.status === "completed");
+    expect(module.get(scheduled.job.id)).toMatchObject({ attempts: 3, maxAttempts: 3, inputVersion: "ocr-v1" });
+  });
+
 });

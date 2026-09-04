@@ -657,6 +657,10 @@ export function App() {
       void (async () => {
         await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "index", priority: 10, total: openedBook.pageCount });
         await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "outline", priority: 5, total: openedBook.pageCount });
+        const preflight = await pdfMuseApi.getStartupPreflight();
+        if (preflight.ok && !preflight.warnings.some((warning) => warning.includes("OCR"))) {
+          await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "ocr", priority: 20, total: openedBook.pageCount, maxAttempts: 3, inputVersion: "PaddleOCR:PP-OCRv5:3.7.0", startPage: openedBook.currentPage });
+        }
         const embedding = await pdfMuseApi.getEmbeddingConnection();
         if (embedding.baseUrl && embedding.model) {
           await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "embedding", priority: 0, total: openedBook.pageCount });
@@ -1308,8 +1312,8 @@ export function App() {
                 {(visibleBackgroundJob.status === "running" || visibleBackgroundJob.status === "queued") && (
                   <IconButton label="暂停后台任务" onClick={() => void mutateBackgroundJob("pause")}><Pause /></IconButton>
                 )}
-                {visibleBackgroundJob.status === "paused" && (
-                  <IconButton label="继续后台任务" onClick={() => void mutateBackgroundJob("resume")}><Play /></IconButton>
+                {(visibleBackgroundJob.status === "paused" || visibleBackgroundJob.status === "failed") && (
+                  <IconButton label={visibleBackgroundJob.status === "failed" ? "重试后台任务" : "继续后台任务"} onClick={() => void mutateBackgroundJob("resume")}><Play /></IconButton>
                 )}
                 {(visibleBackgroundJob.status === "running" || visibleBackgroundJob.status === "queued" || visibleBackgroundJob.status === "paused") && (
                   <IconButton label="取消后台任务" onClick={() => void mutateBackgroundJob("cancel")}><X /></IconButton>

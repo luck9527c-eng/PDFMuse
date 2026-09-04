@@ -164,4 +164,13 @@ describe("book index", () => {
     if (search.status !== "ok") return;
     expect(search.retrievalMode).toBe("fts-only");
   });
+
+  it("replaces an empty native page with recognized text and invalidates its vectors", async () => {
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+    expect(index.indexRecognizedPage(bookId, 2, [{ text: "扫描页面独有术语" }])).toBe(true);
+    const search = await index.search(bookId, "独有术语");
+    expect(search.status).toBe("ok");
+    if (search.status !== "ok") return;
+    expect(search.hits[0]).toMatchObject({ source: "pdf", page: 2 });
+  });
 });

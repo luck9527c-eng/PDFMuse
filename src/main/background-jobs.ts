@@ -28,6 +28,9 @@ type JobRow = {
   total: number;
   checkpoint: string | null;
   attempts: number;
+  max_attempts: number;
+  input_version: string | null;
+  claim_id: string | null;
   error_message: string | null;
   created_at: string;
   updated_at: string;
@@ -51,6 +54,8 @@ function toJob(row: JobRow): BackgroundJob {
     total: row.total,
     ...(row.checkpoint ? { checkpoint: row.checkpoint } : {}),
     attempts: row.attempts,
+    maxAttempts: row.max_attempts,
+    ...(row.input_version ? { inputVersion: row.input_version } : {}),
     ...(row.error_message ? { errorMessage: row.error_message } : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -58,6 +63,12 @@ function toJob(row: JobRow): BackgroundJob {
 }
 
 function now() { return new Date().toISOString(); }
+
+function isDiskFullError(error: unknown) {
+  const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+  const message = error instanceof Error ? error.message : String(error);
+  return code === "ENOSPC" || code === "SQLITE_FULL" || /database or disk is full/i.test(message);
+}
 
 export function createBackgroundJobModule(dataHome: string, executors: Partial<Record<BackgroundJobKind, JobExecutor>> = {}) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
@@ -72,6 +83,9 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
       total INTEGER NOT NULL DEFAULT 0,
       checkpoint TEXT,
       attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 3,
+      input_version TEXT,
+      claim_id TEXT,
       error_message TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -99,6 +113,10 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
       throw error;
     }
   }
+  const columns = database.prepare("PRAGMA table_info(background_jobs)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "max_attempts")) database.exec("ALTER TABLE background_jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3");
+  if (!columns.some((column) => column.name === "input_version")) database.exec("ALTER TABLE background_jobs ADD COLUMN input_version TEXT");
+  if (!columns.some((column) => column.name === "claim_id")) database.exec("ALTER TABLE background_jobs ADD COLUMN claim_id TEXT");
   database.exec(`
     CREATE INDEX IF NOT EXISTS background_jobs_schedule ON background_jobs(status, priority DESC, created_at ASC);
     CREATE INDEX IF NOT EXISTS background_jobs_book ON background_jobs(book_id, updated_at DESC);
@@ -117,7 +135,7 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
   let closed = false;
 
   const rowFor = (id: string) => database.prepare(`
-    SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, error_message, created_at, updated_at
+    SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, claim_id, error_message, created_at, updated_at
     FROM background_jobs WHERE id = ?
   `).get(id) as JobRow | undefined;
 
@@ -148,7 +166,7 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
       try {
         while (!closed) {
           const row = database.prepare(`
-            SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, error_message, created_at, updated_at
+            SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, claim_id, error_message, created_at, updated_at
             FROM background_jobs WHERE status = 'queued'
             ORDER BY priority DESC, created_at ASC LIMIT 1
           `).get() as JobRow | undefined;
@@ -163,7 +181,8 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
           let resolveSettled: () => void = () => undefined;
           const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
           active.set(row.id, { bookId: row.book_id, controller, settled, resolveSettled });
-          update(row.id, "status = ?, attempts = attempts + 1, error_message = NULL", ["running"]);
+          const claimId = randomUUID();
+          update(row.id, "status = ?, attempts = attempts + 1, claim_id = ?, error_message = NULL", ["running", claimId]);
           const running = toJob(rowFor(row.id)!);
           try {
             await executor(running, {
@@ -171,16 +190,24 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
               checkpoint(value, progress, total = running.total) {
                 if (closed) return;
                 const boundedProgress = Math.max(0, Math.min(total, Math.floor(progress)));
-                update(row.id, "progress = ?, total = ?, checkpoint = ?", [boundedProgress, total, value ?? null]);
+                database.prepare("UPDATE background_jobs SET progress = ?, total = ?, checkpoint = ?, updated_at = ? WHERE id = ? AND status = 'running' AND claim_id = ?")
+                  .run(boundedProgress, total, value ?? null, now(), row.id, claimId);
               },
             });
             if (!closed && !settleRequestedAction(row.id)) {
-              update(row.id, "status = ?, progress = total, error_message = NULL", ["completed"]);
+              update(row.id, "status = ?, progress = total, claim_id = NULL, error_message = NULL", ["completed"]);
             }
           } catch (error) {
             if (!closed && !settleRequestedAction(row.id)) {
               console.error(`后台任务执行失败：${row.kind}`, error);
-              update(row.id, "status = ?, error_message = ?", ["failed", FAILURE_MESSAGES[row.kind]]);
+              const latest = rowFor(row.id);
+              if (isDiskFullError(error)) {
+                update(row.id, "status = ?, claim_id = NULL, error_message = ?", ["failed", "磁盘空间不足，任务已暂停写入；释放空间后可重试。"]);
+              } else if (latest && latest.attempts < latest.max_attempts) {
+                update(row.id, "status = ?, claim_id = NULL, error_message = ?", ["queued", `第 ${latest.attempts} 次尝试失败，正在自动重试。`]);
+              } else {
+                update(row.id, "status = ?, claim_id = NULL, error_message = ?", ["failed", FAILURE_MESSAGES[row.kind]]);
+              }
             }
           } finally {
             active.get(row.id)?.resolveSettled();
@@ -204,26 +231,34 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
       if (!BOOK_ID_PATTERN.test(input.bookId) || !KINDS.includes(input.kind)) return { ok: false, code: "VALIDATION_ERROR", message: "后台任务参数无效。" };
       const priority = Number.isSafeInteger(input.priority) ? Math.max(-100, Math.min(100, input.priority!)) : 0;
       const total = Number.isSafeInteger(input.total) && input.total! >= 0 ? input.total! : 0;
+      const maxAttempts = Number.isSafeInteger(input.maxAttempts) ? Math.max(1, Math.min(5, input.maxAttempts!)) : 3;
+      const inputVersion = typeof input.inputVersion === "string" && input.inputVersion.length <= 256 ? input.inputVersion : undefined;
+      const startPage = Number.isSafeInteger(input.startPage) && input.startPage! > 1 ? input.startPage! : undefined;
       const existing = database.prepare(`
-        SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, error_message, created_at, updated_at
+        SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, claim_id, error_message, created_at, updated_at
         FROM background_jobs WHERE book_id = ? AND kind = ? AND status IN ('queued', 'running', 'paused')
         ORDER BY created_at ASC LIMIT 1
       `).get(input.bookId, input.kind) as JobRow | undefined;
-      if (existing) return { ok: true, job: toJob(existing) };
+      if (existing && (!inputVersion || existing.input_version === inputVersion)) return { ok: true, job: toJob(existing) };
+      if (existing) {
+        const state = active.get(existing.id);
+        if (state) { state.action = "cancel"; state.controller.abort(); }
+        update(existing.id, "status = ?, claim_id = NULL", ["cancelled"]);
+      }
       const id = randomUUID();
       const timestamp = now();
       database.prepare(`
-        INSERT INTO background_jobs (id, book_id, kind, priority, status, progress, total, attempts, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'queued', 0, ?, 0, ?, ?)
-      `).run(id, input.bookId, input.kind, priority, total, timestamp, timestamp);
+        INSERT INTO background_jobs (id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?)
+      `).run(id, input.bookId, input.kind, priority, startPage ? startPage - 1 : 0, total, startPage ? `page:${startPage - 1}` : null, maxAttempts, inputVersion ?? null, timestamp, timestamp);
       pump();
       return { ok: true, job: toJob(rowFor(id)!) };
     },
     list(bookId?: string): BackgroundJob[] {
       if (closed) return [];
       const rows = bookId && BOOK_ID_PATTERN.test(bookId)
-        ? database.prepare(`SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, error_message, created_at, updated_at FROM background_jobs WHERE book_id = ? ORDER BY updated_at DESC`).all(bookId)
-        : database.prepare(`SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, error_message, created_at, updated_at FROM background_jobs ORDER BY updated_at DESC`).all();
+        ? database.prepare(`SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, claim_id, error_message, created_at, updated_at FROM background_jobs WHERE book_id = ? ORDER BY updated_at DESC`).all(bookId)
+        : database.prepare(`SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, claim_id, error_message, created_at, updated_at FROM background_jobs ORDER BY updated_at DESC`).all();
       return (rows as JobRow[]).map(toJob);
     },
     get(id: string): BackgroundJob | undefined {
@@ -245,8 +280,8 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
     resume(id: string): BackgroundJobMutationResult {
       const row = validJobId(id) ? rowFor(id) : undefined;
       if (!row) return { ok: false, code: "NOT_FOUND", message: "后台任务不存在。" };
-      if (row.status !== "paused") return { ok: false, code: "CONFLICT", message: "当前任务不在暂停状态。" };
-      update(id, "status = ?, error_message = NULL", ["queued"]);
+      if (row.status !== "paused" && row.status !== "failed") return { ok: false, code: "CONFLICT", message: "当前任务无法继续。" };
+      update(id, "status = ?, attempts = ?, claim_id = NULL, error_message = NULL", ["queued", row.status === "failed" ? 0 : row.attempts]);
       pump();
       return { ok: true, job: toJob(rowFor(id)!) };
     },
@@ -264,7 +299,7 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
     async cancelBook(bookId: string) {
       if (!BOOK_ID_PATTERN.test(bookId) || closed) return;
       const jobs = (database.prepare(`
-        SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, error_message, created_at, updated_at
+        SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, claim_id, error_message, created_at, updated_at
         FROM background_jobs WHERE book_id = ? AND status IN ('queued', 'running', 'paused')
       `).all(bookId) as JobRow[]);
       const waits: Promise<void>[] = [];

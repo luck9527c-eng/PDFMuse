@@ -37,11 +37,12 @@ async function verifyWritable(directory: string) {
 }
 
 async function hasOcrResources(applicationDirectory: string) {
-  const worker = path.join(applicationDirectory, "resources", "ocr-worker");
+  const worker = path.join(applicationDirectory, "resources", "ocr-worker", "paddleocr_worker.py");
+  const runtime = path.join(applicationDirectory, "resources", "ocr-runtime", process.platform === "win32" ? "python.exe" : "python");
   const models = path.join(applicationDirectory, "resources", "ocr-models");
 
   try {
-    await Promise.all([access(worker, constants.R_OK), access(models, constants.R_OK)]);
+    await Promise.all([access(worker, constants.R_OK), access(runtime, constants.X_OK), access(models, constants.R_OK)]);
     return true;
   } catch {
     return false;

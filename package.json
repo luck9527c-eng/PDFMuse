@@ -14,9 +14,11 @@
     "smoke:electron": "node scripts/smoke-electron.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
     "build": "npm run clean && npm run typecheck && vite build && tsc -p tsconfig.electron.json",
-    "package:portable": "npm run build && electron-builder --win portable"
+    "package:portable": "npm run build && electron-builder --win portable",
+    "package:installer": "npm run build && electron-builder --win nsis"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.8",
     "@openclaw/ai": "2026.8.1",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-tooltip": "^1.2.8",
@@ -56,9 +58,19 @@
       "dist-electron/**",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "resources",
+        "to": "resources",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
     "win": {
       "target": [
-        "portable"
+        "portable",
+        "nsis"
       ],
       "artifactName": "PDFMuse-${version}-portable.${ext}"
     }
