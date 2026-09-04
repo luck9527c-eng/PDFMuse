@@ -40,22 +40,14 @@ function assistantText(message: AssistantMessage) {
     .join("");
 }
 
-/**
- * 把已持久化的会话消息转换为下一轮模型上下文。
- * 错误或被取消的回答不进入模型上下文，但在 Reader 侧保留展示。
- */
-export function historyToLlmMessages(
+/** 将已持久化的纯文本会话消息转换为 OpenClaw 消息；附件只在当前轮单独注入。 */
+export function historyMessagesToLlmMessages(
   history: ReadonlyArray<{ role: "reader" | "assistant"; body: string; status: string }>,
-  question: string,
-  focus: ReadingFocus | undefined,
-  limit = 12,
-  attachments: readonly AgentImageAttachment[] = [],
 ): Message[] {
   const usable = history.filter(
     (message) => message.role === "reader" || message.status === "complete",
   );
-  const recent = usable.slice(-limit);
-  const messages: Message[] = recent.map<Message>((message) => {
+  return usable.map<Message>((message) => {
     if (message.role === "assistant") {
       return {
         role: "assistant",
@@ -74,6 +66,26 @@ export function historyToLlmMessages(
       timestamp: 0,
     } satisfies UserMessage;
   });
+}
+
+/**
+ * 把已持久化的会话消息转换为下一轮模型上下文。
+ * 错误或被取消的回答不进入模型上下文，但在 Reader 侧保留展示。
+ */
+export function historyToLlmMessages(
+  history: ReadonlyArray<{ role: "reader" | "assistant"; body: string; status: string }>,
+  question: string,
+  focus: ReadingFocus | undefined,
+  limit = 12,
+  attachments: readonly AgentImageAttachment[] = [],
+  summary?: string,
+): Message[] {
+  const recent = historyMessagesToLlmMessages(history).slice(-limit);
+  const messages: Message[] = [];
+  if (summary?.trim()) {
+    messages.push({ role: "user", content: `【Conversation Summary】\n${summary.trim()}`, timestamp: 0 });
+  }
+  messages.push(...recent);
   const imageBlocks: ImageContent[] = attachments.map((attachment) => ({
     type: "image",
     data: attachment.data,

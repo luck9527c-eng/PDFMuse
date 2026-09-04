@@ -194,6 +194,43 @@ describe("agent host", () => {
     expect(conversation[2]?.passage).toEqual({ page: 3, text: "选中的原文片段", rects: [] });
   });
 
+  it("uses OpenClaw compaction for long history while retaining raw messages", async () => {
+    const sessionStore = createSessionStore(dataHome);
+    const session = sessionStore.ensureSession(BOOK_ID);
+    for (let index = 0; index < 8; index += 1) {
+      sessionStore.appendMessage({ sessionId: session.id, runId: `old-${index}`, role: "reader", body: `历史问题 ${index} ${"内容".repeat(80)}`, status: "complete" });
+      sessionStore.appendMessage({ sessionId: session.id, runId: `old-${index}`, role: "assistant", body: `历史回答 ${index} ${"回答".repeat(80)}`, status: "complete" });
+    }
+    sessionStore.close();
+
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage(calls === 1 ? "历史摘要" : "压缩后回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      compactionContextWindow: 80,
+      compactionSettings: { reserveTokens: 16, keepRecentTokens: 16 },
+    });
+
+    const result = await startRun("压缩后的新问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 5_000);
+
+    expect(calls).toBe(2);
+    expect(fake.requests[1]?.context.messages.some((message) => (
+      typeof message.content === "string" && message.content.includes("Conversation Summary")
+    ))).toBe(true);
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation.filter((message) => message.role === "reader")).toHaveLength(9);
+    expect(conversation.at(-1)?.body).toBe("压缩后回答");
+    const persisted = createSessionStore(dataHome);
+    expect(persisted.getSummary(session.id)?.summary).toBe("历史摘要");
+    persisted.close();
+  });
+
   it("passes current-turn screenshot blocks to the model without indexing them", async () => {
     const fake = createFakeStreamFn(({ push }) => {
       push({ type: "start", partial: assistantMessage("") });

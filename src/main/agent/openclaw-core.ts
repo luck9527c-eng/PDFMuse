@@ -4,12 +4,17 @@
 
 export {
   Agent,
+  DEFAULT_COMPACTION_SETTINGS,
+  estimateTokens,
+  generateSummary,
+  shouldCompact,
   type AgentEvent,
   type AgentMessage,
   type AgentOptions,
   type AgentState,
   type AgentTool,
   type AgentToolResult,
+  type CompactionSettings,
   type StreamFn,
 } from "../../../vendor/openclaw-agent-core/packages/agent-core/src/index.js";
 

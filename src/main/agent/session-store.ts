@@ -14,6 +14,8 @@ type SessionRow = {
   book_id: string;
   created_at: string;
   updated_at: string;
+  summary: string | null;
+  summary_through_id: string | null;
 };
 
 /** 持久层消息状态比契约多一个 streaming：回答开始即落盘，结束后收尾。 */
@@ -87,7 +89,9 @@ export function createSessionStore(dataHome: string) {
       id TEXT PRIMARY KEY,
       book_id TEXT NOT NULL UNIQUE,
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      summary TEXT,
+      summary_through_id TEXT
     );
     CREATE TABLE IF NOT EXISTS agent_messages (
       id TEXT PRIMARY KEY,
@@ -105,6 +109,12 @@ export function createSessionStore(dataHome: string) {
     CREATE INDEX IF NOT EXISTS agent_messages_session_order
       ON agent_messages(session_id, created_at, id);
   `);
+  const sessionColumns = new Set(
+    (database.prepare("PRAGMA table_info(agent_sessions)").all() as { name: string }[])
+      .map((column) => column.name),
+  );
+  if (!sessionColumns.has("summary")) database.exec("ALTER TABLE agent_sessions ADD COLUMN summary TEXT");
+  if (!sessionColumns.has("summary_through_id")) database.exec("ALTER TABLE agent_sessions ADD COLUMN summary_through_id TEXT");
   // 旧库迁移：T08 之前的 agent_messages 没有 evidence_json。
   const messageColumns = new Set(
     (database.prepare("PRAGMA table_info(agent_messages)").all() as { name: string }[])
@@ -115,7 +125,7 @@ export function createSessionStore(dataHome: string) {
   }
 
   const findSessionStatement = database.prepare(`
-    SELECT id, book_id, created_at, updated_at FROM agent_sessions WHERE book_id = ?
+    SELECT id, book_id, created_at, updated_at, summary, summary_through_id FROM agent_sessions WHERE book_id = ?
   `);
   const insertSessionStatement = database.prepare(`
     INSERT INTO agent_sessions (id, book_id, created_at, updated_at)
@@ -124,6 +134,9 @@ export function createSessionStore(dataHome: string) {
   `);
   const touchSessionStatement = database.prepare(`
     UPDATE agent_sessions SET updated_at = ? WHERE id = ?
+  `);
+  const updateSummaryStatement = database.prepare(`
+    UPDATE agent_sessions SET summary = ?, summary_through_id = ?, updated_at = ? WHERE id = ?
   `);
   const insertMessageStatement = database.prepare(`
     INSERT INTO agent_messages (
@@ -164,6 +177,18 @@ export function createSessionStore(dataHome: string) {
 
     findSession(bookId: string): SessionRow | undefined {
       return findSessionStatement.get(bookId) as SessionRow | undefined;
+    },
+
+    getSummary(sessionId: string): { summary: string; throughMessageId: string } | undefined {
+      const row = database.prepare("SELECT summary, summary_through_id FROM agent_sessions WHERE id = ?").get(sessionId) as
+        | { summary: string | null; summary_through_id: string | null }
+        | undefined;
+      if (!row?.summary || !row.summary_through_id) return undefined;
+      return { summary: row.summary, throughMessageId: row.summary_through_id };
+    },
+
+    saveSummary(sessionId: string, summary: string, throughMessageId: string) {
+      updateSummaryStatement.run(summary, throughMessageId, now(), sessionId);
     },
 
     appendMessage(input: {

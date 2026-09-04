@@ -10,9 +10,19 @@ import type {
   StartAgentRunResult,
 } from "../../shared/contracts.js";
 import { MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES, MAX_AGENT_IMAGE_TOTAL_BYTES } from "../../shared/contracts.js";
-import { assistantText, buildSystemPrompt, historyToLlmMessages } from "./context-assembly.js";
+import { assistantText, buildSystemPrompt, historyMessagesToLlmMessages, historyToLlmMessages } from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, toLlmModel, type ResolvedModelConnection } from "./model-runtime.js";
-import { Agent, type AgentEvent, type AgentTool, type StreamFn } from "./openclaw-core.js";
+import {
+  Agent,
+  DEFAULT_COMPACTION_SETTINGS,
+  estimateTokens,
+  generateSummary,
+  shouldCompact,
+  type AgentEvent,
+  type AgentTool,
+  type CompactionSettings,
+  type StreamFn,
+} from "./openclaw-core.js";
 import { createSessionStore, type SessionStore } from "./session-store.js";
 
 export type AgentHostOptions = {
@@ -38,6 +48,9 @@ export type AgentHostOptions = {
   emit(event: AgentStreamEvent): void;
   runTimeoutMs?: number;
   historyLimit?: number;
+  /** OpenClaw compaction trigger and retention can be lowered in tests or constrained deployments. */
+  compactionContextWindow?: number;
+  compactionSettings?: Partial<CompactionSettings>;
   /** 测试注入假模型流；生产默认使用 @openclaw/ai Provider Adapter。 */
   createStreamFn?: (connection: ResolvedModelConnection) => StreamFn;
 };
@@ -117,6 +130,11 @@ export function createAgentHost(options: AgentHostOptions) {
   const store: SessionStore = createSessionStore(options.dataHome);
   const runTimeoutMs = options.runTimeoutMs ?? 120_000;
   const historyLimit = options.historyLimit ?? 12;
+  const compactionContextWindow = options.compactionContextWindow ?? 64_000;
+  const compactionSettings: CompactionSettings = {
+    ...DEFAULT_COMPACTION_SETTINGS,
+    ...options.compactionSettings,
+  };
   const makeStreamFn = options.createStreamFn ?? createModelStreamFn;
   // 每个 Book Conversation 一条串行 lane；lane 尾部为空时移除，避免长期驻留。
   const sessionLanes = new Map<string, Promise<void>>();
@@ -134,6 +152,61 @@ export function createAgentHost(options: AgentHostOptions) {
       if (sessionLanes.get(sessionId) === tail) sessionLanes.delete(sessionId);
     });
     return run;
+  }
+
+  async function compactHistory(
+    sessionId: string,
+    history: ConversationMessage[],
+    connection: ResolvedModelConnection,
+  ): Promise<{ history: ConversationMessage[]; summary?: string }> {
+    const previous = store.getSummary(sessionId);
+    const previousIndex = previous ? history.findIndex((message) => message.id === previous.throughMessageId) : -1;
+    const workingHistory = previousIndex >= 0 ? history.slice(previousIndex + 1) : history;
+    const usableHistory = workingHistory.filter(
+      (message) => message.role === "reader" || message.status === "complete",
+    );
+    const historyMessages = historyMessagesToLlmMessages(usableHistory);
+    const summaryMessage = previous?.summary
+      ? [{ role: "user" as const, content: `【Conversation Summary】\n${previous.summary}`, timestamp: 0 }]
+      : [];
+    const contextTokens = [...summaryMessage, ...historyMessages]
+      .reduce((total, message) => total + estimateTokens(message), 0);
+    if (!shouldCompact(contextTokens, compactionContextWindow, compactionSettings)) {
+      return { history: workingHistory, ...(previous?.summary ? { summary: previous.summary } : {}) };
+    }
+
+    let retainedTokens = 0;
+    let cut = historyMessages.length;
+    while (cut > 0) {
+      const next = estimateTokens(historyMessages[cut - 1]!);
+      if (retainedTokens + next > compactionSettings.keepRecentTokens) break;
+      retainedTokens += next;
+      cut -= 1;
+    }
+    if (cut <= 0) {
+      return { history: workingHistory, ...(previous?.summary ? { summary: previous.summary } : {}) };
+    }
+    const summaryResult = await generateSummary(
+      historyMessages.slice(0, cut),
+      toLlmModel(connection),
+      compactionSettings.reserveTokens,
+      connection.apiKey,
+      undefined,
+      undefined,
+      undefined,
+      previous?.summary,
+      undefined,
+      makeStreamFn(connection),
+    );
+    if (!summaryResult.ok || !summaryResult.value.trim()) {
+      // 摘要是优化，不是回答的前置条件；失败时保持原始消息可用。
+      return { history: workingHistory, ...(previous?.summary ? { summary: previous.summary } : {}) };
+    }
+    const throughMessage = usableHistory[cut - 1];
+    if (!throughMessage) return { history: workingHistory, summary: summaryResult.value };
+    store.saveSummary(sessionId, summaryResult.value, throughMessage.id);
+    const nextHistory = history.slice(history.findIndex((message) => message.id === throughMessage.id) + 1);
+    return { history: nextHistory, summary: summaryResult.value };
   }
 
   async function executeRun(input: {
@@ -155,8 +228,11 @@ export function createAgentHost(options: AgentHostOptions) {
     }
 
     // Reader 问题先落盘：失败或中断时问题和阅读焦点不丢失。
-    const history = store.listMessages(sessionId);
-    for (const message of history) {
+    const fullHistory = store.listMessages(sessionId);
+    const compacted = await compactHistory(sessionId, fullHistory, connection);
+    const history = compacted.history;
+    // 索引需要看到完整的原始会话；压缩只影响发给模型的上下文窗口。
+    for (const message of fullHistory) {
       if (message.body && message.status === "complete") {
         await options.indexConversationMessage?.(bookId, {
           id: message.id,
@@ -174,7 +250,7 @@ export function createAgentHost(options: AgentHostOptions) {
       status: readerMessage.status,
     });
 
-    const llmMessages = historyToLlmMessages(history, question, focus, historyLimit, attachments);
+    const llmMessages = historyToLlmMessages(history, question, focus, historyLimit, attachments, compacted.summary);
     const questionMessage = llmMessages[llmMessages.length - 1];
     if (!questionMessage) return;
 
