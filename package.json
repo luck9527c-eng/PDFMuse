@@ -63,11 +63,7 @@
         "from": "resources",
         "to": "resources",
         "filter": [
-          "**/*",
-          "!ocr-worker/**",
-          "!ocr-runtime/**",
-          "!ocr-models/**",
-          "!ocr-manifest.json"
+          "**/*"
         ]
       }
     ],
