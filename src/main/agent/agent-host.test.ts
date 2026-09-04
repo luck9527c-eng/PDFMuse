@@ -194,6 +194,39 @@ describe("agent host", () => {
     expect(conversation[2]?.passage).toEqual({ page: 3, text: "选中的原文片段", rects: [] });
   });
 
+  it("passes current-turn screenshot blocks to the model without indexing them", async () => {
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("看到了截图") });
+    });
+    const indexed: Array<{ role: string; body: string }> = [];
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      indexConversationMessage: (_bookId, message) => indexed.push({ role: message.role, body: message.body }),
+    });
+    const result = await host.start({
+      bookId: BOOK_ID,
+      question: "请看这张图",
+      attachments: [{ id: "shot-1", mimeType: "image/png", data: "aGVsbG8=" }],
+    });
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    const request = fake.requests[0]!;
+    expect(request.model.input).toEqual(["text", "image"]);
+    const current = request.context.messages.at(-1);
+    expect(current?.role).toBe("user");
+    expect(Array.isArray(current?.content)).toBe(true);
+    expect(current?.content).toEqual([
+      expect.objectContaining({ type: "text", text: expect.stringContaining("请看这张图") }),
+      { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+    ]);
+    expect(indexed).toEqual([
+      { role: "reader", body: "请看这张图" },
+      { role: "assistant", body: "看到了截图" },
+    ]);
+  });
+
   it("truncates oversized reader profiles inside the system prompt budget", async () => {
     const fake = createFakeStreamFn(({ push }) => {
       push({ type: "start", partial: assistantMessage("") });
@@ -393,6 +426,11 @@ describe("agent host", () => {
     expect((await host.start({ bookId: BOOK_ID, question: "   " })).ok).toBe(false);
     expect((await host.start({ bookId: BOOK_ID, question: "x".repeat(9_000) })).ok).toBe(false);
     expect((await host.start(null)).ok).toBe(false);
+    expect((await host.start({
+      bookId: BOOK_ID,
+      question: "图片太多",
+      attachments: Array.from({ length: 5 }, (_, index) => ({ id: String(index), mimeType: "image/png", data: "aGVsbG8=" })),
+    })).ok).toBe(false);
   });
 
   it("recovers interrupted streaming messages on restart", async () => {

@@ -21,6 +21,7 @@ export {
   type AssistantMessageEvent,
   type CompleteSimpleFn,
   type Context,
+  type ImageContent,
   type Message,
   type Model,
   type SimpleStreamOptions,

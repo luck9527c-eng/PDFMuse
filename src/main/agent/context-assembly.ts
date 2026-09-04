@@ -1,5 +1,5 @@
-import type { ReadingFocus } from "../../shared/contracts.js";
-import type { AssistantMessage, Message, UserMessage } from "./openclaw-core.js";
+import type { AgentImageAttachment, ReadingFocus } from "../../shared/contracts.js";
+import type { AssistantMessage, ImageContent, Message, UserMessage } from "./openclaw-core.js";
 
 const SYSTEM_PROMPT = [
   "你是 PDFMuse，一位帮助 Reader 精读 PDF 书籍的中文阅读助手。",
@@ -49,6 +49,7 @@ export function historyToLlmMessages(
   question: string,
   focus: ReadingFocus | undefined,
   limit = 12,
+  attachments: readonly AgentImageAttachment[] = [],
 ): Message[] {
   const usable = history.filter(
     (message) => message.role === "reader" || message.status === "complete",
@@ -73,9 +74,16 @@ export function historyToLlmMessages(
       timestamp: 0,
     } satisfies UserMessage;
   });
+  const imageBlocks: ImageContent[] = attachments.map((attachment) => ({
+    type: "image",
+    data: attachment.data,
+    mimeType: attachment.mimeType,
+  }));
   const questionMessage: UserMessage = {
     role: "user",
-    content: buildQuestionContent(question, focus),
+    content: imageBlocks.length > 0
+      ? [{ type: "text", text: buildQuestionContent(question, focus) }, ...imageBlocks]
+      : buildQuestionContent(question, focus),
     timestamp: Date.now(),
   };
   messages.push(questionMessage);

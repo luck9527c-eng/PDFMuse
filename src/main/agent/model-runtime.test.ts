@@ -35,6 +35,13 @@ describe("normalizeModelError", () => {
     expect(normalizeModelError({ stopReason: "stop" })).toBeUndefined();
     expect(normalizeModelError({ stopReason: "aborted" })).toBeUndefined();
   });
+
+  it("maps unsupported vision responses to a Chinese retry message", () => {
+    expect(normalizeModelError({ stopReason: "error", errorMessage: "model does not support image input" })).toEqual({
+      code: "INVALID_RESPONSE",
+      message: "当前配置的模型不支持图片输入，请更换支持视觉的模型后重试。",
+    });
+  });
 });
 
 describe("toLlmModel", () => {
@@ -42,5 +49,10 @@ describe("toLlmModel", () => {
     expect(toLlmModel({ protocol: "openai", baseUrl: "http://x/v1", model: "gpt" }).api).toBe("openai-completions");
     expect(toLlmModel({ protocol: "anthropic", baseUrl: "http://x", model: "claude" }).api).toBe("anthropic-messages");
     expect(toLlmModel({ protocol: "openai", baseUrl: "http://x/v1", model: "gpt" }).baseUrl).toBe("http://x/v1");
+  });
+
+  it("declares image input only for image requests", () => {
+    expect(toLlmModel({ protocol: "openai", baseUrl: "http://x/v1", model: "gpt" }).input).toEqual(["text"]);
+    expect(toLlmModel({ protocol: "openai", baseUrl: "http://x/v1", model: "gpt" }, true).input).toEqual(["text", "image"]);
   });
 });

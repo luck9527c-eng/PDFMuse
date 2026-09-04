@@ -19,7 +19,7 @@ const llmRuntime = createLlmRuntime();
 registerBuiltInApiProviders(llmRuntime.registry);
 
 /** Model Connection 配置映射为 vendored Agent Core 需要的 Model 对象。 */
-export function toLlmModel(connection: ResolvedModelConnection): Model {
+export function toLlmModel(connection: ResolvedModelConnection, supportsVision = false): Model {
   return {
     id: connection.model,
     name: connection.model,
@@ -27,7 +27,7 @@ export function toLlmModel(connection: ResolvedModelConnection): Model {
     provider: "pdfmuse",
     baseUrl: connection.baseUrl,
     reasoning: false,
-    input: ["text"],
+    input: supportsVision ? ["text", "image"] : ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 0,
     maxTokens: 0,
@@ -86,6 +86,14 @@ export function normalizeModelError(failure: {
     return {
       code: "NETWORK_ERROR",
       message: "无法连接模型服务，请检查网络或接口地址后重试。",
+    };
+  }
+  if (text.includes("vision") || text.includes("multimodal") || text.includes("image input")
+    || text.includes("image_url") || text.includes("images are not supported")
+    || text.includes("does not support image") || text.includes("图片")) {
+    return {
+      code: "INVALID_RESPONSE",
+      message: "当前配置的模型不支持图片输入，请更换支持视觉的模型后重试。",
     };
   }
   return {

@@ -212,10 +212,22 @@ export type ReadingFocus = {
   selectedPassage?: SelectedPassage;
 };
 
+/** 当前问题的图片附件；data 仅保存不含 data: 前缀的 Base64。 */
+export type AgentImageAttachment = {
+  id: string;
+  mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+  data: string;
+};
+
+export const MAX_AGENT_IMAGE_ATTACHMENTS = 4;
+export const MAX_AGENT_IMAGE_BYTES = 8 * 1024 * 1024;
+export const MAX_AGENT_IMAGE_TOTAL_BYTES = 24 * 1024 * 1024;
+
 export type StartAgentRunInput = {
   bookId: string;
   question: string;
   focus?: ReadingFocus;
+  attachments?: AgentImageAttachment[];
 };
 
 export type StartAgentRunResult =

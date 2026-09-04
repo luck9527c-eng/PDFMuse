@@ -2,12 +2,14 @@ import { randomUUID } from "node:crypto";
 
 import type {
   AgentStreamEvent,
+  AgentImageAttachment,
   ConversationEvidence,
   ConversationMessage,
   ReadingFocus,
   StartAgentRunInput,
   StartAgentRunResult,
 } from "../../shared/contracts.js";
+import { MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES, MAX_AGENT_IMAGE_TOTAL_BYTES } from "../../shared/contracts.js";
 import { assistantText, buildSystemPrompt, historyToLlmMessages } from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, toLlmModel, type ResolvedModelConnection } from "./model-runtime.js";
 import { Agent, type AgentEvent, type AgentTool, type StreamFn } from "./openclaw-core.js";
@@ -42,6 +44,7 @@ export type AgentHostOptions = {
 
 const QUESTION_MAX_LENGTH = 8_000;
 const PASSAGE_MAX_LENGTH = 20_000;
+const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -68,6 +71,37 @@ function isBookId(value: unknown): value is string {
 
 function isStartInput(value: Record<string, unknown>): value is StartAgentRunInput {
   return isBookId(value.bookId) && typeof value.question === "string";
+}
+
+function base64ByteLength(value: string) {
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return Math.floor(value.length * 3 / 4) - padding;
+}
+
+/** 图片只在当前请求内存在，严格限制格式和大小，避免借 IPC 注入任意内容。 */
+function parseAttachments(value: unknown): AgentImageAttachment[] | undefined | null {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_AGENT_IMAGE_ATTACHMENTS) return null;
+  const ids = new Set<string>();
+  let totalBytes = 0;
+  const attachments: AgentImageAttachment[] = [];
+  for (const item of value) {
+    if (!isRecord(item)
+      || typeof item.id !== "string" || item.id.length === 0 || item.id.length > 128
+      || ids.has(item.id)
+      || (item.mimeType !== "image/png" && item.mimeType !== "image/jpeg"
+        && item.mimeType !== "image/webp" && item.mimeType !== "image/gif")
+      || typeof item.data !== "string" || !BASE64_PATTERN.test(item.data)
+      || item.data.length === 0) {
+      return null;
+    }
+    const bytes = base64ByteLength(item.data);
+    if (bytes <= 0 || bytes > MAX_AGENT_IMAGE_BYTES || totalBytes + bytes > MAX_AGENT_IMAGE_TOTAL_BYTES) return null;
+    ids.add(item.id);
+    totalBytes += bytes;
+    attachments.push({ id: item.id, mimeType: item.mimeType, data: item.data });
+  }
+  return attachments;
 }
 
 type ActiveRun = {
@@ -108,10 +142,11 @@ export function createAgentHost(options: AgentHostOptions) {
     bookId: string;
     question: string;
     focus?: ReadingFocus;
+    attachments?: AgentImageAttachment[];
     connection: ResolvedModelConnection;
     profile: string;
   }) {
-    const { runId, sessionId, bookId, question, focus, connection, profile } = input;
+    const { runId, sessionId, bookId, question, focus, attachments = [], connection, profile } = input;
     if (cancelledBeforeStart.delete(runId)) {
       // 排队期间被取消：仍保留 Reader 问题，并发出终态让 Renderer 解除占用。
       store.appendMessage({ sessionId, runId, role: "reader", body: question, status: "complete", focus });
@@ -139,7 +174,7 @@ export function createAgentHost(options: AgentHostOptions) {
       status: readerMessage.status,
     });
 
-    const llmMessages = historyToLlmMessages(history, question, focus, historyLimit);
+    const llmMessages = historyToLlmMessages(history, question, focus, historyLimit, attachments);
     const questionMessage = llmMessages[llmMessages.length - 1];
     if (!questionMessage) return;
 
@@ -157,7 +192,7 @@ export function createAgentHost(options: AgentHostOptions) {
     const agent = new Agent({
       initialState: {
         systemPrompt: buildSystemPrompt(profile),
-        model: toLlmModel(connection),
+        model: toLlmModel(connection, attachments.length > 0),
         messages: llmMessages.slice(0, -1),
         tools,
       },
@@ -233,9 +268,11 @@ export function createAgentHost(options: AgentHostOptions) {
     try {
       await agent.prompt(questionMessage);
     } catch (error) {
+      const thrownMessage = error instanceof Error ? error.message : String(error);
+      const normalized = normalizeModelError({ stopReason: "error", errorMessage: thrownMessage });
       assistantFailure = {
         status: "error",
-        message: error instanceof Error ? `回答生成失败：${error.message}` : "回答生成失败。",
+        message: normalized?.message ?? "回答生成失败，请重试。",
       };
     } finally {
       clearTimeout(timeout);
@@ -297,6 +334,14 @@ export function createAgentHost(options: AgentHostOptions) {
           message: `问题不能为空，且不超过 ${QUESTION_MAX_LENGTH} 个字符。`,
         };
       }
+      const attachments = parseAttachments(input.attachments);
+      if (attachments === null) {
+        return {
+          ok: false,
+          code: "VALIDATION_ERROR",
+          message: `截图附件最多 ${MAX_AGENT_IMAGE_ATTACHMENTS} 张，支持 PNG、JPEG、WEBP、GIF，单张不超过 8 MB。`,
+        };
+      }
       const connection = await options.loadModelConnection();
       if (!connection || !connection.baseUrl || !connection.model) {
         return {
@@ -322,6 +367,7 @@ export function createAgentHost(options: AgentHostOptions) {
         bookId: input.bookId,
         question,
         focus,
+        attachments,
         connection,
         profile,
       }));

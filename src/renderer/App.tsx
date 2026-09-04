@@ -12,6 +12,7 @@ import {
   FilePlus2,
   Focus,
   Hand,
+  ImagePlus,
   Library,
   Loader2,
   LockKeyhole,
@@ -32,6 +33,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 
 import type {
   AgentStreamEvent,
+  AgentImageAttachment,
   ConversationMessage,
   LibraryBook,
   OpenedPdfBook,
@@ -40,6 +42,7 @@ import type {
   SelectedPassage,
   StartupPreflight,
 } from "../shared/contracts";
+import { MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES } from "../shared/contracts";
 import { IconButton } from "./components/IconButton";
 import { MarkdownView } from "./components/MarkdownView";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -48,6 +51,7 @@ import { createReadingStateWriter } from "./reading-state-persistence";
 
 type PassagePopover = Extract<ViewerSelection, { kind: "selected" }>;
 type StreamingReply = { runId: string; sessionId: string; body: string };
+type ComposerSubmission = { runId: string; question: string; passage?: SelectedPassage; attachments: AgentImageAttachment[] };
 
 const TOOL_TITLES: Record<string, string> = {
   book_search: "检索本书",
@@ -394,6 +398,7 @@ export function App() {
   const [selectionFeedback, setSelectionFeedback] = useState<{ message: string; tone: "success" | "error" }>();
   const [draft, setDraft] = useState("");
   const [attachedPassage, setAttachedPassage] = useState<SelectedPassage>();
+  const [attachments, setAttachments] = useState<AgentImageAttachment[]>([]);
   const [conversation, setConversation] = useState<ConversationMessage[]>([]);
   const [streamingReply, setStreamingReply] = useState<StreamingReply>();
   const [toolStatus, setToolStatus] = useState<string>();
@@ -401,6 +406,13 @@ export function App() {
   const [conversationLoading, setConversationLoading] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
   const activeRunRef = useRef<StreamingReply | undefined>(undefined);
+  const pendingComposerRef = useRef<ComposerSubmission | undefined>(undefined);
+  const draftRef = useRef(draft);
+  const passageRef = useRef(attachedPassage);
+  const attachmentsRef = useRef(attachments);
+  draftRef.current = draft;
+  passageRef.current = attachedPassage;
+  attachmentsRef.current = attachments;
 
   useEffect(() => {
     void (window.pdfMuse?.getStartupPreflight() ?? Promise.resolve(browserPreflight)).then(setPreflight);
@@ -505,6 +517,7 @@ export function App() {
     setPanMode(false);
     setPassage(undefined);
     setAttachedPassage(undefined);
+    setAttachments([]);
     setSelectionFeedback(undefined);
   }, [refreshConversation, resetConversationState]);
 
@@ -702,6 +715,19 @@ export function App() {
           const title = TOOL_TITLES[event.name] ?? event.name;
           setToolStatus(event.phase === "end" ? `${title}完成` : `${title}中...`);
         } else if (event.stream === "lifecycle" && (event.phase === "end" || event.phase === "cancelled" || event.phase === "error")) {
+          const submission = pendingComposerRef.current;
+          if (submission?.runId === event.runId) {
+            if (event.phase === "end"
+              && draftRef.current === submission.question
+              && passageRef.current === submission.passage
+              && attachmentsRef.current.length === submission.attachments.length
+              && attachmentsRef.current.every((item, index) => item.id === submission.attachments[index]?.id)) {
+              setDraft("");
+              setAttachedPassage(undefined);
+              setAttachments([]);
+            }
+            pendingComposerRef.current = undefined;
+          }
           activeRunRef.current = undefined;
           setStreamingReply(undefined);
           setToolStatus(undefined);
@@ -711,8 +737,8 @@ export function App() {
     });
   }, [book, refreshConversation]);
 
-  const askAgent = useCallback(async (question: string, passage?: SelectedPassage) => {
-    if (!book || !window.pdfMuse || activeRunRef.current) return;
+  const askAgent = useCallback(async (question: string, passage?: SelectedPassage, imageAttachments: AgentImageAttachment[] = []) => {
+    if (!book || !window.pdfMuse || activeRunRef.current) return undefined;
     setAgentNotice("");
     try {
       const result = await window.pdfMuse.startAgentRun({
@@ -722,10 +748,11 @@ export function App() {
           currentPage: viewerState.page,
           ...(passage ? { selectedPassage: passage } : {}),
         },
+        ...(imageAttachments.length > 0 ? { attachments: imageAttachments } : {}),
       });
       if (!result.ok) {
         setAgentNotice(result.message);
-        return;
+        return undefined;
       }
       // Reader 问题立即上屏；终态时 refreshConversation 会以持久化数据替换。
       setConversation((current) => [
@@ -743,8 +770,10 @@ export function App() {
       ]);
       activeRunRef.current = { runId: result.runId, sessionId: result.sessionId, body: "" };
       setStreamingReply(activeRunRef.current);
+      return result;
     } catch {
       setAgentNotice("无法发起回答，请重试。");
+      return undefined;
     }
   }, [book, viewerState.page]);
 
@@ -798,14 +827,69 @@ export function App() {
     void askAgent(readerQuestion.body, passage);
   }, [askAgent, book, conversation]);
 
-  const sendDraft = useCallback(() => {
+  const addClipboardImages = useCallback(async (items: DataTransferItem[]) => {
+    const remaining = MAX_AGENT_IMAGE_ATTACHMENTS - attachmentsRef.current.length;
+    if (remaining <= 0) {
+      setAgentNotice(`最多添加 ${MAX_AGENT_IMAGE_ATTACHMENTS} 张截图。`);
+      return;
+    }
+    const files = items.slice(0, remaining).map((item) => item.getAsFile()).filter((file): file is File => Boolean(file));
+    if (files.length < items.slice(0, remaining).length) {
+      setAgentNotice("无法读取剪贴板截图，请重试。");
+      return;
+    }
+    const accepted: AgentImageAttachment[] = [];
+    for (const file of files) {
+      const mimeType = file.type.toLowerCase();
+      if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mimeType)) {
+        setAgentNotice("仅支持 PNG、JPEG、WEBP 或 GIF 截图。");
+        continue;
+      }
+      if (file.size > MAX_AGENT_IMAGE_BYTES) {
+        setAgentNotice("单张截图不能超过 8 MB。");
+        continue;
+      }
+      const dataUrl = await new Promise<string | undefined>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : undefined);
+        reader.onerror = () => resolve(undefined);
+        reader.readAsDataURL(file);
+      });
+      const data = dataUrl?.split(",", 2)[1];
+      if (!data) {
+        setAgentNotice("读取截图失败，请重试。");
+        continue;
+      }
+      accepted.push({
+        id: typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${accepted.length}`,
+        mimeType: mimeType as AgentImageAttachment["mimeType"],
+        data,
+      });
+    }
+    if (accepted.length > 0) {
+      setAttachments((current) => [...current, ...accepted].slice(0, MAX_AGENT_IMAGE_ATTACHMENTS));
+      setAgentNotice("");
+    }
+    if (items.length > remaining) setAgentNotice(`最多添加 ${MAX_AGENT_IMAGE_ATTACHMENTS} 张截图，超出的图片未添加。`);
+  }, []);
+
+  const handleComposerPaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageItems = Array.from(event.clipboardData.items).filter((item) => item.kind === "file" && item.type.toLowerCase().startsWith("image/"));
+    if (imageItems.length === 0) return;
+    event.preventDefault();
+    void addClipboardImages(imageItems);
+  }, [addClipboardImages]);
+
+  const sendDraft = useCallback(async () => {
     const question = draft.trim();
     if (!question || activeRunRef.current) return;
     const passage = attachedPassage;
-    setDraft("");
-    setAttachedPassage(undefined);
-    void askAgent(question, passage);
-  }, [askAgent, attachedPassage, draft]);
+    const imageAttachments = attachments;
+    const result = await askAgent(question, passage, imageAttachments);
+    if (result?.ok) {
+      pendingComposerRef.current = { runId: result.runId, question, passage, attachments: imageAttachments };
+    }
+  }, [askAgent, attachedPassage, attachments, draft]);
 
   const passageByRun = useMemo(() => {
     const map = new Map<string, { page: number; text: string }>();
@@ -990,12 +1074,23 @@ export function App() {
             )}
             <div className="composer-wrap">
               {attachedPassage && <div className="passage-chip"><span>已选原文 · 第 {attachedPassage.page} 页</span><p>{attachedPassage.text}</p><button aria-label="移除已选原文" onClick={() => setAttachedPassage(undefined)}><X size={14} /></button></div>}
+              {attachments.length > 0 && (
+                <div className="attachment-strip" aria-label="截图附件">
+                  {attachments.map((attachment, index) => (
+                    <div className="attachment-thumb" key={attachment.id}>
+                      <img src={`data:${attachment.mimeType};base64,${attachment.data}`} alt={`截图 ${index + 1}`} />
+                      <button aria-label={`移除截图 ${index + 1}`} onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}><X size={12} /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
               <div className="composer">
-                <textarea ref={composerRef} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendDraft(); } }} placeholder="询问这本 PDF 书籍..." rows={2} />
+                <textarea ref={composerRef} value={draft} onChange={(event) => setDraft(event.target.value)} onPaste={handleComposerPaste} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendDraft(); } }} placeholder={attachments.length > 0 ? "已添加截图，输入问题..." : "询问这本 PDF 书籍..."} rows={2} />
                 {streamingReply
                   ? <button className="send-button stop" aria-label="停止回答" onClick={() => void stopAgent()}><Square size={14} /></button>
-                  : <button className="send-button" aria-label="发送问题" disabled={!draft.trim()} onClick={sendDraft}><Send size={17} /></button>}
+                  : <button className="send-button" aria-label="发送问题" disabled={!draft.trim()} onClick={() => void sendDraft()}><Send size={17} /></button>}
               </div>
+              <div className="composer-meta" title={`粘贴截图，最多 ${MAX_AGENT_IMAGE_ATTACHMENTS} 张`} aria-label={`截图附件 ${attachments.length}/${MAX_AGENT_IMAGE_ATTACHMENTS}`}><ImagePlus size={12} />{attachments.length > 0 && <span>{attachments.length}/{MAX_AGENT_IMAGE_ATTACHMENTS}</span>}</div>
             </div>
           </aside>
         )}
