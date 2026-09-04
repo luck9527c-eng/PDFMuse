@@ -11,7 +11,7 @@ import type {
 } from "../shared/contracts.js";
 
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
-const KINDS: BackgroundJobKind[] = ["ocr", "embedding", "index"];
+const KINDS: BackgroundJobKind[] = ["ocr", "embedding", "index", "outline"];
 type JobRow = {
   id: string;
   book_id: string;
@@ -55,11 +55,11 @@ function now() { return new Date().toISOString(); }
 
 export function createBackgroundJobModule(dataHome: string, executors: Partial<Record<BackgroundJobKind, JobExecutor>> = {}) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
-  database.exec(`
+  const createTable = `
     CREATE TABLE IF NOT EXISTS background_jobs (
       id TEXT PRIMARY KEY,
       book_id TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK (kind IN ('ocr', 'embedding', 'index')),
+      kind TEXT NOT NULL CHECK (kind IN ('ocr', 'embedding', 'index', 'outline')),
       priority INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'paused', 'completed', 'cancelled', 'failed')),
       progress INTEGER NOT NULL DEFAULT 0,
@@ -69,7 +69,31 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
       error_message TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
-    );
+    );`;
+  database.exec(createTable);
+  const schema = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'background_jobs'").get() as { sql: string };
+  if (!schema.sql.includes("'outline'")) {
+    database.exec("BEGIN");
+    try {
+      database.exec("ALTER TABLE background_jobs RENAME TO background_jobs_legacy;");
+      database.exec(createTable);
+      database.exec(`
+        INSERT INTO background_jobs (
+          id, book_id, kind, priority, status, progress, total, checkpoint,
+          attempts, error_message, created_at, updated_at
+        )
+        SELECT id, book_id, kind, priority, status, progress, total, checkpoint,
+          attempts, error_message, created_at, updated_at
+        FROM background_jobs_legacy;
+        DROP TABLE background_jobs_legacy;
+      `);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  database.exec(`
     CREATE INDEX IF NOT EXISTS background_jobs_schedule ON background_jobs(status, priority DESC, created_at ASC);
     CREATE INDEX IF NOT EXISTS background_jobs_book ON background_jobs(book_id, updated_at DESC);
   `);

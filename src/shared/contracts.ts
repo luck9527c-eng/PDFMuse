@@ -307,7 +307,14 @@ export type OcrPageResult =
   | { ok: true; page: RecognizedPageText }
   | { ok: false; code: "VALIDATION_ERROR" | "UNAVAILABLE" | "FAILED" | "CANCELLED"; message: string };
 
-export type BackgroundJobKind = "ocr" | "embedding" | "index";
+export type BookOutlineNode = {
+  id: string;
+  label: string;
+  page?: number;
+  children: BookOutlineNode[];
+};
+
+export type BackgroundJobKind = "ocr" | "embedding" | "index" | "outline";
 export type BackgroundJobStatus = "queued" | "running" | "paused" | "completed" | "cancelled" | "failed";
 export type BackgroundJob = {
   id: string;
@@ -431,6 +438,7 @@ export interface PDFMuseApi {
   getBookConversation(bookId: string): Promise<ConversationMessage[]>;
   recognizePage(input: OcrPageRequest): Promise<OcrPageResult>;
   getRecognizedPage(bookId: string, page: number): Promise<RecognizedPageText | undefined>;
+  getBookOutline(bookId: string): Promise<BookOutlineNode[] | undefined>;
   listBackgroundJobs(bookId?: string): Promise<BackgroundJob[]>;
   scheduleBackgroundJob(input: ScheduleBackgroundJobInput): Promise<BackgroundJobMutationResult>;
   pauseBackgroundJob(jobId: string): Promise<BackgroundJobMutationResult>;

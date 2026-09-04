@@ -15,6 +15,7 @@ import { createToolRegistry } from "./agent/tool-registry.js";
 import { createMemoryModule } from "./agent/memory.js";
 import { createOcrModule } from "./ocr.js";
 import { createBackgroundJobModule } from "./background-jobs.js";
+import { createBookOutlineModule } from "./book-outline.js";
 import { createReaderProfileModule } from "./reader-profile.js";
 import type {
   AgentStreamEvent,
@@ -35,6 +36,7 @@ let closeBookIndex: (() => void) | undefined;
 let closeMemory: (() => void) | undefined;
 let closeOcr: (() => void) | undefined;
 let closeBackgroundJobs: (() => void) | undefined;
+let closeBookOutline: (() => void) | undefined;
 
 function broadcastAgentEvent(event: AgentStreamEvent) {
   for (const window of BrowserWindow.getAllWindows()) {
@@ -103,6 +105,8 @@ app.whenReady().then(async () => {
     closeMemory = memory.close;
     const ocr = createOcrModule(startupPreflight.dataHome);
     closeOcr = ocr.close;
+    const bookOutline = createBookOutlineModule(startupPreflight.dataHome);
+    closeBookOutline = bookOutline.close;
     const backgroundJobs = createBackgroundJobModule(startupPreflight.dataHome, {
       index: async (job, context) => {
         const result = await bookIndex.ensureIndexed(
@@ -125,6 +129,16 @@ app.whenReady().then(async () => {
       },
       ocr: async () => {
         throw new Error("OCR 工作进程资源尚未安装，暂时只能识别当前页。");
+      },
+      outline: async (job, context) => {
+        const result = await bookOutline.rebuild(
+          job.bookId,
+          () => bookIndex.loadBookByBookId(job.bookId),
+          context.signal,
+          (progress, total) => context.checkpoint(`page:${progress}`, progress, total),
+        );
+        context.checkpoint(`page:${result.processedPages}`, result.processedPages, result.totalPages);
+        if (context.signal.aborted) throw new Error("目录补全任务已暂停或取消。");
       },
     });
     closeBackgroundJobs = backgroundJobs.close;
@@ -218,9 +232,23 @@ app.whenReady().then(async () => {
       if (!input || typeof input !== "object") return { ok: false, code: "VALIDATION_ERROR", message: "OCR 页面请求无效。" };
       const value = input as { bookId?: unknown };
       if (!isOwnedBook(value.bookId)) return { ok: false, code: "VALIDATION_ERROR", message: "当前 PDF 书籍不可用。" };
-      return ocr.recognizePage(input as Parameters<typeof ocr.recognizePage>[0]);
+      const result = await ocr.recognizePage(input as Parameters<typeof ocr.recognizePage>[0]);
+      if (result.ok) {
+        bookOutline.invalidate(result.page.bookId, result.page.page);
+        const book = library.list().find((item) => item.id === result.page.bookId);
+        backgroundJobs.schedule({
+          bookId: result.page.bookId,
+          kind: "outline",
+          priority: 20,
+          total: book?.pageCount ?? 0,
+        });
+      }
+      return result;
     });
     const isOwnedBook = (bookId: unknown): bookId is string => typeof bookId === "string" && library.list().some((book) => book.id === bookId);
+    ipcMain.handle("outline:get", (_event, bookId: unknown) => (
+      isOwnedBook(bookId) ? bookOutline.get(bookId) : undefined
+    ));
     const invalidBackgroundJob = (): BackgroundJobMutationResult => ({
       ok: false,
       code: "NOT_FOUND",
@@ -288,6 +316,8 @@ app.whenReady().then(async () => {
 app.once("before-quit", () => {
   closeBackgroundJobs?.();
   closeBackgroundJobs = undefined;
+  closeBookOutline?.();
+  closeBookOutline = undefined;
   closeLibrary?.();
   closeLibrary = undefined;
   closeAgentHost?.();

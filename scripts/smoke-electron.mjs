@@ -399,19 +399,22 @@ try {
       let jobs = [];
       while (Date.now() < deadline) {
         jobs = await window.pdfMuse.listBackgroundJobs(book.id);
-        if (jobs.some((job) => job.kind === 'index')) break;
+        if (jobs.some((job) => job.kind === 'index') && jobs.some((job) => job.kind === 'outline')) break;
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
       const unknownBookId = 'f'.repeat(64);
       return {
         jobs,
         unknownJobs: await window.pdfMuse.listBackgroundJobs(unknownBookId),
+        unknownOutline: (await window.pdfMuse.getBookOutline(unknownBookId)) ?? null,
         unknownSchedule: await window.pdfMuse.scheduleBackgroundJob({ bookId: unknownBookId, kind: 'index' }),
       };
     })()`,
   );
   assert.equal(backgroundState.jobs.some((job) => job.kind === "index"), true, "opening a book did not schedule its background index");
+  assert.equal(backgroundState.jobs.some((job) => job.kind === "outline"), true, "opening a book did not schedule outline recovery");
   assert.deepEqual(backgroundState.unknownJobs, [], "background jobs leaked across the Library boundary");
+  assert.equal(backgroundState.unknownOutline, null, "a generated outline leaked across the Library boundary");
   assert.equal(backgroundState.unknownSchedule.ok, false, "an unknown book could schedule a background job");
   const readerControls = await evaluate(
     page.webSocketDebuggerUrl,

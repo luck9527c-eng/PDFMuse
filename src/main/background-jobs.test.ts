@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createBackgroundJobModule, type BackgroundJobModule, type JobExecutor } from "./background-jobs.js";
@@ -124,5 +125,30 @@ describe("background jobs", () => {
       status: "failed",
       errorMessage: "当前任务类型尚未配置执行器。",
     });
+  });
+
+  it("migrates the existing task table before scheduling outline recovery", async () => {
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    database.exec(`
+      CREATE TABLE background_jobs (
+        id TEXT PRIMARY KEY,
+        book_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('ocr', 'embedding', 'index')),
+        priority INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        progress INTEGER NOT NULL DEFAULT 0,
+        total INTEGER NOT NULL DEFAULT 0,
+        checkpoint TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    database.close();
+    module = createBackgroundJobModule(dataHome, { outline: async () => undefined });
+    const scheduled = module.schedule({ bookId: BOOK_A, kind: "outline" });
+    expect(scheduled.ok).toBe(true);
+    await waitFor(() => module?.list(BOOK_A)[0]?.status === "completed");
   });
 });

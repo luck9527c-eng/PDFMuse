@@ -72,6 +72,7 @@ const BACKGROUND_JOB_KIND_LABELS: Record<BackgroundJob["kind"], string> = {
   ocr: "文字识别",
   embedding: "语义索引",
   index: "全文索引",
+  outline: "目录补全",
 };
 
 const BACKGROUND_JOB_STATUS_LABELS: Record<BackgroundJob["status"], string> = {
@@ -143,7 +144,7 @@ function OutlineTree({
   );
 }
 
-function OutlinePanel({ nodes, page, onGoToPage }: { nodes: OutlineNode[]; page: number; onGoToPage(page: number): void }) {
+function OutlinePanel({ nodes, page, emptyMessage, onGoToPage }: { nodes: OutlineNode[]; page: number; emptyMessage: string; onGoToPage(page: number): void }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const activeId = useMemo(() => {
@@ -165,6 +166,8 @@ function OutlinePanel({ nodes, page, onGoToPage }: { nodes: OutlineNode[]; page:
       rootRef.current?.querySelector(`[data-outline-id="${activeId}"]`)?.scrollIntoView({ block: "nearest" });
     });
   }, [activeId, nodes]);
+
+  if (nodes.length === 0) return <p className="outline-empty">{emptyMessage}</p>;
 
   return (
     <div className="outline-panel" ref={rootRef}>
@@ -432,6 +435,7 @@ export function App() {
   const [ocrLoading, setOcrLoading] = useState(false);
   const [ocrNotice, setOcrNotice] = useState("");
   const [backgroundJobs, setBackgroundJobs] = useState<BackgroundJob[]>([]);
+  const [generatedOutline, setGeneratedOutline] = useState<OutlineNode[]>();
   const [memoryAudit, setMemoryAudit] = useState<MemoryAuditEntry[]>([]);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval>();
   const [streamingReply, setStreamingReply] = useState<StreamingReply>();
@@ -493,7 +497,12 @@ export function App() {
   const refreshBackgroundJobs = useCallback(async (bookId: string) => {
     if (!window.pdfMuse) return;
     try {
-      setBackgroundJobs(await window.pdfMuse.listBackgroundJobs(bookId));
+      const [jobs, outline] = await Promise.all([
+        window.pdfMuse.listBackgroundJobs(bookId),
+        window.pdfMuse.getBookOutline(bookId),
+      ]);
+      setBackgroundJobs(jobs);
+      setGeneratedOutline(outline);
     } catch {
       setBackgroundJobs([]);
     }
@@ -507,6 +516,7 @@ export function App() {
     setRecognizedPage(undefined);
     setOcrNotice("");
     setBackgroundJobs([]);
+    setGeneratedOutline(undefined);
     setPendingApproval(undefined);
     setStreamingReply(undefined);
     setToolStatus(undefined);
@@ -581,6 +591,7 @@ export function App() {
     if (pdfMuseApi) {
       void (async () => {
         await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "index", priority: 10, total: openedBook.pageCount });
+        await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "outline", priority: 5, total: openedBook.pageCount });
         const embedding = await pdfMuseApi.getEmbeddingConnection();
         if (embedding.baseUrl && embedding.model) {
           await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "embedding", priority: 0, total: openedBook.pageCount });
@@ -627,6 +638,16 @@ export function App() {
     await method(visibleBackgroundJob.id);
     await refreshBackgroundJobs(book.id);
   }, [book, refreshBackgroundJobs, visibleBackgroundJob]);
+
+  const effectiveOutline = viewerState.outline.length > 0 ? viewerState.outline : generatedOutline ?? [];
+  const outlineJob = backgroundJobs.find((job) => job.kind === "outline");
+  const outlineEmptyMessage = outlineJob?.status === "running" || outlineJob?.status === "queued"
+    ? "正在分析章节结构..."
+    : outlineJob?.status === "paused"
+      ? "目录补全已暂停。"
+      : outlineJob?.status === "failed"
+        ? "暂时无法补全目录，请稍后重试。"
+        : "未检测到可用章节，可使用缩略图浏览。";
 
   const handleOpenResult = useCallback((result: OpenPdfBookResult, attemptedBookId?: string) => {
     if (result.ok) {
@@ -1134,7 +1155,7 @@ export function App() {
               </div>
               <div className="sidebar-tabs"><button className={sidebarView === "outline" ? "active" : ""} onClick={() => setSidebarView("outline")}>目录</button><button className={sidebarView === "thumbnails" ? "active" : ""} onClick={() => setSidebarView("thumbnails")}>缩略图</button></div>
               {sidebarView === "outline" ? (
-                <OutlinePanel nodes={viewerState.outline} page={viewerState.page} onGoToPage={(page) => viewerRef.current?.goToPage(page)} />
+                <OutlinePanel nodes={effectiveOutline} page={viewerState.page} emptyMessage={outlineEmptyMessage} onGoToPage={(page) => viewerRef.current?.goToPage(page)} />
               ) : (
                 <div className="thumbnail-list">
                   {Array.from({ length: viewerState.pages }, (_, index) => index + 1).map((page) => (
