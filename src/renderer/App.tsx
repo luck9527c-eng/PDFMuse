@@ -117,7 +117,7 @@ function OutlineTree({
   onGoToPage(page: number): void;
 }) {
   if (nodes.length === 0) {
-    return <p className="outline-empty">此 PDF 书籍没有内置目录。后续 OCR 阶段将补全章节。</p>;
+    return <p className="outline-empty">未检测到可用章节。</p>;
   }
 
   return (
@@ -448,6 +448,7 @@ export function App() {
   const draftRef = useRef(draft);
   const passageRef = useRef(attachedPassage);
   const attachmentsRef = useRef(attachments);
+  const activeBookIdRef = useRef<string | undefined>(undefined);
   draftRef.current = draft;
   passageRef.current = attachedPassage;
   attachmentsRef.current = attachments;
@@ -501,6 +502,7 @@ export function App() {
         window.pdfMuse.listBackgroundJobs(bookId),
         window.pdfMuse.getBookOutline(bookId),
       ]);
+      if (activeBookIdRef.current !== bookId) return;
       setBackgroundJobs(jobs);
       setGeneratedOutline(outline);
     } catch {
@@ -564,6 +566,7 @@ export function App() {
   }, [book]);
 
   const activateBook = useCallback((openedBook: OpenedPdfBook) => {
+    activeBookIdRef.current = openedBook.id;
     stateWriterRef.current?.flush();
     readingStateRef.current = openedBook.readingState;
     leftOpenRef.current = openedBook.readingState.leftSidebarOpen;
@@ -798,6 +801,7 @@ export function App() {
   }, [book, ocrLoading, viewerState.page]);
 
   const showLibrary = useCallback(() => {
+    activeBookIdRef.current = undefined;
     stateWriterRef.current?.flush();
     setBook(undefined);
     setViewerError("");

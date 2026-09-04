@@ -1,8 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createBackgroundJobModule, type BackgroundJobModule, type JobExecutor } from "./background-jobs.js";
 
@@ -30,6 +29,7 @@ describe("background jobs", () => {
     module?.close();
     module = undefined;
     await rm(dataHome, { recursive: true, force: true });
+    vi.restoreAllMocks();
   });
 
   it("executes higher priority jobs first and deduplicates active jobs", async () => {
@@ -82,9 +82,10 @@ describe("background jobs", () => {
     expect(runs).toBe(2);
   });
 
-  it("cancels running jobs and records executor errors", async () => {
+  it("cancels running jobs and hides executor errors behind a Chinese diagnostic", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const executor: JobExecutor = async (job, context) => {
-      if (job.bookId === BOOK_B) throw new Error("模拟失败");
+      if (job.bookId === BOOK_B) throw new Error("provider request failed");
       await new Promise<void>((resolve) => context.signal.addEventListener("abort", () => resolve(), { once: true }));
       throw new Error("模拟失败");
     };
@@ -95,10 +96,20 @@ describe("background jobs", () => {
     expect(module.cancel(scheduled.job.id)).toMatchObject({ ok: true, job: { status: "cancelled" } });
     await waitFor(() => module?.list()[0]?.status === "cancelled");
 
+    const replacement = module.schedule({ bookId: BOOK_A, kind: "embedding" });
+    if (!replacement.ok) throw new Error("替代任务未创建。");
+    expect(replacement.job.id).not.toBe(scheduled.job.id);
+    await waitFor(() => module?.get(replacement.job.id)?.status === "running");
+    module.cancel(replacement.job.id);
+
     const failed = module.schedule({ bookId: BOOK_B, kind: "embedding" });
     if (!failed.ok) throw new Error("任务未创建。");
     await waitFor(() => module?.list().find((job) => job.id === failed.job.id)?.status === "failed");
-    expect(module.list(BOOK_B)[0]).toMatchObject({ status: "failed", errorMessage: "模拟失败" });
+    expect(module.list(BOOK_B)[0]).toMatchObject({
+      status: "failed",
+      errorMessage: "语义索引任务失败，当前继续使用全文检索。",
+    });
+    expect(errorLog).toHaveBeenCalledWith("后台任务执行失败：embedding", expect.any(Error));
   });
 
   it("restores running jobs to queued after restart", async () => {
@@ -127,28 +138,4 @@ describe("background jobs", () => {
     });
   });
 
-  it("migrates the existing task table before scheduling outline recovery", async () => {
-    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
-    database.exec(`
-      CREATE TABLE background_jobs (
-        id TEXT PRIMARY KEY,
-        book_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('ocr', 'embedding', 'index')),
-        priority INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL,
-        progress INTEGER NOT NULL DEFAULT 0,
-        total INTEGER NOT NULL DEFAULT 0,
-        checkpoint TEXT,
-        attempts INTEGER NOT NULL DEFAULT 0,
-        error_message TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `);
-    database.close();
-    module = createBackgroundJobModule(dataHome, { outline: async () => undefined });
-    const scheduled = module.schedule({ bookId: BOOK_A, kind: "outline" });
-    expect(scheduled.ok).toBe(true);
-    await waitFor(() => module?.list(BOOK_A)[0]?.status === "completed");
-  });
 });

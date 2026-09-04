@@ -14,17 +14,12 @@ import {
 } from "pdfjs-dist/web/pdf_viewer.mjs";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
-import type { OpenedPdfBook, ReadingZoomMode, RecognizedPageText, SelectedPassage } from "../../shared/contracts";
+import type { BookOutlineNode, OpenedPdfBook, ReadingZoomMode, RecognizedPageText, SelectedPassage } from "../../shared/contracts";
 import { normalizePageRects } from "./selection-geometry";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
-export type OutlineNode = {
-  id: string;
-  label: string;
-  page?: number;
-  children: OutlineNode[];
-};
+export type OutlineNode = BookOutlineNode;
 
 export type ViewerState = {
   page: number;

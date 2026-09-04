@@ -235,6 +235,10 @@ app.whenReady().then(async () => {
       const result = await ocr.recognizePage(input as Parameters<typeof ocr.recognizePage>[0]);
       if (result.ok) {
         bookOutline.invalidate(result.page.bookId, result.page.page);
+        const activeOutline = backgroundJobs.list(result.page.bookId).find((job) => (
+          job.kind === "outline" && (job.status === "queued" || job.status === "running" || job.status === "paused")
+        ));
+        if (activeOutline) backgroundJobs.cancel(activeOutline.id);
         const book = library.list().find((item) => item.id === result.page.bookId);
         backgroundJobs.schedule({
           bookId: result.page.bookId,

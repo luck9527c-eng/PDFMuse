@@ -14,6 +14,7 @@ import { createOcrModule, type OcrEngine } from "./ocr.js";
 
 const BOOK_ID = "a".repeat(64);
 const NAVIGATION_FIXTURE = path.resolve(import.meta.dirname, "fixtures/navigation.pdf");
+const NO_OUTLINE_FIXTURE = path.resolve(import.meta.dirname, "fixtures/three-page.pdf");
 
 function documentSource(
   pages: OutlineTextLine[][],
@@ -141,5 +142,14 @@ describe("book outline", () => {
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes }));
     expect(result.status).toBe("embedded");
     expect(outline.get(BOOK_ID)).toBeUndefined();
+  });
+
+  it("does not turn a repeated page header into a generated outline", async () => {
+    const outline = createBookOutlineModule(dataHome);
+    closeOutline = outline.close;
+    const bytes = new Uint8Array(await readFile(NO_OUTLINE_FIXTURE));
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes }));
+    expect(result).toMatchObject({ status: "generated", nodes: [] });
+    expect(outline.get(BOOK_ID)).toEqual([]);
   });
 });

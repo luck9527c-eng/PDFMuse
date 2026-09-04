@@ -12,6 +12,12 @@ import type {
 
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
 const KINDS: BackgroundJobKind[] = ["ocr", "embedding", "index", "outline"];
+const FAILURE_MESSAGES: Record<BackgroundJobKind, string> = {
+  ocr: "文字识别任务失败，请稍后重试。",
+  embedding: "语义索引任务失败，当前继续使用全文检索。",
+  index: "全文索引任务失败，请稍后重试。",
+  outline: "目录生成任务失败，请稍后重试。",
+};
 type JobRow = {
   id: string;
   book_id: string;
@@ -114,6 +120,21 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
     database.prepare(`UPDATE background_jobs SET ${fields}, updated_at = ? WHERE id = ?`).run(...values, now(), id);
   }
 
+  function settleRequestedAction(id: string) {
+    const requested = active.get(id)?.action;
+    const latest = rowFor(id);
+    if (latest?.status === "queued") return true;
+    if (requested === "pause") {
+      update(id, "status = ?", ["paused"]);
+      return true;
+    }
+    if (requested === "cancel") {
+      update(id, "status = ?", ["cancelled"]);
+      return true;
+    }
+    return false;
+  }
+
   function pump() {
     if (pumping || closed) return;
     pumping = true;
@@ -145,24 +166,13 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
                 update(row.id, "progress = ?, total = ?, checkpoint = ?", [boundedProgress, total, value ?? null]);
               },
             });
-            if (!closed) {
-              const requested = active.get(row.id)?.action;
-              const latest = rowFor(row.id);
-              if (latest?.status === "queued") {
-                // A resume may have been requested while an abort was settling.
-              } else if (requested === "pause") update(row.id, "status = ?", ["paused"]);
-              else if (requested === "cancel") update(row.id, "status = ?", ["cancelled"]);
-              else update(row.id, "status = ?, progress = total, error_message = NULL", ["completed"]);
+            if (!closed && !settleRequestedAction(row.id)) {
+              update(row.id, "status = ?, progress = total, error_message = NULL", ["completed"]);
             }
           } catch (error) {
-            if (!closed) {
-              const requested = active.get(row.id)?.action;
-              const latest = rowFor(row.id);
-              if (latest?.status === "queued") {
-                // A resume may have been requested while an abort was settling.
-              } else if (requested === "pause") update(row.id, "status = ?", ["paused"]);
-              else if (requested === "cancel") update(row.id, "status = ?", ["cancelled"]);
-              else update(row.id, "status = ?, error_message = ?", ["failed", error instanceof Error ? error.message : "后台任务失败。"]);
+            if (!closed && !settleRequestedAction(row.id)) {
+              console.error(`后台任务执行失败：${row.kind}`, error);
+              update(row.id, "status = ?, error_message = ?", ["failed", FAILURE_MESSAGES[row.kind]]);
             }
           } finally {
             active.delete(row.id);
