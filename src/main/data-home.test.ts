@@ -1,9 +1,10 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { preflightDataHome } from "./data-home.js";
+import { hashOcrResource, hasOcrResources, preflightDataHome } from "./data-home.js";
+import { OCR_ENGINE, OCR_ENGINE_VERSION, OCR_MODEL } from "../shared/ocr-config.js";
 
 const workspaces: string[] = [];
 
@@ -18,6 +19,42 @@ afterEach(async () => {
 });
 
 describe("preflightDataHome", () => {
+  it("递归校验 OCR 资源目录并拒绝哈希变化", async () => {
+    const applicationDirectory = await createWorkspace();
+    const resources = path.join(applicationDirectory, "resources");
+    const runtime = path.join(resources, "ocr-runtime");
+    const worker = path.join(resources, "ocr-worker", "rapidocr_worker.py");
+    await mkdir(path.dirname(worker), { recursive: true });
+    await mkdir(path.join(runtime, "Lib", "site-packages"), { recursive: true });
+    await Promise.all([
+      writeFile(path.join(runtime, process.platform === "win32" ? "python.exe" : "python"), "runtime"),
+      writeFile(path.join(runtime, "Lib", "site-packages", "model.onnx"), "model"),
+      writeFile(worker, "worker"),
+    ]);
+    const paths = ["ocr-runtime", "ocr-worker/rapidocr_worker.py"];
+    const files = await Promise.all(paths.map(async (resourcePath) => ({
+      path: resourcePath,
+      sha256: await hashOcrResource(path.join(resources, resourcePath)),
+    })));
+    const manifest = {
+      schemaVersion: 1,
+      engine: OCR_ENGINE,
+      engineVersion: OCR_ENGINE_VERSION,
+      model: OCR_MODEL,
+      files,
+    };
+    await writeFile(path.join(resources, "ocr-manifest.json"), JSON.stringify(manifest));
+
+    await expect(hasOcrResources(applicationDirectory)).resolves.toBe(true);
+    await writeFile(path.join(runtime, "python.exe"), "signed-runtime");
+    await expect(hasOcrResources(applicationDirectory)).resolves.toBe(false);
+    await writeFile(path.join(resources, "ocr-manifest.json"), JSON.stringify({ ...manifest, files: [] }));
+    await expect(hasOcrResources(applicationDirectory)).resolves.toBe(false);
+    await writeFile(path.join(resources, "ocr-manifest.json"), JSON.stringify(manifest));
+    await writeFile(path.join(runtime, "Lib", "site-packages", "model.onnx"), "changed");
+    await expect(hasOcrResources(applicationDirectory)).resolves.toBe(false);
+  });
+
   it("creates the complete portable data root beside the application", async () => {
     const applicationDirectory = await createWorkspace();
 

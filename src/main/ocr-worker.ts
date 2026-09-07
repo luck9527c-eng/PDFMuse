@@ -4,7 +4,7 @@ import { parentPort } from "node:worker_threads";
 
 import type { OcrPageRequest, RecognizedPageText } from "../shared/contracts.js";
 
-export type OcrWorkerRequest = { id: string; input: OcrPageRequest } | { id: string; cancel: true };
+export type OcrWorkerRequest = { warmup: true } | { id: string; input: OcrPageRequest } | { id: string; cancel: true };
 export type OcrWorkerResponse =
   | { id: string; ok: true; result: Pick<RecognizedPageText, "width" | "height" | "orientation" | "lines"> }
   | { id: string; ok: false; message: string };
@@ -31,7 +31,16 @@ if (parentPort) {
   function startBridge() {
     if (child && !child.killed) return child;
     if (!command) throw new Error("OCR 工作进程资源尚未安装。");
-    const processHandle = spawn(command, commandArgs, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    const processHandle = spawn(command, commandArgs, {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: "utf-8",
+        PYTHONUTF8: "1",
+        PYTHONDONTWRITEBYTECODE: "1",
+      },
+    });
     child = processHandle;
     const lines = createInterface({ input: processHandle.stdout });
     lines.on("line", (line) => {
@@ -58,6 +67,10 @@ if (parentPort) {
   }
 
   port.on("message", (message: OcrWorkerRequest) => {
+    if ("warmup" in message) {
+      try { startBridge(); } catch { /* Startup preflight reports unavailable resources. */ }
+      return;
+    }
     if ("cancel" in message) {
       pending.delete(message.id);
       stopBridge();

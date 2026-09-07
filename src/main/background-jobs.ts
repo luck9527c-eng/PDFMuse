@@ -126,6 +126,7 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
 
   const active = new Map<string, {
     bookId: string;
+    priority: number;
     controller: AbortController;
     settled: Promise<void>;
     resolveSettled(): void;
@@ -180,7 +181,7 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
           const controller = new AbortController();
           let resolveSettled: () => void = () => undefined;
           const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
-          active.set(row.id, { bookId: row.book_id, controller, settled, resolveSettled });
+          active.set(row.id, { bookId: row.book_id, priority: row.priority, controller, settled, resolveSettled });
           const claimId = randomUUID();
           update(row.id, "status = ?, attempts = attempts + 1, claim_id = ?, error_message = NULL", ["running", claimId]);
           const running = toJob(rowFor(row.id)!);
@@ -233,7 +234,7 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
       const total = Number.isSafeInteger(input.total) && input.total! >= 0 ? input.total! : 0;
       const maxAttempts = Number.isSafeInteger(input.maxAttempts) ? Math.max(1, Math.min(5, input.maxAttempts!)) : 3;
       const inputVersion = typeof input.inputVersion === "string" && input.inputVersion.length <= 256 ? input.inputVersion : undefined;
-      const startPage = Number.isSafeInteger(input.startPage) && input.startPage! > 1 ? input.startPage! : undefined;
+      const startPage = Number.isSafeInteger(input.startPage) && input.startPage! > 0 ? input.startPage! : undefined;
       const existing = database.prepare(`
         SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, claim_id, error_message, created_at, updated_at
         FROM background_jobs WHERE book_id = ? AND kind = ? AND status IN ('queued', 'running', 'paused')
@@ -250,7 +251,16 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
       database.prepare(`
         INSERT INTO background_jobs (id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, created_at, updated_at)
         VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?)
-      `).run(id, input.bookId, input.kind, priority, startPage ? startPage - 1 : 0, total, startPage ? `page:${startPage - 1}` : null, maxAttempts, inputVersion ?? null, timestamp, timestamp);
+      `).run(id, input.bookId, input.kind, priority, 0, total, startPage ? `start:${startPage}` : null, maxAttempts, inputVersion ?? null, timestamp, timestamp);
+      // Reader-triggered OCR is interactive; it may pause a lower-priority batch job.
+      if (input.kind === "ocr" && priority > 0) {
+        for (const [activeId, state] of active) {
+          if (state.priority >= priority) continue;
+          state.action = "pause";
+          update(activeId, "status = ?", ["paused"]);
+          state.controller.abort();
+        }
+      }
       pump();
       return { ok: true, job: toJob(rowFor(id)!) };
     },

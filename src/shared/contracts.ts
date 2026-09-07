@@ -306,6 +306,7 @@ export type RecognizedPageText = {
   engine: string;
   model: string;
   inputHash: string;
+  inputVersion?: string;
   engineVersion: string;
   createdAt: string;
 };

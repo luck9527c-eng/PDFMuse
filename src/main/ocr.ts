@@ -9,6 +9,7 @@ export type OcrEngine = {
   name: string;
   model: string;
   version?: string;
+  inputVersion?: string;
   recognize(input: OcrPageRequest, signal?: AbortSignal): Promise<Pick<RecognizedPageText, "width" | "height" | "orientation" | "lines">>;
   close?(): void;
 };
@@ -29,6 +30,7 @@ export type WorkerOcrOptions = {
   args?: string[];
   modelDir?: string;
   model?: string;
+  inputVersion?: string;
   engineVersion?: string;
 };
 
@@ -56,9 +58,11 @@ export function createWorkerOcrEngine(options: WorkerOcrOptions = {}): OcrEngine
     for (const request of pending.values()) request.reject(error instanceof Error ? error : new Error(String(error)));
     pending.clear();
   });
+  worker.postMessage({ warmup: true });
   return {
     name: "OCR Worker",
     model: options.model ?? "待安装",
+    inputVersion: options.inputVersion,
     version: options.engineVersion ?? "unknown",
     recognize(input, signal) {
       return new Promise((resolve, reject) => {
@@ -92,6 +96,7 @@ function unavailableEngine(): OcrEngine {
 
 export function createOcrModule(dataHome: string, engine: OcrEngine = createWorkerOcrEngine()) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+  const activeRecognitions = new Map<string, Promise<OcrPageResult>>();
   database.exec(`
     CREATE TABLE IF NOT EXISTS recognized_pages (
       book_id TEXT NOT NULL,
@@ -104,6 +109,7 @@ export function createOcrModule(dataHome: string, engine: OcrEngine = createWork
       model TEXT NOT NULL,
       input_hash TEXT NOT NULL DEFAULT '',
       engine_version TEXT NOT NULL DEFAULT 'unknown',
+      input_version TEXT NOT NULL DEFAULT 'unknown',
       created_at TEXT NOT NULL,
       PRIMARY KEY (book_id, page)
     );
@@ -111,14 +117,15 @@ export function createOcrModule(dataHome: string, engine: OcrEngine = createWork
   const columns = database.prepare("PRAGMA table_info(recognized_pages)").all() as Array<{ name: string }>;
   if (!columns.some((column) => column.name === "input_hash")) database.exec("ALTER TABLE recognized_pages ADD COLUMN input_hash TEXT NOT NULL DEFAULT ''");
   if (!columns.some((column) => column.name === "engine_version")) database.exec("ALTER TABLE recognized_pages ADD COLUMN engine_version TEXT NOT NULL DEFAULT 'unknown'");
+  if (!columns.some((column) => column.name === "input_version")) database.exec("ALTER TABLE recognized_pages ADD COLUMN input_version TEXT NOT NULL DEFAULT 'unknown'");
 
   function read(bookId: string, page: number): RecognizedPageText | undefined {
     const row = database.prepare(`
-      SELECT book_id, page, width, height, orientation, lines_json, engine, model, input_hash, engine_version, created_at
+      SELECT book_id, page, width, height, orientation, lines_json, engine, model, input_hash, input_version, engine_version, created_at
       FROM recognized_pages WHERE book_id = ? AND page = ?
     `).get(bookId, page) as {
       book_id: string; page: number; width: number; height: number; orientation: number;
-      lines_json: string; engine: string; model: string; input_hash: string; engine_version: string; created_at: string;
+      lines_json: string; engine: string; model: string; input_hash: string; input_version: string; engine_version: string; created_at: string;
     } | undefined;
     if (!row) return undefined;
     try {
@@ -132,6 +139,7 @@ export function createOcrModule(dataHome: string, engine: OcrEngine = createWork
         engine: row.engine,
         model: row.model,
         inputHash: row.input_hash,
+        inputVersion: row.input_version,
         engineVersion: row.engine_version,
         createdAt: row.created_at,
       };
@@ -144,43 +152,65 @@ export function createOcrModule(dataHome: string, engine: OcrEngine = createWork
     async recognizePage(input: OcrPageRequest, signal?: AbortSignal): Promise<OcrPageResult> {
       if (!validRequest(input)) return { ok: false, code: "VALIDATION_ERROR", message: "OCR 页面请求无效。" };
       if (signal?.aborted) return { ok: false, code: "CANCELLED", message: "OCR 已取消。" };
-      try {
-        const recognized = await engine.recognize(input, signal);
-        if (signal?.aborted) return { ok: false, code: "CANCELLED", message: "OCR 已取消。" };
-        const page: RecognizedPageText = {
-          bookId: input.bookId,
-          page: input.page,
-          width: recognized.width,
-          height: recognized.height,
-          orientation: recognized.orientation,
-          lines: recognized.lines,
-          engine: engine.name,
-          model: engine.model,
-          inputHash: createHash("sha256").update(input.imageData).digest("hex"),
-          engineVersion: engine.version ?? "unknown",
-          createdAt: new Date().toISOString(),
-        };
-        database.prepare(`
-          INSERT INTO recognized_pages (book_id, page, width, height, orientation, lines_json, engine, model, input_hash, engine_version, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(book_id, page) DO UPDATE SET
-            width = excluded.width, height = excluded.height, orientation = excluded.orientation,
-            lines_json = excluded.lines_json, engine = excluded.engine, model = excluded.model, created_at = excluded.created_at
-            , input_hash = excluded.input_hash, engine_version = excluded.engine_version
-        `).run(page.bookId, page.page, page.width, page.height, page.orientation, JSON.stringify(page.lines), page.engine, page.model, page.inputHash, page.engineVersion, page.createdAt);
-        return { ok: true, page };
-      } catch (error) {
-        if (signal?.aborted) return { ok: false, code: "CANCELLED", message: "OCR 已取消。" };
-        return { ok: false, code: "UNAVAILABLE", message: error instanceof Error ? error.message : "OCR 工作进程不可用。" };
-      }
+      const key = `${input.bookId}:${input.page}`;
+      const active = activeRecognitions.get(key);
+      if (active) return active;
+      const run = (async (): Promise<OcrPageResult> => {
+        const inputHash = createHash("sha256").update(input.imageData).digest("hex");
+        const cached = read(input.bookId, input.page);
+        if (
+          cached
+          && cached.inputHash === inputHash
+          && cached.model === engine.model
+          && cached.engineVersion === (engine.version ?? "unknown")
+          && cached.inputVersion === (engine.inputVersion ?? "unknown")
+        ) return { ok: true, page: cached };
+        try {
+          const recognized = await engine.recognize(input, signal);
+          if (signal?.aborted) return { ok: false, code: "CANCELLED", message: "OCR 已取消。" };
+          const page: RecognizedPageText = {
+            bookId: input.bookId,
+            page: input.page,
+            width: recognized.width,
+            height: recognized.height,
+            orientation: recognized.orientation,
+            lines: recognized.lines,
+            engine: engine.name,
+            model: engine.model,
+            inputHash,
+            inputVersion: engine.inputVersion ?? "unknown",
+            engineVersion: engine.version ?? "unknown",
+            createdAt: new Date().toISOString(),
+          };
+          database.prepare(`
+            INSERT INTO recognized_pages (book_id, page, width, height, orientation, lines_json, engine, model, input_hash, input_version, engine_version, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(book_id, page) DO UPDATE SET
+              width = excluded.width, height = excluded.height, orientation = excluded.orientation,
+              lines_json = excluded.lines_json, engine = excluded.engine, model = excluded.model, created_at = excluded.created_at,
+              input_hash = excluded.input_hash, input_version = excluded.input_version, engine_version = excluded.engine_version
+          `).run(page.bookId, page.page, page.width, page.height, page.orientation, JSON.stringify(page.lines), page.engine, page.model, page.inputHash, page.inputVersion ?? "unknown", page.engineVersion, page.createdAt);
+          return { ok: true, page };
+        } catch (error) {
+          if (signal?.aborted) return { ok: false, code: "CANCELLED", message: "OCR 已取消。" };
+          return { ok: false, code: "UNAVAILABLE", message: error instanceof Error ? error.message : "OCR 工作进程不可用。" };
+        }
+      })().finally(() => activeRecognitions.delete(key));
+      activeRecognitions.set(key, run);
+      return run;
     },
     getPage(bookId: string, page: number) {
       if (!BOOK_ID_PATTERN.test(bookId) || !Number.isSafeInteger(page) || page <= 0) return undefined;
       return read(bookId, page);
     },
-    isPageCompatible(bookId: string, page: number, expectedEngine: string, expectedModel: string) {
+    isPageCompatible(bookId: string, page: number, expectedEngine: string, expectedModel: string, expectedInputVersion?: string) {
       const result = read(bookId, page);
-      return Boolean(result && result.engineVersion === expectedEngine && result.model === expectedModel);
+      return Boolean(
+        result
+        && result.engineVersion === expectedEngine
+        && result.model === expectedModel
+        && (!expectedInputVersion || result.inputVersion === expectedInputVersion),
+      );
     },
     close() {
       engine.close?.();

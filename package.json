@@ -12,10 +12,12 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "smoke:electron": "node scripts/smoke-electron.mjs",
+    "prepare:ocr": "node scripts/prepare-ocr-runtime.mjs",
+    "benchmark:ocr": "node scripts/benchmark-ocr.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
     "build": "npm run clean && npm run typecheck && vite build && tsc -p tsconfig.electron.json",
-    "package:portable": "npm run build && electron-builder --win portable",
-    "package:installer": "npm run build && electron-builder --win nsis"
+    "package:portable": "npm run prepare:ocr && npm run build && electron-builder --win portable",
+    "package:installer": "npm run prepare:ocr && npm run build && electron-builder --win nsis"
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.8",
@@ -61,7 +63,7 @@
     "extraResources": [
       {
         "from": "resources",
-        "to": "resources",
+        "to": ".",
         "filter": [
           "**/*"
         ]
@@ -72,6 +74,7 @@
         "portable",
         "nsis"
       ],
+      "signAndEditExecutable": false,
       "artifactName": "PDFMuse-${version}-portable.${ext}"
     }
   },

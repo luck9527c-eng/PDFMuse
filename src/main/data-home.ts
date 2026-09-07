@@ -1,10 +1,12 @@
-import { constants } from "node:fs";
+import { constants, createReadStream } from "node:fs";
 import { createHash } from "node:crypto";
 import {
   access,
   mkdir,
   readFile,
+  readdir,
   rename,
+  stat,
   statfs,
   unlink,
   writeFile,
@@ -17,6 +19,12 @@ import {
   writeAppConfig,
 } from "./config-store.js";
 import type { StartupPreflight } from "../shared/contracts.js";
+import {
+  OCR_ENGINE,
+  OCR_ENGINE_VERSION,
+  OCR_MODEL,
+  OCR_REQUIRED_RESOURCE_PATHS,
+} from "../shared/ocr-config.js";
 
 const MINIMUM_FREE_BYTES = 256 * 1024 * 1024;
 const DATA_DIRECTORIES = ["logs", "cache", "books"];
@@ -37,28 +45,75 @@ async function verifyWritable(directory: string) {
   await unlink(probePath);
 }
 
-async function hasOcrResources(applicationDirectory: string) {
-  const worker = path.join(applicationDirectory, "resources", "ocr-worker", "paddleocr_worker.py");
+async function collectResourceFiles(directory: string, relative = ""): Promise<string[]> {
+  const entries = await readdir(path.join(directory, relative), { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    const child = path.join(relative, entry.name);
+    if (entry.isDirectory()) files.push(...await collectResourceFiles(directory, child));
+    else if (entry.isFile()) files.push(child);
+    else throw new Error("OCR 资源包含不支持的文件类型。");
+  }
+  return files;
+}
+
+async function updateHashFromFile(hash: ReturnType<typeof createHash>, filePath: string) {
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+}
+
+export async function hashOcrResource(target: string) {
+  const info = await stat(target);
+  const hash = createHash("sha256");
+  if (info.isFile()) {
+    await updateHashFromFile(hash, target);
+    return hash.digest("hex");
+  }
+  if (!info.isDirectory()) throw new Error("OCR 资源类型无效。");
+  const files = (await collectResourceFiles(target)).sort((left, right) => left.localeCompare(right, "en"));
+  for (const file of files) {
+    if (path.basename(file) === ".gitkeep") continue;
+    hash.update(file.split(path.sep).join("/"));
+    hash.update("\0");
+    await updateHashFromFile(hash, path.join(target, file));
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+export async function hasOcrResources(applicationDirectory: string) {
+  const worker = path.join(applicationDirectory, "resources", "ocr-worker", "rapidocr_worker.py");
   const runtime = path.join(applicationDirectory, "resources", "ocr-runtime", process.platform === "win32" ? "python.exe" : "python");
-  const models = path.join(applicationDirectory, "resources", "ocr-models");
   const manifestPath = path.join(applicationDirectory, "resources", "ocr-manifest.json");
 
   try {
-    await Promise.all([access(worker, constants.R_OK), access(runtime, constants.X_OK), access(models, constants.R_OK)]);
-    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as { engine?: string; engineVersion?: string; model?: string; files?: Array<{ path?: string; sha256?: string }> };
-    if (manifest.engine !== "PaddleOCR" || manifest.model !== "PP-OCRv5" || !Array.isArray(manifest.files)) return false;
-    for (const entry of manifest.files) {
+    await Promise.all([access(worker, constants.R_OK), access(runtime, constants.X_OK)]);
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      schemaVersion?: number;
+      engine?: string;
+      engineVersion?: string;
+      model?: string;
+      files?: Array<{ path?: string; sha256?: string }>;
+    };
+    if (
+      manifest.schemaVersion !== 1
+      || manifest.engine !== OCR_ENGINE
+      || manifest.engineVersion !== OCR_ENGINE_VERSION
+      || manifest.model !== OCR_MODEL
+      || !Array.isArray(manifest.files)
+      || manifest.files.length !== OCR_REQUIRED_RESOURCE_PATHS.length
+    ) return false;
+    const entries = new Map(manifest.files.map((entry) => [entry.path, entry]));
+    if (entries.size !== OCR_REQUIRED_RESOURCE_PATHS.length) return false;
+    const resourcesRoot = path.resolve(applicationDirectory, "resources");
+    for (const resourcePath of OCR_REQUIRED_RESOURCE_PATHS) {
+      const entry = entries.get(resourcePath);
+      if (!entry) return false;
       if (!entry.path || !entry.sha256) return false;
-      const target = path.join(applicationDirectory, "resources", entry.path);
+      const target = path.resolve(resourcesRoot, entry.path);
+      const relative = path.relative(resourcesRoot, target);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return false;
       await access(target, constants.R_OK);
-      // File hashes are checked for files; model directories are existence-checked and hashed by the release pipeline.
-      try {
-        const bytes = await readFile(target);
-        const digest = createHash("sha256").update(bytes).digest("hex");
-        if (digest !== entry.sha256) return false;
-      } catch {
-        // Directories are validated by access above; the installer manifest owns their recursive hash.
-      }
+      if (await hashOcrResource(target) !== entry.sha256) return false;
     }
     return true;
   } catch {

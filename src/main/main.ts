@@ -16,6 +16,7 @@ import { createMemoryModule } from "./agent/memory.js";
 import { createOcrModule, createWorkerOcrEngine } from "./ocr.js";
 import { createBackgroundJobModule } from "./background-jobs.js";
 import { createBookOutlineModule } from "./book-outline.js";
+import { prioritizedPageOrder } from "./ocr-page-order.js";
 import { createReaderProfileModule } from "./reader-profile.js";
 import type {
   AgentStreamEvent,
@@ -28,6 +29,7 @@ import type {
   TestEmbeddingConnectionInput,
   TestModelConnectionInput,
 } from "../shared/contracts.js";
+import { OCR_ENGINE_VERSION, OCR_INPUT_VERSION, OCR_MODEL, OCR_RENDER_SCALE } from "../shared/ocr-config.js";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 let startupPreflight: StartupPreflight;
@@ -110,9 +112,10 @@ app.whenReady().then(async () => {
     closeMemory = memory.close;
     const ocr = createOcrModule(startupPreflight.dataHome, createWorkerOcrEngine({
       command: path.join(applicationDirectory(), "resources", "ocr-runtime", process.platform === "win32" ? "python.exe" : "python"),
-      args: [path.join(applicationDirectory(), "resources", "ocr-worker", "paddleocr_worker.py")],
-      model: "PP-OCRv5",
-      engineVersion: "3.7.0",
+      args: [path.join(applicationDirectory(), "resources", "ocr-worker", "rapidocr_worker.py")],
+      model: OCR_MODEL,
+      inputVersion: OCR_INPUT_VERSION,
+      engineVersion: OCR_ENGINE_VERSION,
     }));
     closeOcr = ocr.close;
     const bookOutline = createBookOutlineModule(startupPreflight.dataHome);
@@ -140,18 +143,29 @@ app.whenReady().then(async () => {
       ocr: async (job, context) => {
         const book = library.list().find((item) => item.id === job.bookId);
         if (!book) throw new Error("当前 PDF 书籍不可用。");
-        const checkpoint = job.checkpoint?.match(/^page:(\d+)$/);
-        const startPage = Math.max(1, Number(checkpoint?.[1] ?? 0) + 1);
-        for (let page = startPage; page <= book.pageCount; page += 1) {
+        const orderCheckpoint = job.checkpoint?.match(/^ocr-order:(\d+):(\d+)$/);
+        const initialFocus = job.checkpoint?.match(/^start:(\d+)$/);
+        const legacyCheckpoint = job.checkpoint?.match(/^page:(\d+)$/);
+        const focusPage = Number(orderCheckpoint?.[1] ?? initialFocus?.[1] ?? legacyCheckpoint?.[1] ?? 1);
+        const completed = Number(orderCheckpoint?.[2] ?? 0);
+        const pages = prioritizedPageOrder(book.pageCount, focusPage);
+        for (let index = completed; index < pages.length; index += 1) {
+          const page = pages[index]!;
           if (context.signal.aborted) throw new Error("OCR 任务已暂停或取消。");
-          if (!ocr.isPageCompatible(job.bookId, page, "3.7.0", "PP-OCRv5")) {
-            const image = await bookIndex.renderPageForOcr(job.bookId, page);
+          if (!ocr.isPageCompatible(job.bookId, page, OCR_ENGINE_VERSION, OCR_MODEL, OCR_INPUT_VERSION)) {
+            const image = await bookIndex.renderPageForOcr(job.bookId, page, OCR_RENDER_SCALE);
             const result = await ocr.recognizePage({ bookId: job.bookId, page, ...image }, context.signal);
             if (!result.ok) throw new Error(result.message);
             bookIndex.indexRecognizedPage(job.bookId, page, result.page.lines);
+            backgroundJobs.schedule({
+              bookId: job.bookId,
+              kind: "embedding",
+              priority: 5,
+              total: book.pageCount,
+            });
             bookOutline.invalidate(job.bookId, page);
           }
-          context.checkpoint(`page:${page}`, page, book.pageCount);
+          context.checkpoint(`ocr-order:${focusPage}:${index + 1}`, index + 1, book.pageCount);
         }
       },
       outline: async (job, context) => {
@@ -284,12 +298,18 @@ app.whenReady().then(async () => {
       if (!isOwnedBook(value.bookId)) return { ok: false, code: "VALIDATION_ERROR", message: "当前 PDF 书籍不可用。" };
       const result = await ocr.recognizePage(input as Parameters<typeof ocr.recognizePage>[0]);
       if (result.ok) {
+        const book = library.list().find((item) => item.id === result.page.bookId);
+        backgroundJobs.schedule({
+          bookId: result.page.bookId,
+          kind: "embedding",
+          priority: 5,
+          total: book?.pageCount ?? 0,
+        });
         bookOutline.invalidate(result.page.bookId, result.page.page);
         const activeOutline = backgroundJobs.list(result.page.bookId).find((job) => (
           job.kind === "outline" && (job.status === "queued" || job.status === "running" || job.status === "paused")
         ));
         if (activeOutline) backgroundJobs.cancel(activeOutline.id);
-        const book = library.list().find((item) => item.id === result.page.bookId);
         backgroundJobs.schedule({
           bookId: result.page.bookId,
           kind: "outline",

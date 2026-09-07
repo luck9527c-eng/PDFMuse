@@ -61,4 +61,26 @@ describe("OCR module", () => {
     await expect(module.recognizePage({ bookId: BOOK_ID, page: 1, imageData: "a", width: 1, height: 1 }, controller.signal)).resolves.toMatchObject({ ok: false, code: "CANCELLED" });
     expect(module.getPage(BOOK_ID, 1)).toBeUndefined();
   });
+
+  it("coalesces concurrent requests for the same page and reuses an identical cached input", async () => {
+    let calls = 0;
+    const engine: OcrEngine = {
+      name: "测试引擎",
+      model: "测试模型",
+      version: "1",
+      inputVersion: "input-1",
+      async recognize(input) {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return { width: input.width, height: input.height, orientation: 0, lines: [] };
+      },
+    };
+    const module = createOcrModule(dataHome, engine);
+    close = module.close;
+    const input = { bookId: BOOK_ID, page: 1, imageData: "aGVsbG8=", width: 10, height: 10 };
+    const [first, second] = await Promise.all([module.recognizePage(input), module.recognizePage(input)]);
+    expect(first).toEqual(second);
+    await module.recognizePage(input);
+    expect(calls).toBe(1);
+  });
 });

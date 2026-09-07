@@ -437,14 +437,14 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     }
   }
 
-  async function renderPageForOcr(bookId: string, pageNumber: number) {
+  async function renderPageForOcr(bookId: string, pageNumber: number, scale = 1.5) {
     const { createCanvas } = await import("@napi-rs/canvas");
     const source = await loadBookBytesForIndex(bookId);
     const loadingTask = getDocument({ data: source.bytes.slice(), ...(source.password ? { password: source.password } : {}) });
     try {
       const document = await loadingTask.promise;
       const page = await document.getPage(pageNumber);
-      const viewport = page.getViewport({ scale: 1.5 });
+      const viewport = page.getViewport({ scale });
       const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
       const context = canvas.getContext("2d");
       await page.render({ canvas: canvas as never, canvasContext: context as never, viewport }).promise;
