@@ -9,3 +9,10 @@ resources/ocr-runtime/**
 resources/ocr-models/**
 /tmp/
 docs/193826_计算机组成原理（第3版）.pdf
+
+# Private development notes and planning artifacts
+/PRD.md
+/CONTEXT.md
+/CLAUDE.md
+/docs/
+/prototypes/
