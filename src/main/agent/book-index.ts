@@ -716,6 +716,12 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
 
     indexConversationMessage,
 
+    clearConversationIndex(bookId: string) {
+      database.prepare(
+        "DELETE FROM semantic_embeddings WHERE book_id = ? AND source = 'conversation'",
+      ).run(bookId);
+    },
+
     /** 按书库记录读取原文件字节（含已记住的密码）；原文件只读，永不修改。 */
     async loadBookByBookId(bookId: string) {
       const row = bookRowStatement.get(bookId) as BookRow | undefined;

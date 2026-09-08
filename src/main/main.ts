@@ -227,6 +227,7 @@ app.whenReady().then(async () => {
       indexConversationMessage: async (bookId, message) => {
         await bookIndex.indexConversationMessage(bookId, message);
       },
+      clearConversationIndex: (bookId) => bookIndex.clearConversationIndex(bookId),
     });
     closeAgentHost = agentHost.close;
     const invalidLibraryMutation = (): LibraryMutationResult => ({
@@ -304,6 +305,7 @@ app.whenReady().then(async () => {
       (_event, input: TestEmbeddingConnectionInput) => embeddingConnection.test(input),
     );
     ipcMain.handle("agent:get-conversation", (_event, bookId: unknown) => agentHost.getConversation(bookId));
+    ipcMain.handle("agent:clear-conversation", (_event, bookId: unknown) => agentHost.clearConversation(bookId));
     ipcMain.handle("ocr:get-page", (_event, bookId: unknown, page: unknown) => (
       isOwnedBook(bookId) && typeof page === "number" ? ocr.getPage(bookId, page) : undefined
     ));

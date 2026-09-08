@@ -138,6 +138,10 @@ export function createSessionStore(dataHome: string) {
   const updateSummaryStatement = database.prepare(`
     UPDATE agent_sessions SET summary = ?, summary_through_id = ?, updated_at = ? WHERE id = ?
   `);
+  const clearMessagesStatement = database.prepare("DELETE FROM agent_messages WHERE session_id = ?");
+  const clearSummaryStatement = database.prepare(`
+    UPDATE agent_sessions SET summary = NULL, summary_through_id = NULL, updated_at = ? WHERE id = ?
+  `);
   const insertMessageStatement = database.prepare(`
     INSERT INTO agent_messages (
       id, session_id, run_id, role, body, status, error_message, focus_json, created_at, updated_at
@@ -189,6 +193,20 @@ export function createSessionStore(dataHome: string) {
 
     saveSummary(sessionId: string, summary: string, throughMessageId: string) {
       updateSummaryStatement.run(summary, throughMessageId, now(), sessionId);
+    },
+
+    clearConversation(bookId: string) {
+      const session = findSessionStatement.get(bookId) as SessionRow | undefined;
+      if (!session) return;
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        clearMessagesStatement.run(session.id);
+        clearSummaryStatement.run(now(), session.id);
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
     },
 
     appendMessage(input: {

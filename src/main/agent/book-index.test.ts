@@ -227,6 +227,34 @@ describe("book index", () => {
     expect(search.hits.find((hit) => hit.source === "conversation")?.page).toBeUndefined();
   });
 
+  it("clears conversation embeddings without deleting PDF embeddings", async () => {
+    index.close();
+    const provider: EmbeddingProvider = {
+      model: "test-embedding-v1",
+      embed: async (inputs) => inputs.map(() => [1, 0]),
+    };
+    index = createBookIndex(dataHome, { getEmbeddingProvider: () => provider });
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+    await index.ensureEmbeddings(bookId);
+    await index.indexConversationMessage(bookId, {
+      id: "message-to-clear",
+      role: "reader",
+      body: "需要清理的会话向量",
+      status: "complete",
+    });
+
+    index.clearConversationIndex(bookId);
+
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    const counts = database.prepare(`
+      SELECT source, COUNT(*) AS count FROM semantic_embeddings
+      WHERE book_id = ? GROUP BY source
+    `).all(bookId) as Array<{ source: string; count: number }>;
+    database.close();
+    expect(counts.find((row) => row.source === "conversation")).toBeUndefined();
+    expect(counts.find((row) => row.source === "pdf")?.count).toBeGreaterThan(0);
+  });
+
   it("marks retrieval as FTS-only when no embedding provider is available", async () => {
     await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
     const search = await index.search(bookId, "Chapter One");

@@ -397,6 +397,14 @@ export type StartAgentRunResult =
       message: string;
     };
 
+export type ClearBookConversationResult =
+  | { ok: true }
+  | {
+      ok: false;
+      code: "VALIDATION_ERROR" | "CONFLICT" | "WRITE_ERROR";
+      message: string;
+    };
+
 export type AgentStreamEvent =
   | {
       stream: "lifecycle";
@@ -465,6 +473,7 @@ export interface PDFMuseApi {
   saveEmbeddingConnection(input: SaveEmbeddingConnectionInput): Promise<SaveEmbeddingConnectionResult>;
   testEmbeddingConnection(input: TestEmbeddingConnectionInput): Promise<TestEmbeddingConnectionResult>;
   getBookConversation(bookId: string): Promise<ConversationMessage[]>;
+  clearBookConversation(bookId: string): Promise<ClearBookConversationResult>;
   recognizePage(input: OcrPageRequest): Promise<OcrPageResult>;
   getRecognizedPage(bookId: string, page: number): Promise<RecognizedPageText | undefined>;
   searchBook(bookId: string, query: string, limit?: number): Promise<PdfSearchResult>;

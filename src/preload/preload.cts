@@ -28,6 +28,7 @@ const api: PDFMuseApi = {
   saveEmbeddingConnection: (input) => ipcRenderer.invoke("embedding-connection:save", input),
   testEmbeddingConnection: (input) => ipcRenderer.invoke("embedding-connection:test", input),
   getBookConversation: (bookId) => ipcRenderer.invoke("agent:get-conversation", bookId),
+  clearBookConversation: (bookId) => ipcRenderer.invoke("agent:clear-conversation", bookId),
   recognizePage: (input) => ipcRenderer.invoke("ocr:recognize-page", input),
   getRecognizedPage: (bookId, page) => ipcRenderer.invoke("ocr:get-page", bookId, page),
   searchBook: (bookId, query, limit) => ipcRenderer.invoke("book:search", bookId, query, limit),

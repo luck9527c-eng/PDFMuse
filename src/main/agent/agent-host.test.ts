@@ -149,6 +149,30 @@ describe("agent host", () => {
     expect(messageEvent?.status).toBe("complete");
   });
 
+  it("clears only the selected book conversation when no run is active", async () => {
+    const otherBookId = "b".repeat(64);
+    const clearedIndexes: string[] = [];
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      isKnownBook: () => true,
+      clearConversationIndex: (bookId) => { clearedIndexes.push(bookId); },
+    });
+    await host.start({ bookId: BOOK_ID, question: "当前书问题" });
+    await host.start({ bookId: otherBookId, question: "另一本书问题" });
+    await waitFor(() => host.getConversation(BOOK_ID).length === 2 && host.getConversation(otherBookId).length === 2);
+
+    const result = await host.clearConversation(BOOK_ID);
+
+    expect(result).toEqual({ ok: true });
+    expect(host.getConversation(BOOK_ID)).toEqual([]);
+    expect(host.getConversation(otherBookId)).toHaveLength(2);
+    expect(clearedIndexes).toEqual([BOOK_ID]);
+  });
+
   it("injects history, focus, reader profile and system prompt into the model context", async () => {
     const first = createFakeStreamFn(({ push }) => {
       push({ type: "start", partial: assistantMessage("") });
@@ -181,6 +205,7 @@ describe("agent host", () => {
     expect(request.context.systemPrompt).toContain("PDFMuse");
     expect(request.context.systemPrompt).toContain("Reader Profile");
     expect(request.context.systemPrompt).toContain("我是工程师，偏好先结论后展开。");
+    expect(request.context.systemPrompt).toContain("不要在回答正文中反复插入页码");
     expect(request.context.tools).toEqual([]);
     const serialized = JSON.stringify(request.context.messages);
     expect(serialized).toContain("第一个问题");

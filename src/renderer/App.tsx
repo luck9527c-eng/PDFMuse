@@ -61,6 +61,8 @@ import { IconButton } from "./components/IconButton";
 import { MarkdownView } from "./components/MarkdownView";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PdfViewer, type OutlineNode, type PdfViewerHandle, type ViewerSelection, type ViewerState } from "./pdf/PdfViewer";
+import { createAgentEventBuffer } from "./agent-event-buffer";
+import { getConversationReferencePage } from "./conversation-reference";
 import { createReadingStateWriter } from "./reading-state-persistence";
 
 type PassagePopover = Extract<ViewerSelection, { kind: "selected" }>;
@@ -506,8 +508,11 @@ export function App() {
   const [toolStatus, setToolStatus] = useState<string>();
   const [agentNotice, setAgentNotice] = useState("");
   const [conversationLoading, setConversationLoading] = useState(false);
+  const [clearConversationOpen, setClearConversationOpen] = useState(false);
+  const [clearingConversation, setClearingConversation] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
   const activeRunRef = useRef<StreamingReply | undefined>(undefined);
+  const agentEventBufferRef = useRef(createAgentEventBuffer());
   const pendingComposerRef = useRef<ComposerSubmission | undefined>(undefined);
   const draftRef = useRef(draft);
   const passageRef = useRef(attachedPassage);
@@ -1027,10 +1032,7 @@ export function App() {
     stateWriterRef.current?.schedule({ bookId: book.id, state: readingStateRef.current });
   }, [book, leftOpen, rightOpen]);
 
-  // Agent 事件订阅：流式增量、工具状态、消息终态与会话收尾都由 Main 推送。
-  useEffect(() => {
-    if (!window.pdfMuse) return;
-    return window.pdfMuse.onAgentEvent((event) => {
+  const handleAgentEvent = useCallback((event: AgentStreamEvent) => {
       const active = activeRunRef.current;
       if (active && event.runId === active.runId) {
         if (event.stream === "assistant") {
@@ -1063,12 +1065,21 @@ export function App() {
           if (book) void refreshMemoryProposals(book.id);
         }
       }
-    });
   }, [book, refreshConversation, refreshMemoryProposals]);
+
+  // Agent 事件订阅：runId 返回前先缓冲，随后按原始顺序回放，避免丢失首批增量。
+  useEffect(() => {
+    if (!window.pdfMuse) return;
+    return window.pdfMuse.onAgentEvent((event) => {
+      const routed = agentEventBufferRef.current.route(event, activeRunRef.current?.runId);
+      for (const item of routed) handleAgentEvent(item);
+    });
+  }, [handleAgentEvent]);
 
   const askAgent = useCallback(async (question: string, passage?: SelectedPassage, imageAttachments: AgentImageAttachment[] = []) => {
     if (!book || !window.pdfMuse || activeRunRef.current) return undefined;
     setAgentNotice("");
+    agentEventBufferRef.current.beginStart();
     try {
       const result = await window.pdfMuse.startAgentRun({
         bookId: book.id,
@@ -1080,6 +1091,7 @@ export function App() {
         ...(imageAttachments.length > 0 ? { attachments: imageAttachments } : {}),
       });
       if (!result.ok) {
+        agentEventBufferRef.current.cancelStart();
         setAgentNotice(result.message);
         return undefined;
       }
@@ -1098,13 +1110,37 @@ export function App() {
         },
       ]);
       activeRunRef.current = { runId: result.runId, sessionId: result.sessionId, body: "" };
+      pendingComposerRef.current = { runId: result.runId, question, passage, attachments: imageAttachments };
       setStreamingReply(activeRunRef.current);
+      const bufferedEvents = agentEventBufferRef.current.activate(result.runId);
+      for (const event of bufferedEvents) handleAgentEvent(event);
       return result;
     } catch {
+      agentEventBufferRef.current.cancelStart();
       setAgentNotice("无法发起回答，请重试。");
       return undefined;
     }
-  }, [book, viewerState.page]);
+  }, [book, handleAgentEvent, viewerState.page]);
+
+  const clearBookConversation = useCallback(async () => {
+    if (!book || !window.pdfMuse || activeRunRef.current) return;
+    setClearingConversation(true);
+    setAgentNotice("");
+    try {
+      const result = await window.pdfMuse.clearBookConversation(book.id);
+      if (!result.ok) {
+        setAgentNotice(result.message);
+        return;
+      }
+      setConversation([]);
+      setClearConversationOpen(false);
+      setAgentNotice("本书会话已清空。");
+    } catch {
+      setAgentNotice("无法清空本书会话，请重试。");
+    } finally {
+      setClearingConversation(false);
+    }
+  }, [book]);
 
   const stopAgent = useCallback(async () => {
     const active = activeRunRef.current;
@@ -1246,10 +1282,7 @@ export function App() {
     if (!question || activeRunRef.current) return;
     const passage = attachedPassage;
     const imageAttachments = attachments;
-    const result = await askAgent(question, passage, imageAttachments);
-    if (result?.ok) {
-      pendingComposerRef.current = { runId: result.runId, question, passage, attachments: imageAttachments };
-    }
+    await askAgent(question, passage, imageAttachments);
   }, [askAgent, attachedPassage, attachments, draft]);
 
   const passageByRun = useMemo(() => {
@@ -1396,7 +1429,10 @@ export function App() {
         {rightOpen && (
           <aside className="assistant-panel">
             <div className="sidebar-resize-handle right" role="separator" aria-label="调整右侧栏宽度" aria-orientation="vertical" onPointerDown={(event) => beginSidebarResize("right", event)} />
-            <header className="assistant-header"><div><span className="assistant-title"><Sparkles size={16} />AI 助手</span><span className="assistant-context">本书对话 · 当前 PDF 书籍</span></div></header>
+            <header className="assistant-header">
+              <div className="assistant-heading"><span className="assistant-title"><Sparkles size={16} />AI 助手</span><span className="assistant-context">本书对话 · 当前 PDF 书籍</span></div>
+              <IconButton label="清空本书会话" disabled={conversation.length === 0 || Boolean(streamingReply) || conversationLoading} onClick={() => setClearConversationOpen(true)}><Trash2 /></IconButton>
+            </header>
             <div className="conversation" ref={conversationRef}>
               {conversation.length === 0 && !streamingReply && !conversationLoading ? (
                 <div className="conversation-empty"><Bot size={24} /><strong>从原文开始</strong><span>选中文字后解释，或直接询问这本 PDF 书籍。</span></div>
@@ -1421,23 +1457,10 @@ export function App() {
                             </div>
                           )}
                           {message.status === "cancelled" && message.body && <div className="message-interrupted">回答已停止，以上为已生成内容。</div>}
-                          {message.evidence && message.evidence.length > 0 && (
-                            <div className="evidence-tags">
-                              {[...new Set(message.evidence.map((item) => item.page))].map((page) => (
-                                <button
-                                  className="evidence-tag"
-                                  key={page}
-                                  title={message.evidence!.find((item) => item.page === page)?.snippet}
-                                  onClick={() => viewerRef.current?.goToPage(page)}
-                                >
-                                  本书第 {page} 页
-                                </button>
-                              ))}
-                            </div>
-                          )}
-                          {passageByRun.get(message.runId) && (
-                            <button className="evidence-tag" onClick={() => viewerRef.current?.goToPage(passageByRun.get(message.runId)!.page)}>参考：PDF 第 {passageByRun.get(message.runId)!.page} 页</button>
-                          )}
+                          {getConversationReferencePage(message, passageByRun.get(message.runId)?.page) && (() => {
+                            const referencePage = getConversationReferencePage(message, passageByRun.get(message.runId)?.page);
+                            return <button className="evidence-tag" onClick={() => viewerRef.current?.goToPage(referencePage!)}>参考：PDF 第 {referencePage} 页</button>;
+                          })()}
                         </>
                       )}
                     </article>
@@ -1539,6 +1562,21 @@ export function App() {
           </div>
         )}
         <PasswordDialog request={passwordRequest} onCancel={() => setPasswordRequest(undefined)} onUnlock={unlockPdf} />
+        <Dialog.Root open={clearConversationOpen} onOpenChange={(open) => { if (!clearingConversation) setClearConversationOpen(open); }}>
+          <Dialog.Portal>
+            <Dialog.Overlay className="dialog-overlay" />
+            <Dialog.Content className="settings-dialog conversation-clear-dialog" aria-describedby="clear-conversation-description">
+              <div className="dialog-heading">
+                <div><Dialog.Title>清空本书会话</Dialog.Title><Dialog.Description id="clear-conversation-description">将删除这本 PDF 的全部聊天记录和会话摘要。本书记忆、OCR 与 PDF 索引会保留。</Dialog.Description></div>
+                <Dialog.Close asChild><IconButton label="关闭清空会话确认" disabled={clearingConversation}><X /></IconButton></Dialog.Close>
+              </div>
+              <div className="library-manage-actions">
+                <Dialog.Close asChild><button className="secondary-command" disabled={clearingConversation}>取消</button></Dialog.Close>
+                <button className="danger-command" disabled={clearingConversation} onClick={() => void clearBookConversation()}><Trash2 size={16} />{clearingConversation ? "正在清空..." : "确认清空"}</button>
+              </div>
+            </Dialog.Content>
+          </Dialog.Portal>
+        </Dialog.Root>
       </div>
     </Tooltip.Provider>
   );

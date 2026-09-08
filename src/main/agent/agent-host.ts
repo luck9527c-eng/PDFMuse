@@ -49,6 +49,8 @@ export type AgentHostOptions = {
     body: string;
     status: string;
   }): Promise<void> | void;
+  /** 清空 Book Conversation 时同步移除会话语义向量。 */
+  clearConversationIndex?(bookId: string): Promise<void> | void;
   emit(event: AgentStreamEvent): void;
   runTimeoutMs?: number;
   historyLimit?: number;
@@ -526,6 +528,22 @@ export function createAgentHost(options: AgentHostOptions) {
       if (!isBookId(bookId)) return [];
       const session = store.findSession(bookId);
       return session ? store.listMessages(session.id) : [];
+    },
+
+    async clearConversation(bookId: unknown) {
+      if (!isBookId(bookId) || (options.isKnownBook && !(await options.isKnownBook(bookId)))) {
+        return { ok: false as const, code: "VALIDATION_ERROR" as const, message: "当前 PDF 书籍不可用。" };
+      }
+      if ([...runBooks.values()].some((run) => run.bookId === bookId)) {
+        return { ok: false as const, code: "CONFLICT" as const, message: "回答进行中，暂时无法清空会话。" };
+      }
+      try {
+        store.clearConversation(bookId);
+        await options.clearConversationIndex?.(bookId);
+        return { ok: true as const };
+      } catch {
+        return { ok: false as const, code: "WRITE_ERROR" as const, message: "无法清空本书会话，请重试。" };
+      }
     },
 
     close() {
