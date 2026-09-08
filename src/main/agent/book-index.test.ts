@@ -133,6 +133,28 @@ describe("book index", () => {
     expect(search.hits[0]).toMatchObject({ source: "pdf", page: 1 });
   });
 
+  it("falls back to smaller embedding batches when a provider rejects a large batch", async () => {
+    index.close();
+    const provider: EmbeddingProvider = {
+      model: "single-input-embedding-v1",
+      embed: async (inputs) => {
+        if (inputs.length > 1) throw new Error("嵌入模型服务返回 HTTP 400。");
+        return inputs.map(() => [1, 0]);
+      },
+    };
+    index = createBookIndex(dataHome, {
+      getEmbeddingProvider: () => provider,
+      embeddingBatchSize: 32,
+    });
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+
+    await expect(index.ensureEmbeddings(bookId)).resolves.toBe(true);
+    const search = await index.search(bookId, "Chapter One");
+    expect(search.status).toBe("ok");
+    if (search.status !== "ok") return;
+    expect(search.retrievalMode).toBe("hybrid");
+  });
+
   it("returns earlier conversation messages as a separate source", async () => {
     index.close();
     const provider: EmbeddingProvider = {

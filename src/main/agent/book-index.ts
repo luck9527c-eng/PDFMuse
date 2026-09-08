@@ -83,6 +83,33 @@ const PDF_CHUNK_SIZE = 1_200;
 const PDF_CHUNK_OVERLAP = 160;
 const DEFAULT_EMBEDDING_BATCH_SIZE = 32;
 
+function canRetryWithSmallerEmbeddingBatch(error: unknown) {
+  if (error instanceof DOMException && error.name === "AbortError") return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return /HTTP (400|413|422)\b/.test(message)
+    || /批量|batch|向量数量|无效向量/i.test(message);
+}
+
+async function embedWithAdaptiveBatching(
+  provider: EmbeddingProvider,
+  inputs: readonly string[],
+  signal?: AbortSignal,
+): Promise<readonly number[][]> {
+  if (inputs.length === 0) return [];
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  try {
+    const vectors = await provider.embed(inputs, signal);
+    if (vectors.length !== inputs.length) throw new Error("嵌入模型返回的向量数量不匹配。");
+    return vectors;
+  } catch (error) {
+    if (inputs.length === 1 || !canRetryWithSmallerEmbeddingBatch(error)) throw error;
+    const midpoint = Math.ceil(inputs.length / 2);
+    const left = await embedWithAdaptiveBatching(provider, inputs.slice(0, midpoint), signal);
+    const right = await embedWithAdaptiveBatching(provider, inputs.slice(midpoint), signal);
+    return [...left, ...right];
+  }
+}
+
 function contentHash(text: string) {
   return createHash("sha256").update(text).digest("hex");
 }
@@ -277,7 +304,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       for (let start = 0; start < missing.length; start += embeddingBatchSize) {
         if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
         const batch = missing.slice(start, start + embeddingBatchSize);
-        const vectors = await provider.embed(batch.map((chunk) => chunk.text), signal);
+        const vectors = await embedWithAdaptiveBatching(provider, batch.map((chunk) => chunk.text), signal);
         if (vectors.length !== batch.length) throw new Error("嵌入模型返回的向量数量不匹配。");
         const timestamp = new Date().toISOString();
         database.exec("BEGIN");
