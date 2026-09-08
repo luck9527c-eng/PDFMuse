@@ -99,6 +99,12 @@ app.whenReady().then(async () => {
     const configPath = path.join(startupPreflight.dataHome, "config.json");
     const readerProfile = createReaderProfileModule(startupPreflight.dataHome);
     const bookIndex = createBookIndex(startupPreflight.dataHome, {
+      onEmbeddingError: (error) => {
+        const diagnostic = error instanceof Error
+          ? { name: error.name, message: error.message }
+          : { name: "UnknownError", message: String(error) };
+        console.error("语义索引底层请求失败：", diagnostic);
+      },
       getEmbeddingProvider: async () => {
         const config = await readAppConfig(configPath);
         if (!config.embedding) return undefined;

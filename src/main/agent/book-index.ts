@@ -61,6 +61,7 @@ export type BookIndexOptions = {
   embeddingProvider?: EmbeddingProvider;
   getEmbeddingProvider?: () => EmbeddingProvider | undefined | Promise<EmbeddingProvider | undefined>;
   embeddingBatchSize?: number;
+  onEmbeddingError?: (error: unknown) => void;
 };
 
 type EmbeddingRow = {
@@ -344,7 +345,8 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
         }
       }
       return true;
-    } catch {
+    } catch (error) {
+      options.onEmbeddingError?.(error);
       return false;
     }
   }

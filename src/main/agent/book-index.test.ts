@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createBookIndex, tokenizeForIndex, type EmbeddingProvider } from "./book-index.js";
 import { createLibraryModule } from "../library.js";
@@ -183,6 +183,24 @@ describe("book index", () => {
     expect(search.status).toBe("ok");
     if (search.status !== "ok") return;
     expect(search.retrievalMode).toBe("hybrid");
+  });
+
+  it("reports the underlying embedding failure without breaking FTS fallback", async () => {
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+    index.close();
+    const failure = new Error("嵌入模型服务返回 HTTP 429。");
+    const onEmbeddingError = vi.fn();
+    index = createBookIndex(dataHome, {
+      getEmbeddingProvider: () => ({
+        model: "limited-embedding-v1",
+        embed: async () => { throw failure; },
+      }),
+      onEmbeddingError,
+    });
+
+    await expect(index.ensureEmbeddings(bookId)).resolves.toBe(false);
+    expect(onEmbeddingError).toHaveBeenCalledOnce();
+    expect(onEmbeddingError).toHaveBeenCalledWith(failure);
   });
 
   it("returns earlier conversation messages as a separate source", async () => {
