@@ -32,6 +32,8 @@ export type AgentHostOptions = {
   loadModelConnection(): Promise<ResolvedModelConnection | undefined>;
   /** Reader Profile 只读注入；没有 Profile 时返回空字符串。 */
   loadReaderProfile?(): Promise<string>;
+  /** 当前书名由 Main 侧 Library 提供，不信任 Renderer 自报书名。 */
+  loadBookTitle?(bookId: string): string | undefined | Promise<string | undefined>;
   /** Book 所有权验证：伪造的 bookId 不允许建立会话。 */
   isKnownBook?(bookId: string): boolean | Promise<boolean>;
   /** 为一次运行构造可见工具；工具通过 reportEvidence 上报检索证据。 */
@@ -73,6 +75,9 @@ function isReadingFocus(value: unknown): value is ReadingFocus {
   if (!isRecord(value)) return false;
   const currentPage = value.currentPage;
   if (typeof currentPage !== "number" || !Number.isSafeInteger(currentPage) || currentPage <= 0) return false;
+  if (value.currentChapter !== undefined && (
+    typeof value.currentChapter !== "string" || !value.currentChapter.trim() || value.currentChapter.length > 500
+  )) return false;
   if (value.selectedPassage !== undefined) {
     const passage = value.selectedPassage;
     if (!isRecord(passage)) return false;
@@ -226,8 +231,9 @@ export function createAgentHost(options: AgentHostOptions) {
     attachments?: AgentImageAttachment[];
     connection: ResolvedModelConnection;
     profile: string;
+    bookTitle?: string;
   }) {
-    const { runId, sessionId, bookId, question, focus, attachments = [], connection, profile } = input;
+    const { runId, sessionId, bookId, question, focus, attachments = [], connection, profile, bookTitle } = input;
     if (cancelledBeforeStart.delete(runId)) {
       // 排队期间被取消：仍保留 Reader 问题，并发出终态让 Renderer 解除占用。
       store.appendMessage({ sessionId, runId, role: "reader", body: question, status: "complete", focus });
@@ -280,7 +286,11 @@ export function createAgentHost(options: AgentHostOptions) {
 
     const agent = new Agent({
       initialState: {
-        systemPrompt: buildSystemPrompt(profile),
+        systemPrompt: buildSystemPrompt(profile, bookTitle && focus ? {
+          title: bookTitle,
+          currentPage: focus.currentPage,
+          ...(focus.currentChapter ? { currentChapter: focus.currentChapter } : {}),
+        } : undefined),
         model: toLlmModel(connection, attachments.length > 0),
         messages: llmMessages.slice(0, -1),
         tools,
@@ -470,6 +480,7 @@ export function createAgentHost(options: AgentHostOptions) {
       const runId = randomUUID();
       const focus = isReadingFocus(input.focus) ? input.focus : undefined;
       const profile = await (options.loadReaderProfile?.() ?? "");
+      const bookTitle = await options.loadBookTitle?.(input.bookId);
       runBooks.set(runId, { bookId: input.bookId, sessionId });
       void enqueue(sessionId, () => executeRun({
         runId,
@@ -480,6 +491,7 @@ export function createAgentHost(options: AgentHostOptions) {
         attachments,
         connection,
         profile,
+        bookTitle,
       }).finally(() => runBooks.delete(runId)));
       return { ok: true, runId, sessionId };
     },

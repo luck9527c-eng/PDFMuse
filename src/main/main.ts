@@ -215,6 +215,7 @@ app.whenReady().then(async () => {
           : undefined;
       },
       loadReaderProfile: async () => (await readerProfile.get()).content,
+      loadBookTitle: (bookId) => library.list().find((book) => book.id === bookId)?.title,
       memory,
       isKnownBook: isOwnedBook,
       buildTools: (context) => toolRegistry.buildAgentTools(() => ({

@@ -191,10 +191,12 @@ describe("agent host", () => {
     buildHost({
       createStreamFn: () => second.streamFn,
       loadReaderProfile: async () => "我是工程师，偏好先结论后展开。",
+      loadBookTitle: async () => "计算机组成原理（第3版）",
     });
 
     const focus = {
       currentPage: 3,
+      currentChapter: "第一章 计算机系统概论",
       selectedPassage: { bookId: BOOK_ID, page: 3, text: "选中的原文片段", rects: [] },
     };
     await startRun("第二个问题", focus);
@@ -205,6 +207,10 @@ describe("agent host", () => {
     expect(request.context.systemPrompt).toContain("PDFMuse");
     expect(request.context.systemPrompt).toContain("Reader Profile");
     expect(request.context.systemPrompt).toContain("我是工程师，偏好先结论后展开。");
+    expect(request.context.systemPrompt).toContain("计算机组成原理（第3版）");
+    expect(request.context.systemPrompt).toContain("第一章 计算机系统概论");
+    expect(request.context.systemPrompt).toContain('"currentPage":3');
+    expect(request.context.systemPrompt).toContain("简洁务实");
     expect(request.context.systemPrompt).toContain("不要在回答正文中反复插入页码");
     expect(request.context.tools).toEqual([]);
     const serialized = JSON.stringify(request.context.messages);
