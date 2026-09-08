@@ -5,6 +5,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 
 import { preflightDataHome } from "./data-home.js";
 import { createEmbeddingConnectionModule } from "./embedding-connection.js";
+import { scheduleEmbeddingJobIfConfigured } from "./embedding-job-scheduler.js";
 import { createLibraryModule } from "./library.js";
 import { createModelConnectionModule } from "./model-connection.js";
 import { readAppConfig } from "./config-store.js";
@@ -120,6 +121,12 @@ app.whenReady().then(async () => {
     closeOcr = ocr.close;
     const bookOutline = createBookOutlineModule(startupPreflight.dataHome);
     closeBookOutline = bookOutline.close;
+    const scheduleOptionalEmbedding = (input: Omit<ScheduleBackgroundJobInput, "kind">) => (
+      scheduleEmbeddingJobIfConfigured(input, {
+        loadConfig: () => readAppConfig(configPath),
+        schedule: (job) => backgroundJobs.schedule(job),
+      })
+    );
     const backgroundJobs = createBackgroundJobModule(startupPreflight.dataHome, {
       index: async (job, context) => {
         const result = await bookIndex.ensureIndexed(
@@ -133,7 +140,7 @@ app.whenReady().then(async () => {
       },
       embedding: async (job, context) => {
         const config = await readAppConfig(configPath);
-        if (!config.embedding) throw new Error("尚未配置嵌入模型，当前继续使用全文检索。");
+        if (!config.embedding?.baseUrl.trim() || !config.embedding.model.trim()) return;
         if (context.signal.aborted) throw new Error("嵌入任务已暂停或取消。");
         const completed = await bookIndex.ensureEmbeddings(job.bookId, context.signal);
         if (!completed) throw new Error("语义索引生成失败，当前继续使用全文检索。");
@@ -157,9 +164,8 @@ app.whenReady().then(async () => {
             const result = await ocr.recognizePage({ bookId: job.bookId, page, ...image }, context.signal);
             if (!result.ok) throw new Error(result.message);
             bookIndex.indexRecognizedPage(job.bookId, page, result.page.lines);
-            backgroundJobs.schedule({
+            await scheduleOptionalEmbedding({
               bookId: job.bookId,
-              kind: "embedding",
               priority: 5,
               total: book.pageCount,
             });
@@ -180,6 +186,13 @@ app.whenReady().then(async () => {
       },
     });
     closeBackgroundJobs = backgroundJobs.close;
+    void readAppConfig(configPath)
+      .then((config) => {
+        if (!config.embedding?.baseUrl.trim() || !config.embedding.model.trim()) {
+          backgroundJobs.clearFailed("embedding");
+        }
+      })
+      .catch((error) => console.error("读取嵌入模型配置失败，无法清理历史语义索引任务。", error));
     const toolRegistry = createToolRegistry({ memoryConfigured: true });
     const agentHost: AgentHost = createAgentHost({
       dataHome: startupPreflight.dataHome,
@@ -299,9 +312,8 @@ app.whenReady().then(async () => {
       const result = await ocr.recognizePage(input as Parameters<typeof ocr.recognizePage>[0]);
       if (result.ok) {
         const book = library.list().find((item) => item.id === result.page.bookId);
-        backgroundJobs.schedule({
+        await scheduleOptionalEmbedding({
           bookId: result.page.bookId,
-          kind: "embedding",
           priority: 5,
           total: book?.pageCount ?? 0,
         });

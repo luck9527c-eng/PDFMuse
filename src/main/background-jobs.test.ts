@@ -110,6 +110,8 @@ describe("background jobs", () => {
       errorMessage: "语义索引任务失败，当前继续使用全文检索。",
     });
     expect(errorLog).toHaveBeenCalledWith("后台任务执行失败：embedding", expect.any(Error));
+    expect(module.clearFailed("embedding")).toBe(1);
+    expect(module.list(BOOK_B)).toEqual([]);
   });
 
   it("restores running jobs to queued after restart", async () => {

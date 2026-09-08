@@ -306,6 +306,10 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
       else return { ok: false, code: "CONFLICT", message: "当前任务无法取消。" };
       return { ok: true, job: toJob(rowFor(id)!) };
     },
+    clearFailed(kind: BackgroundJobKind) {
+      if (closed || !KINDS.includes(kind)) return 0;
+      return Number(database.prepare("DELETE FROM background_jobs WHERE kind = ? AND status = 'failed'").run(kind).changes);
+    },
     async cancelBook(bookId: string) {
       if (!BOOK_ID_PATTERN.test(bookId) || closed) return;
       const jobs = (database.prepare(`
