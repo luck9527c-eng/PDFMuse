@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createBookIndex, tokenizeForIndex, type EmbeddingProvider } from "./book-index.js";
@@ -87,6 +88,35 @@ describe("book index", () => {
     });
     expect(second.indexedPages).toBe(3);
     expect(loads).toBe(0);
+  });
+
+  it("rebuilds legacy flat page text with the structured extraction version", async () => {
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+    index.close();
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    database.prepare("UPDATE book_pages SET extraction_version = 'v1-flat-text' WHERE book_id = ?").run(bookId);
+    const timestamp = new Date().toISOString();
+    database.prepare(`
+      INSERT INTO semantic_embeddings
+        (book_id, source, source_id, page, text, vector_json, model, dimensions, content_hash, created_at, updated_at)
+      VALUES (?, 'pdf', '1:0', 1, 'legacy', '[1,0]', 'legacy-model', 2, 'legacy-hash', ?, ?)
+    `).run(bookId, timestamp, timestamp);
+    database.close();
+    index = createBookIndex(dataHome);
+    let sourceLoads = 0;
+
+    await index.ensureIndexed(bookId, async () => {
+      sourceLoads += 1;
+      return { bytes: fixtureBytes };
+    });
+
+    expect(sourceLoads).toBe(1);
+    const verified = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    const versions = verified.prepare("SELECT DISTINCT extraction_version FROM book_pages WHERE book_id = ?").all(bookId);
+    const oldVectors = verified.prepare("SELECT COUNT(*) AS count FROM semantic_embeddings WHERE book_id = ? AND source_id = '1:0'").get(bookId);
+    verified.close();
+    expect(versions).toEqual([{ extraction_version: "v2-structured-lines" }]);
+    expect(oldVectors).toEqual({ count: 0 });
   });
 
   it("continues from the last committed page after interruption", async () => {

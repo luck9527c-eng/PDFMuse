@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { ReadingFocus } from "../../shared/contracts.js";
+import { chunkPageText } from "./semantic-chunker.js";
 
 /**
  * 整本书的页级全文索引（FTS5）。
@@ -13,6 +14,7 @@ import type { ReadingFocus } from "../../shared/contracts.js";
  */
 const CJK_PATTERN = /[\u3000-\u9fff\uff00-\uffef]/;
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
+const TEXT_EXTRACTION_VERSION = "v2-structured-lines";
 
 export function tokenizeForIndex(text: string) {
   return Array.from(text)
@@ -79,8 +81,6 @@ type ConversationIndexInput = {
   status?: string;
 };
 
-const PDF_CHUNK_SIZE = 1_200;
-const PDF_CHUNK_OVERLAP = 160;
 const DEFAULT_EMBEDDING_BATCH_SIZE = 32;
 
 function canRetryWithSmallerEmbeddingBatch(error: unknown) {
@@ -112,20 +112,6 @@ async function embedWithAdaptiveBatching(
 
 function contentHash(text: string) {
   return createHash("sha256").update(text).digest("hex");
-}
-
-function splitIntoChunks(text: string, page: number) {
-  const chunks: Array<{ id: string; text: string; page: number }> = [];
-  if (!text) return chunks;
-  const step = Math.max(1, PDF_CHUNK_SIZE - PDF_CHUNK_OVERLAP);
-  let index = 0;
-  for (let start = 0; start < text.length; start += step) {
-    const chunk = text.slice(start, start + PDF_CHUNK_SIZE).trim();
-    if (chunk) chunks.push({ id: `${index}`, text: chunk, page });
-    index += 1;
-    if (start + PDF_CHUNK_SIZE >= text.length) break;
-  }
-  return chunks;
 }
 
 function parseVector(value: string) {
@@ -161,9 +147,10 @@ async function extractPageText(document: Awaited<ReturnType<typeof getDocument>[
     const pageProxy = await document.getPage(page);
     const content = await pageProxy.getTextContent();
     return content.items
-      .map((item) => ("str" in item ? item.str : ""))
-      .join(" ")
-      .replace(/\s+/g, " ")
+      .map((item) => ("str" in item ? `${item.str}${"hasEOL" in item && item.hasEOL ? "\n" : " "}` : ""))
+      .join("")
+      .replace(/[^\S\n]+/g, " ")
+      .replace(/ *\n */g, "\n")
       .trim();
   } catch {
     return "";
@@ -175,7 +162,7 @@ function readRecognizedText(database: DatabaseSync, bookId: string, page: number
     const row = database.prepare("SELECT lines_json FROM recognized_pages WHERE book_id = ? AND page = ?").get(bookId, page) as { lines_json: string } | undefined;
     if (!row) return "";
     const lines = JSON.parse(row.lines_json) as Array<{ text?: unknown }>;
-    return lines.filter((line) => typeof line.text === "string").map((line) => line.text as string).join(" ").replace(/\s+/g, " ").trim();
+    return lines.filter((line) => typeof line.text === "string").map((line) => line.text as string).join("\n").replace(/[^\S\n]+/g, " ").trim();
   } catch {
     return "";
   }
@@ -188,6 +175,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       book_id TEXT NOT NULL,
       page INTEGER NOT NULL,
       text TEXT NOT NULL,
+      extraction_version TEXT NOT NULL DEFAULT 'v2-structured-lines',
       PRIMARY KEY (book_id, page)
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS book_pages_fts USING fts5(
@@ -213,20 +201,29 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     CREATE INDEX IF NOT EXISTS semantic_embeddings_book_source
       ON semantic_embeddings(book_id, source);
   `);
+  const pageColumns = database.prepare("PRAGMA table_info(book_pages)").all() as Array<{ name: string }>;
+  if (!pageColumns.some((column) => column.name === "extraction_version")) {
+    database.exec("ALTER TABLE book_pages ADD COLUMN extraction_version TEXT NOT NULL DEFAULT 'v1-flat-text'");
+  }
 
   const embeddingBatchSize = Math.max(1, options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE);
   const indexing = new Map<string, Promise<{ indexedPages: number; totalPages: number; note?: string }>>();
   const embeddingRuns = new Map<string, Promise<boolean>>();
 
   const indexedPagesStatement = database.prepare(
+    "SELECT COUNT(*) AS count FROM book_pages WHERE book_id = ? AND extraction_version = ?",
+  );
+  const allIndexedPagesStatement = database.prepare(
     "SELECT COUNT(*) AS count FROM book_pages WHERE book_id = ?",
   );
   const bookRowStatement = database.prepare(
     "SELECT current_path, page_count, saved_password FROM library_books WHERE id = ?",
   );
   const insertPageStatement = database.prepare(`
-    INSERT INTO book_pages (book_id, page, text) VALUES (?, ?, ?)
-    ON CONFLICT(book_id, page) DO UPDATE SET text = excluded.text
+    INSERT INTO book_pages (book_id, page, text, extraction_version) VALUES (?, ?, ?, ?)
+    ON CONFLICT(book_id, page) DO UPDATE SET
+      text = excluded.text,
+      extraction_version = excluded.extraction_version
   `);
   const insertFtsStatement = database.prepare(
     "INSERT INTO book_pages_fts (book_id, page, tokens) VALUES (?, ?, ?)",
@@ -238,18 +235,21 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   const clearPagesStatement = database.prepare(
     "DELETE FROM book_pages WHERE book_id = ?",
   );
+  const clearPdfEmbeddingsStatement = database.prepare(
+    "DELETE FROM semantic_embeddings WHERE book_id = ? AND source = 'pdf'",
+  );
   const searchStatement = database.prepare(`
     SELECT page, text
     FROM book_pages
-    WHERE book_id = ? AND text LIKE ?
+    WHERE book_id = ? AND extraction_version = ? AND text LIKE ?
     ORDER BY page ASC
     LIMIT 40
   `);
   const indexedPagesBeforeStatement = database.prepare(
-    "SELECT MAX(page) AS max_page, COUNT(*) AS count FROM book_pages WHERE book_id = ?",
+    "SELECT MAX(page) AS max_page, COUNT(*) AS count FROM book_pages WHERE book_id = ? AND extraction_version = ?",
   );
   const pageTextStatement = database.prepare(
-    "SELECT page, text FROM book_pages WHERE book_id = ? ORDER BY page ASC",
+    "SELECT page, text FROM book_pages WHERE book_id = ? AND extraction_version = ? ORDER BY page ASC",
   );
   const embeddingRowsStatement = database.prepare(`
     SELECT source, source_id, page, text, vector_json, model, dimensions, content_hash
@@ -286,8 +286,8 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     provider: EmbeddingProvider,
     signal?: AbortSignal,
   ) {
-    const pages = pageTextStatement.all(bookId) as Array<{ page: number; text: string }>;
-    const chunks = pages.flatMap((page) => splitIntoChunks(page.text, page.page).map((chunk) => ({
+    const pages = pageTextStatement.all(bookId, TEXT_EXTRACTION_VERSION) as Array<{ page: number; text: string }>;
+    const chunks = pages.flatMap((page) => chunkPageText(page.text, page.page).map((chunk) => ({
       ...chunk,
       sourceId: `${page.page}:${chunk.id}`,
     })));
@@ -393,7 +393,20 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   ): Promise<{ indexedPages: number; totalPages: number; note?: string }> {
     const row = bookRowStatement.get(bookId) as BookRow | undefined;
     if (!row) return { indexedPages: 0, totalPages: 0, note: "书库中没有这本书的索引来源。" };
-    const existing = indexedPagesBeforeStatement.get(bookId) as { max_page: number | null; count: number };
+    const existing = indexedPagesBeforeStatement.get(bookId, TEXT_EXTRACTION_VERSION) as { max_page: number | null; count: number };
+    const allExisting = allIndexedPagesStatement.get(bookId) as { count: number };
+    if (allExisting.count > existing.count) {
+      database.exec("BEGIN");
+      try {
+        clearPagesStatement.run(bookId);
+        clearFtsStatement.run(bookId);
+        clearPdfEmbeddingsStatement.run(bookId);
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    }
     if (existing.count >= row.page_count && existing.max_page === row.page_count) {
       const provider = await embeddingProvider();
       if (provider) await ensureEmbeddings(bookId, signal);
@@ -425,7 +438,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
         const text = nativeText.length >= 16 ? nativeText : (readRecognizedText(database, bookId, page) || nativeText);
         database.exec("BEGIN");
         try {
-          insertPageStatement.run(bookId, page, text);
+          insertPageStatement.run(bookId, page, text, TEXT_EXTRACTION_VERSION);
           deleteFtsPageStatement.run(bookId, page);
           if (text) insertFtsStatement.run(bookId, page, tokenizeForIndex(text));
           database.exec("COMMIT");
@@ -448,11 +461,11 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   }
 
   function indexRecognizedPage(bookId: string, page: number, lines: readonly { text: string }[]) {
-    const text = lines.map((line) => line.text).join(" ").replace(/\s+/g, " ").trim();
+    const text = lines.map((line) => line.text).join("\n").replace(/[^\S\n]+/g, " ").trim();
     if (!BOOK_ID_PATTERN.test(bookId) || !Number.isSafeInteger(page) || page <= 0) return false;
     try {
       database.exec("BEGIN");
-      insertPageStatement.run(bookId, page, text);
+      insertPageStatement.run(bookId, page, text, TEXT_EXTRACTION_VERSION);
       deleteFtsPageStatement.run(bookId, page);
       if (text) insertFtsStatement.run(bookId, page, tokenizeForIndex(text));
       database.prepare("DELETE FROM semantic_embeddings WHERE book_id = ? AND source = 'pdf' AND page = ?").run(bookId, page);
@@ -571,20 +584,20 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
           LIMIT 40
         `).all(`"${tokens.replace(/"/g, '""')}"`, bookId) as { book_id: string; page: number }[];
         ftsPages = new Set(fts.filter((hit) => hit.book_id === bookId).map((hit) => hit.page));
-        const likePages = searchStatement.all(bookId, likePattern(trimmed)) as { page: number; text: string }[];
+        const likePages = searchStatement.all(bookId, TEXT_EXTRACTION_VERSION, likePattern(trimmed)) as { page: number; text: string }[];
         const merged = new Map<number, string>();
         for (const hit of likePages) merged.set(hit.page, hit.text);
         for (const hit of ftsPages) {
           if (!merged.has(hit)) {
             const text = database.prepare(
-              "SELECT text FROM book_pages WHERE book_id = ? AND page = ?",
-            ).get(bookId, hit) as { text: string } | undefined;
+              "SELECT text FROM book_pages WHERE book_id = ? AND page = ? AND extraction_version = ?",
+            ).get(bookId, hit, TEXT_EXTRACTION_VERSION) as { text: string } | undefined;
             if (text) merged.set(hit, text.text);
           }
         }
         pages = [...merged.entries()].sort((a, b) => a[0] - b[0]).map(([page, text]) => ({ page, text }));
       } catch {
-        pages = searchStatement.all(bookId, likePattern(trimmed)) as { page: number; text: string }[];
+        pages = searchStatement.all(bookId, TEXT_EXTRACTION_VERSION, likePattern(trimmed)) as { page: number; text: string }[];
       }
       for (const page of pages) {
         addCandidate({ source: "pdf", sourceId: `${page.page}:0`, page: page.page, text: page.text }, ftsPages.has(page.page) ? 0.8 : 1);
@@ -674,7 +687,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
         snippet: buildSnippet(candidate.text, trimmed),
         score: Number(score.toFixed(6)),
       }));
-      const indexedPages = indexedPagesStatement.get(bookId) as { count: number };
+      const indexedPages = indexedPagesStatement.get(bookId, TEXT_EXTRACTION_VERSION) as { count: number };
       const base = {
         hits,
         indexedPages: indexedPages.count,
@@ -710,7 +723,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
 
     stats(bookId: string) {
       const row = bookRowStatement.get(bookId) as BookRow | undefined;
-      const indexed = indexedPagesStatement.get(bookId) as { count: number };
+      const indexed = indexedPagesStatement.get(bookId, TEXT_EXTRACTION_VERSION) as { count: number };
       return {
         indexedPages: indexed.count,
         totalPages: row?.page_count ?? 0,

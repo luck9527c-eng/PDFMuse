@@ -39,3 +39,8 @@ export {
 } from "@openclaw/ai";
 
 export { registerBuiltInApiProviders } from "@openclaw/ai/providers";
+
+export {
+  estimateStringChars,
+  estimateTokensFromChars,
+} from "../../../vendor/openclaw-agent-core/packages/normalization-core/src/cjk-chars.js";
