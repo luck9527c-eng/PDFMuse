@@ -51,8 +51,6 @@ export type AgentHostOptions = {
     body: string;
     status: string;
   }): Promise<void> | void;
-  /** 清空 Book Conversation 时同步移除会话语义向量。 */
-  clearConversationIndex?(bookId: string): Promise<void> | void;
   emit(event: AgentStreamEvent): void;
   runTimeoutMs?: number;
   historyLimit?: number;
@@ -546,7 +544,6 @@ export function createAgentHost(options: AgentHostOptions) {
       }
       try {
         store.clearConversation(bookId);
-        await options.clearConversationIndex?.(bookId);
         return { ok: true as const };
       } catch {
         return { ok: false as const, code: "WRITE_ERROR" as const, message: "无法清空本书会话，请重试。" };

@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { AgentStreamEvent, StartAgentRunResult } from "../../shared/contracts.js";
@@ -118,6 +119,33 @@ describe("agent host", () => {
     return host.start({ bookId: BOOK_ID, question, ...(focus ? { focus } : {}) });
   }
 
+  function seedEmbedding(bookId: string, source: "pdf" | "conversation", sourceId: string) {
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS semantic_embeddings (
+        book_id TEXT NOT NULL,
+        source TEXT NOT NULL CHECK (source IN ('pdf', 'conversation')),
+        source_id TEXT NOT NULL,
+        page INTEGER,
+        text TEXT NOT NULL,
+        vector_json TEXT NOT NULL,
+        model TEXT NOT NULL,
+        dimensions INTEGER NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (book_id, source, source_id)
+      )
+    `);
+    const timestamp = new Date().toISOString();
+    database.prepare(`
+      INSERT INTO semantic_embeddings
+        (book_id, source, source_id, page, text, vector_json, model, dimensions, content_hash, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'test', '[1]', 'test-model', 1, 'test-hash', ?, ?)
+    `).run(bookId, source, sourceId, source === "pdf" ? 1 : null, timestamp, timestamp);
+    database.close();
+  }
+
   it("streams assistant deltas and persists both messages", async () => {
     const fake = createFakeStreamFn(({ push }) => {
       push({ type: "start", partial: assistantMessage("") });
@@ -151,7 +179,9 @@ describe("agent host", () => {
 
   it("clears only the selected book conversation when no run is active", async () => {
     const otherBookId = "b".repeat(64);
-    const clearedIndexes: string[] = [];
+    seedEmbedding(BOOK_ID, "conversation", "current-conversation");
+    seedEmbedding(BOOK_ID, "pdf", "current-pdf");
+    seedEmbedding(otherBookId, "conversation", "other-conversation");
     const fake = createFakeStreamFn(({ push }) => {
       push({ type: "start", partial: assistantMessage("") });
       push({ type: "done", reason: "stop", message: assistantMessage("回答") });
@@ -159,7 +189,6 @@ describe("agent host", () => {
     buildHost({
       createStreamFn: () => fake.streamFn,
       isKnownBook: () => true,
-      clearConversationIndex: (bookId) => { clearedIndexes.push(bookId); },
     });
     await host.start({ bookId: BOOK_ID, question: "当前书问题" });
     await host.start({ bookId: otherBookId, question: "另一本书问题" });
@@ -170,7 +199,41 @@ describe("agent host", () => {
     expect(result).toEqual({ ok: true });
     expect(host.getConversation(BOOK_ID)).toEqual([]);
     expect(host.getConversation(otherBookId)).toHaveLength(2);
-    expect(clearedIndexes).toEqual([BOOK_ID]);
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    const embeddings = database.prepare(
+      "SELECT book_id, source FROM semantic_embeddings ORDER BY book_id, source",
+    ).all();
+    database.close();
+    expect(embeddings).toEqual([
+      { book_id: BOOK_ID, source: "pdf" },
+      { book_id: otherBookId, source: "conversation" },
+    ]);
+  });
+
+  it("rolls back message deletion when conversation embedding cleanup fails", async () => {
+    seedEmbedding(BOOK_ID, "conversation", "blocked-conversation");
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("回答") });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn, isKnownBook: () => true });
+    await startRun("不能丢失的问题");
+    await waitFor(() => host.getConversation(BOOK_ID).length === 2);
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    database.exec(`
+      CREATE TRIGGER block_conversation_embedding_delete
+      BEFORE DELETE ON semantic_embeddings
+      WHEN OLD.source = 'conversation'
+      BEGIN
+        SELECT RAISE(ABORT, 'blocked');
+      END
+    `);
+    database.close();
+
+    const result = await host.clearConversation(BOOK_ID);
+
+    expect(result).toMatchObject({ ok: false, code: "WRITE_ERROR" });
+    expect(host.getConversation(BOOK_ID)).toHaveLength(2);
   });
 
   it("injects history, focus, reader profile and system prompt into the model context", async () => {

@@ -142,6 +142,9 @@ export function createSessionStore(dataHome: string) {
   const clearSummaryStatement = database.prepare(`
     UPDATE agent_sessions SET summary = NULL, summary_through_id = NULL, updated_at = ? WHERE id = ?
   `);
+  const tableExistsStatement = database.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+  );
   const insertMessageStatement = database.prepare(`
     INSERT INTO agent_messages (
       id, session_id, run_id, role, body, status, error_message, focus_json, created_at, updated_at
@@ -202,6 +205,11 @@ export function createSessionStore(dataHome: string) {
       try {
         clearMessagesStatement.run(session.id);
         clearSummaryStatement.run(now(), session.id);
+        if (tableExistsStatement.get("semantic_embeddings")) {
+          database.prepare(
+            "DELETE FROM semantic_embeddings WHERE book_id = ? AND source = 'conversation'",
+          ).run(bookId);
+        }
         database.exec("COMMIT");
       } catch (error) {
         database.exec("ROLLBACK");

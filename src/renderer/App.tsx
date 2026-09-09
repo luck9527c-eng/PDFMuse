@@ -70,6 +70,11 @@ type StreamingReply = { runId: string; sessionId: string; body: string };
 type ComposerSubmission = { runId: string; question: string; passage?: SelectedPassage; attachments: AgentImageAttachment[] };
 type PendingApproval = { approvalId: string; runId: string; toolName?: string };
 
+function ConversationReferenceButton({ page, onOpen }: { page?: number; onOpen(page: number): void }) {
+  if (!page) return null;
+  return <button className="evidence-tag" onClick={() => onOpen(page)}>参考：PDF 第 {page} 页</button>;
+}
+
 const TOOL_TITLES: Record<string, string> = {
   book_search: "检索本书",
 };
@@ -1457,10 +1462,10 @@ export function App() {
                             </div>
                           )}
                           {message.status === "cancelled" && message.body && <div className="message-interrupted">回答已停止，以上为已生成内容。</div>}
-                          {getConversationReferencePage(message, passageByRun.get(message.runId)?.page) && (() => {
-                            const referencePage = getConversationReferencePage(message, passageByRun.get(message.runId)?.page);
-                            return <button className="evidence-tag" onClick={() => viewerRef.current?.goToPage(referencePage!)}>参考：PDF 第 {referencePage} 页</button>;
-                          })()}
+                          <ConversationReferenceButton
+                            page={getConversationReferencePage(message, passageByRun.get(message.runId)?.page)}
+                            onOpen={(page) => viewerRef.current?.goToPage(page)}
+                          />
                         </>
                       )}
                     </article>

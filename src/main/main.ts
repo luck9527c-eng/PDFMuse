@@ -228,7 +228,6 @@ app.whenReady().then(async () => {
       indexConversationMessage: async (bookId, message) => {
         await bookIndex.indexConversationMessage(bookId, message);
       },
-      clearConversationIndex: (bookId) => bookIndex.clearConversationIndex(bookId),
     });
     closeAgentHost = agentHost.close;
     const invalidLibraryMutation = (): LibraryMutationResult => ({
