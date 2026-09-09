@@ -62,7 +62,6 @@ import { MarkdownView } from "./components/MarkdownView";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PdfViewer, type OutlineNode, type PdfViewerHandle, type ViewerSelection, type ViewerState } from "./pdf/PdfViewer";
 import { createAgentEventBuffer } from "./agent-event-buffer";
-import { findCurrentChapter } from "./book-context";
 import { getConversationReferencePage } from "./conversation-reference";
 import { createReadingStateWriter } from "./reading-state-persistence";
 
@@ -720,7 +719,6 @@ export function App() {
   }, [book, refreshBackgroundJobs, visibleBackgroundJob]);
 
   const effectiveOutline = viewerState.outline.length > 0 ? viewerState.outline : generatedOutline ?? [];
-  const currentChapter = findCurrentChapter(effectiveOutline, viewerState.page);
   const outlineJob = backgroundJobs.find((job) => job.kind === "outline");
   const outlineEmptyMessage = outlineJob?.status === "running" || outlineJob?.status === "queued"
     ? "正在分析章节结构..."
@@ -1088,7 +1086,6 @@ export function App() {
         question,
         focus: {
           currentPage: viewerState.page,
-          ...(currentChapter ? { currentChapter } : {}),
           ...(passage ? { selectedPassage: passage } : {}),
         },
         ...(imageAttachments.length > 0 ? { attachments: imageAttachments } : {}),
@@ -1123,7 +1120,7 @@ export function App() {
       setAgentNotice("无法发起回答，请重试。");
       return undefined;
     }
-  }, [book, currentChapter, handleAgentEvent, viewerState.page]);
+  }, [book, handleAgentEvent, viewerState.page]);
 
   const clearBookConversation = useCallback(async () => {
     if (!book || !window.pdfMuse || activeRunRef.current) return;

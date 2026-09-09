@@ -287,14 +287,11 @@ export type ConversationMessage = {
 
 export type ReadingFocus = {
   currentPage: number;
-  currentChapter?: string;
   selectedPassage?: SelectedPassage;
 };
 
 export type BookContext = {
   title: string;
-  currentPage: number;
-  currentChapter?: string;
 };
 
 export type OcrPoint = { x: number; y: number };

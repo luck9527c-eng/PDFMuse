@@ -75,9 +75,6 @@ function isReadingFocus(value: unknown): value is ReadingFocus {
   if (!isRecord(value)) return false;
   const currentPage = value.currentPage;
   if (typeof currentPage !== "number" || !Number.isSafeInteger(currentPage) || currentPage <= 0) return false;
-  if (value.currentChapter !== undefined && (
-    typeof value.currentChapter !== "string" || !value.currentChapter.trim() || value.currentChapter.length > 500
-  )) return false;
   if (value.selectedPassage !== undefined) {
     const passage = value.selectedPassage;
     if (!isRecord(passage)) return false;
@@ -286,10 +283,8 @@ export function createAgentHost(options: AgentHostOptions) {
 
     const agent = new Agent({
       initialState: {
-        systemPrompt: buildSystemPrompt(profile, bookTitle && focus ? {
+        systemPrompt: buildSystemPrompt(profile, bookTitle ? {
           title: bookTitle,
-          currentPage: focus.currentPage,
-          ...(focus.currentChapter ? { currentChapter: focus.currentChapter } : {}),
         } : undefined),
         model: toLlmModel(connection, attachments.length > 0),
         messages: llmMessages.slice(0, -1),
