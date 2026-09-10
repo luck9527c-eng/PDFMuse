@@ -6,7 +6,6 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createBookIndex } from "./agent/book-index.js";
-import { createMemoryModule } from "./agent/memory.js";
 import { createSessionStore } from "./agent/session-store.js";
 import { createBackgroundJobModule } from "./background-jobs.js";
 import { createBookOutlineModule } from "./book-outline.js";
@@ -260,7 +259,6 @@ describe("Library Module", () => {
     if (!opened.ok) throw new Error(opened.message);
     const bookId = opened.book.id;
     const sessionStore = createSessionStore(dataHome);
-    const memory = createMemoryModule(dataHome);
     const bookIndex = createBookIndex(dataHome);
     const ocrEngine: OcrEngine = {
       name: "测试引擎",
@@ -277,7 +275,11 @@ describe("Library Module", () => {
 
     const session = sessionStore.ensureSession(bookId);
     sessionStore.appendMessage({ sessionId: session.id, runId: "run-1", role: "reader", body: "保留到删除前", status: "complete" });
-    memory.propose({ bookId, content: "待删除的记忆", source: "conversation" });
+    // Book Memory 已移除（ADR 0006）；手工放入遗留表行，验证删除数据时一并清理。
+    const legacyDb = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    legacyDb.exec("CREATE TABLE IF NOT EXISTS book_memories (id TEXT PRIMARY KEY, book_id TEXT NOT NULL)");
+    legacyDb.prepare("INSERT INTO book_memories (id, book_id) VALUES ('m1', ?)").run(bookId);
+    legacyDb.close();
     await bookIndex.ensureIndexed(bookId, async () => ({ bytes: opened.book.bytes }));
     await ocr.recognizePage({ bookId, page: 1, imageData: "AA==", width: 10, height: 10 });
     await outline.rebuild(bookId, async () => ({ bytes: opened.book.bytes }));
@@ -286,7 +288,9 @@ describe("Library Module", () => {
     expect(library.deleteBookData(bookId)).toEqual({ ok: true, bookId });
     expect(library.list()).toEqual([]);
     expect(sessionStore.findSession(bookId)).toBeUndefined();
-    expect(memory.listProposals(bookId)).toEqual([]);
+    const legacyAfter = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    expect((legacyAfter.prepare("SELECT count(*) AS count FROM book_memories WHERE book_id = ?").get(bookId) as { count: number }).count).toBe(0);
+    legacyAfter.close();
     expect(bookIndex.stats(bookId)).toEqual({ indexedPages: 0, totalPages: 0 });
     expect(ocr.getPage(bookId, 1)).toBeUndefined();
     expect(outline.get(bookId)).toBeUndefined();
@@ -297,7 +301,6 @@ describe("Library Module", () => {
     outline.close();
     ocr.close();
     bookIndex.close();
-    memory.close();
     sessionStore.close();
     library.close();
   });

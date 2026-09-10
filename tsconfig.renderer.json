@@ -8,5 +8,5 @@
     "types": ["vite/client"],
     "noEmit": true
   },
-  "include": ["src/renderer", "src/shared"]
+  "include": ["src/renderer", "src/shared", "vendor/openclaw-agent-core/packages/markdown-core/src"]
 }

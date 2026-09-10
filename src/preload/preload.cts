@@ -28,7 +28,9 @@ const api: PDFMuseApi = {
   saveEmbeddingConnection: (input) => ipcRenderer.invoke("embedding-connection:save", input),
   testEmbeddingConnection: (input) => ipcRenderer.invoke("embedding-connection:test", input),
   getBookConversation: (bookId) => ipcRenderer.invoke("agent:get-conversation", bookId),
+  getRunDiagnostics: (bookId) => ipcRenderer.invoke("agent:get-run-diagnostics", bookId),
   clearBookConversation: (bookId) => ipcRenderer.invoke("agent:clear-conversation", bookId),
+  exportBookConversation: (bookId) => ipcRenderer.invoke("agent:export-conversation", bookId),
   recognizePage: (input) => ipcRenderer.invoke("ocr:recognize-page", input),
   getRecognizedPage: (bookId, page) => ipcRenderer.invoke("ocr:get-page", bookId, page),
   searchBook: (bookId, query, limit) => ipcRenderer.invoke("book:search", bookId, query, limit),
@@ -38,12 +40,6 @@ const api: PDFMuseApi = {
   pauseBackgroundJob: (jobId) => ipcRenderer.invoke("background-jobs:pause", jobId),
   resumeBackgroundJob: (jobId) => ipcRenderer.invoke("background-jobs:resume", jobId),
   cancelBackgroundJob: (jobId) => ipcRenderer.invoke("background-jobs:cancel", jobId),
-  listMemoryProposals: (bookId) => ipcRenderer.invoke("memory:list-proposals", bookId),
-  listBookMemories: (bookId) => ipcRenderer.invoke("memory:list", bookId),
-  listMemoryAudit: (bookId) => ipcRenderer.invoke("memory:audit", bookId),
-  reviewMemoryProposal: (input) => ipcRenderer.invoke("memory:review-proposal", input),
-  revokeBookMemory: (input) => ipcRenderer.invoke("memory:revoke", input),
-  approveAgentTool: (input) => ipcRenderer.invoke("agent:approve-tool", input),
   startAgentRun: (input) => ipcRenderer.invoke("agent:start-run", input),
   cancelAgentRun: (runId) => ipcRenderer.invoke("agent:cancel-run", runId),
   onAgentEvent: (listener) => {
@@ -53,6 +49,10 @@ const api: PDFMuseApi = {
   },
   getReaderProfile: () => ipcRenderer.invoke("reader-profile:get"),
   saveReaderProfile: (input) => ipcRenderer.invoke("reader-profile:save", input),
+  getAppearanceSettings: () => ipcRenderer.invoke("appearance-settings:get"),
+  saveAppearanceSettings: (input) => ipcRenderer.invoke("appearance-settings:save", input),
+  getWebSearchConnection: () => ipcRenderer.invoke("web-search-connection:get"),
+  saveWebSearchConnection: (input) => ipcRenderer.invoke("web-search-connection:save", input),
 };
 
 contextBridge.exposeInMainWorld("pdfMuse", api);

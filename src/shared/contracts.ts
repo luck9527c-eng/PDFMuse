@@ -197,79 +197,14 @@ export type TestEmbeddingConnectionResult =
 
 export type AgentMessageStatus = "complete" | "error" | "cancelled";
 
-export type MemorySource = "pdf" | "conversation" | "summary" | "web";
-export type MemoryTrust = "trusted" | "untrusted";
-export type MemoryProposalStatus = "pending" | "approved" | "rejected" | "revoked";
-
-export type BookMemory = {
-  id: string;
-  bookId: string;
-  content: string;
-  source: MemorySource;
-  sourceId?: string;
-  page?: number;
-  trust: MemoryTrust;
-  createdAt: string;
-  confirmedAt: string;
-  revokedAt?: string;
-};
-
-export type MemoryProposal = {
-  id: string;
-  bookId: string;
-  content: string;
-  source: MemorySource;
-  sourceId?: string;
-  page?: number;
-  trust: MemoryTrust;
-  status: MemoryProposalStatus;
-  createdAt: string;
-  reviewedAt?: string;
-  memoryId?: string;
-};
-
-export type MemorySearchResult = BookMemory & { score: number };
-
-export type ProposeMemoryInput = {
-  bookId: string;
-  content: string;
-  source?: MemorySource;
-  sourceId?: string;
-  page?: number;
-  provenance?: "agent" | "reader" | "pdf-evidence" | "conversation" | "summary" | "web";
-};
-
-export type MemoryMutationResult =
-  | { ok: true; memory?: BookMemory; proposal?: MemoryProposal }
-  | { ok: false; code: "VALIDATION_ERROR" | "NOT_FOUND" | "CONFLICT"; message: string };
-
-export type MemoryProposalReviewInput = {
-  bookId: string;
-  proposalId: string;
-  action: "approve" | "reject";
-};
-
-export type MemoryRevokeInput = {
-  bookId: string;
-  memoryId: string;
-};
-
-export type MemoryAuditEntry = {
-  id: string;
-  bookId: string;
-  proposalId?: string;
-  memoryId?: string;
-  action: string;
-  details?: string;
-  createdAt: string;
-};
-
 /** 回答引用的 PDF Evidence：来自当前书的可信检索结果，可点击跳回原文。 */
 export type ConversationEvidence = {
   source: "pdf";
   page: number;
   snippet: string;
   trust: "trusted";
+  /** 检索相关度（read_pages 的整页读取视为 1）；证据聚合按页取最优、按分截断。 */
+  score?: number;
 };
 
 export type ConversationMessage = {
@@ -288,6 +223,8 @@ export type ConversationMessage = {
 export type ReadingFocus = {
   currentPage: number;
   selectedPassage?: SelectedPassage;
+  /** 当前页所在章节（Main 侧由 Book Outline 解析注入，不信任 Renderer 自报）。 */
+  sectionTitle?: string;
 };
 
 export type BookContext = {
@@ -409,14 +346,18 @@ export type ClearBookConversationResult =
       message: string;
     };
 
+/** 导出会话为 Markdown；cancelled 是用户在保存对话框取消，属正常结果。 */
+export type ExportConversationResult =
+  | { outcome: "saved"; path: string }
+  | { outcome: "cancelled" }
+  | { outcome: "failed"; message: string };
+
 export type AgentStreamEvent =
   | {
       stream: "lifecycle";
-      phase: "start" | "finishing" | "end" | "cancelled" | "error" | "waiting-approval";
+      phase: "start" | "finishing" | "end" | "cancelled" | "error";
       runId: string;
       sessionId: string;
-      approvalId?: string;
-      toolName?: string;
     }
   | {
       stream: "assistant";
@@ -438,7 +379,77 @@ export type AgentStreamEvent =
       callId: string;
       name: string;
       summary?: string;
+    }
+  | {
+      stream: "diagnostics";
+      kind: "request";
+      runId: string;
+      sessionId: string;
+      request: RunDiagnosticsRequest;
+    }
+  | {
+      stream: "diagnostics";
+      kind: "request-complete";
+      runId: string;
+      sessionId: string;
+      callIndex: number;
+      durationMs: number;
+      usage?: RunDiagnosticsUsage;
+    }
+  | {
+      stream: "diagnostics";
+      kind: "tool";
+      runId: string;
+      sessionId: string;
+      toolCall: RunDiagnosticsToolCall;
     };
+
+/** 诊断：一次模型调用的请求快照；messages 为 JSON 安全的序列化形式，图片数据已脱敏。 */
+export type RunDiagnosticsRequest = {
+  callIndex: number;
+  role: "main" | "tool-turn" | "compaction";
+  model: string;
+  systemPrompt: string;
+  messages: unknown[];
+  toolNames: string[];
+  startedAt: string;
+  durationMs?: number;
+  usage?: RunDiagnosticsUsage;
+};
+
+export type RunDiagnosticsUsage = {
+  input: number;
+  output: number;
+  totalTokens: number;
+};
+
+export type RunDiagnosticsToolCall = {
+  callId: string;
+  name: string;
+  parameters: unknown;
+  resultText?: string;
+  evidence?: ConversationEvidence[];
+  durationMs: number;
+};
+
+/** 诊断：一次运行的完整记录；仅存在于内存环形缓冲，不落盘。 */
+export type RunDiagnostics = {
+  runId: string;
+  sessionId: string;
+  question: string;
+  startedAt: string;
+  status: "running" | "complete" | "error" | "cancelled";
+  requests: RunDiagnosticsRequest[];
+  toolCalls: RunDiagnosticsToolCall[];
+  timeline: RunDiagnosticsTimelineEntry[];
+  totalDurationMs?: number;
+};
+
+export type RunDiagnosticsTimelineEntry = {
+  at: string;
+  kind: "run-start" | "request" | "request-complete" | "tool-start" | "tool-end" | "run-end";
+  detail: string;
+};
 
 export type ReaderProfileState = {
   content: string;
@@ -457,6 +468,50 @@ export type SaveReaderProfileResult =
       code: "VALIDATION_ERROR" | "WRITE_ERROR";
       message: string;
     };
+
+export type AppearanceSettings = {
+  sidebarFontSize: number;
+  chatFontSize: number;
+  topbarScale: number;
+};
+
+export type SaveAppearanceSettingsInput = AppearanceSettings;
+
+export type SaveAppearanceSettingsResult =
+  | {
+      ok: true;
+      settings: AppearanceSettings;
+    }
+  | {
+      ok: false;
+      code: "VALIDATION_ERROR" | "WRITE_ERROR";
+      message: string;
+    };
+
+export type WebSearchConnectionState = {
+  tavilyApiKeySet: boolean;
+};
+
+export type SaveWebSearchConnectionInput = {
+  tavilyApiKey?: string;
+  clearApiKey?: boolean;
+};
+
+export type SaveWebSearchConnectionResult =
+  | { ok: true; connection: WebSearchConnectionState }
+  | { ok: false; code: "VALIDATION_ERROR" | "WRITE_ERROR"; message: string };
+
+export const APPEARANCE_DEFAULTS: AppearanceSettings = {
+  sidebarFontSize: 11,
+  chatFontSize: 12,
+  topbarScale: 100,
+};
+
+export const APPEARANCE_LIMITS = {
+  sidebarFontSize: { min: 10, max: 16, step: 1 },
+  chatFontSize: { min: 11, max: 18, step: 1 },
+  topbarScale: { min: 85, max: 125, step: 5 },
+} as const;
 
 export interface PDFMuseApi {
   getStartupPreflight(): Promise<StartupPreflight>;
@@ -477,7 +532,9 @@ export interface PDFMuseApi {
   saveEmbeddingConnection(input: SaveEmbeddingConnectionInput): Promise<SaveEmbeddingConnectionResult>;
   testEmbeddingConnection(input: TestEmbeddingConnectionInput): Promise<TestEmbeddingConnectionResult>;
   getBookConversation(bookId: string): Promise<ConversationMessage[]>;
+  getRunDiagnostics(bookId: string): Promise<RunDiagnostics[]>;
   clearBookConversation(bookId: string): Promise<ClearBookConversationResult>;
+  exportBookConversation(bookId: string): Promise<ExportConversationResult>;
   recognizePage(input: OcrPageRequest): Promise<OcrPageResult>;
   getRecognizedPage(bookId: string, page: number): Promise<RecognizedPageText | undefined>;
   searchBook(bookId: string, query: string, limit?: number): Promise<PdfSearchResult>;
@@ -487,15 +544,13 @@ export interface PDFMuseApi {
   pauseBackgroundJob(jobId: string): Promise<BackgroundJobMutationResult>;
   resumeBackgroundJob(jobId: string): Promise<BackgroundJobMutationResult>;
   cancelBackgroundJob(jobId: string): Promise<BackgroundJobMutationResult>;
-  listMemoryProposals(bookId: string): Promise<MemoryProposal[]>;
-  listBookMemories(bookId: string): Promise<BookMemory[]>;
-  listMemoryAudit(bookId: string): Promise<MemoryAuditEntry[]>;
-  reviewMemoryProposal(input: MemoryProposalReviewInput): Promise<MemoryMutationResult>;
-  revokeBookMemory(input: MemoryRevokeInput): Promise<MemoryMutationResult>;
-  approveAgentTool(input: { approvalId: string; approved: boolean }): Promise<{ ok: true } | { ok: false; message: string }>;
   startAgentRun(input: StartAgentRunInput): Promise<StartAgentRunResult>;
   cancelAgentRun(runId: string): Promise<void>;
   onAgentEvent(listener: (event: AgentStreamEvent) => void): () => void;
   getReaderProfile(): Promise<ReaderProfileState>;
   saveReaderProfile(input: SaveReaderProfileInput): Promise<SaveReaderProfileResult>;
+  getAppearanceSettings(): Promise<AppearanceSettings>;
+  saveAppearanceSettings(input: SaveAppearanceSettingsInput): Promise<SaveAppearanceSettingsResult>;
+  getWebSearchConnection(): Promise<WebSearchConnectionState>;
+  saveWebSearchConnection(input: SaveWebSearchConnectionInput): Promise<SaveWebSearchConnectionResult>;
 }

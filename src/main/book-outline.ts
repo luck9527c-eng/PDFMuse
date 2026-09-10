@@ -66,6 +66,27 @@ export function detectHeadingCandidates(page: number, lines: readonly OutlineTex
   });
 }
 
+/**
+ * 查找某页所在的最深章节路径（如「第5章 › 5.2 主存储器」），供 Reading Focus 注入。
+ * 规则与渲染端目录高亮一致：起点不晚于该页的节点中，起点最新者优先；同起点取更深层。
+ */
+export function findOutlineSectionPath(nodes: readonly BookOutlineNode[], page: number): string | undefined {
+  let best: { page: number; path: string[] } | undefined;
+  const walk = (list: readonly BookOutlineNode[], path: string[]) => {
+    for (const node of list) {
+      const nextPath = [...path, node.label];
+      if (node.page !== undefined && node.page <= page) {
+        if (!best || node.page > best.page || (node.page === best.page && nextPath.length > best.path.length)) {
+          best = { page: node.page, path: nextPath };
+        }
+      }
+      if (node.children.length > 0) walk(node.children, nextPath);
+    }
+  };
+  walk(nodes, []);
+  return best ? best.path.join(" › ") : undefined;
+}
+
 export function buildOutlineTree(headings: readonly OutlineHeading[], pageCount: number): BookOutlineNode[] {
   const labelPages = new Map<string, Set<number>>();
   for (const heading of headings) {

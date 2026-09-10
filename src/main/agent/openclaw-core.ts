@@ -4,9 +4,12 @@
 
 export {
   Agent,
+  buildSessionContext,
+  compact,
   DEFAULT_COMPACTION_SETTINGS,
   estimateTokens,
   generateSummary,
+  prepareCompaction,
   shouldCompact,
   type AgentEvent,
   type AgentMessage,
@@ -15,7 +18,10 @@ export {
   type AgentTool,
   type AgentToolResult,
   type BeforeToolCallContext,
+  type CompactionPreparation,
+  type CompactionResult,
   type CompactionSettings,
+  type SessionTreeEntry,
   type StreamFn,
 } from "../../../vendor/openclaw-agent-core/packages/agent-core/src/index.js";
 
@@ -39,6 +45,9 @@ export {
 } from "@openclaw/ai";
 
 export { registerBuiltInApiProviders } from "@openclaw/ai/providers";
+
+// 工具参数校验：agent-loop 执行前调用同一实现，测试与业务侧共用这一个事实来源。
+export { validateToolArguments, validateToolCall } from "../../../vendor/openclaw-agent-core/packages/agent-core/src/validation.js";
 
 export {
   estimateStringChars,

@@ -15,11 +15,18 @@
       "name": "@openclaw/normalization-core",
       "upstreamPath": "packages/normalization-core",
       "contents": "Only the modules imported by agent-core: cjk-chars, error-coercion, number-coercion, record-coerce, result, string-coerce, utf16-slice."
+    },
+    {
+      "name": "@openclaw/markdown-core",
+      "upstreamPath": "packages/markdown-core",
+      "contents": "Only src/fences.ts (fence-aware span scanning for streaming-safe markdown chunking). Copied from the local OpenClaw workspace snapshot (version 2026.8.1) at D:\\myCode\\openclaw; not tied to the pinned agent-core commit."
     }
   ],
   "notVendored": [
     "All *.test.ts and *.test-support.ts files (fetch from the upstream commit when running Core contract tests during an upgrade).",
-    "OpenClaw Gateway, channels, nodes, plugin loader, SecretRef, workspace config, memory-host-sdk, and every other workspace package."
+    "OpenClaw Gateway, channels, nodes, plugin loader, SecretRef, workspace config, memory-host-sdk, and every other workspace package.",
+    "packages/tool-call-repair: deferred. 3.5k non-test lines; the integration point is the model stream layer (model-runtime streamFn wrapping normalizePlainTextToolCallStreamEvents). Vendor when a real weak-model scenario (plain-text tool calls from an OpenAI-compatible endpoint) is available to verify the wiring.",
+    "extensions/duckduckgo: adapted (not vendored verbatim). src/main/agent/web-search.ts carries the DDG html-endpoint client logic (result parsing regexes, HTML entity decoding, uddg redirect unwrap, bot-challenge detection) from the local OpenClaw workspace snapshot, restructured for PDFMuse (module factory, Tavily-first provider chain with per-request DDG fallback, injected fetch for tests)."
   ],
   "npmDependencies": [
     { "name": "@openclaw/ai", "version": "2026.8.1", "reason": "Public provider runtime (streamSimple/completeSimple). Its root export re-exports @openclaw/llm-core from the same pinned commit, so llm-core is consumed from npm instead of being vendored (avoids duplicate EventStream class declarations). Matches the workspace version at the pinned commit; MIT; engines node>=22.19.0 satisfied by Electron 44 bundled Node 24.19.0." },

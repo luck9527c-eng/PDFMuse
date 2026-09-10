@@ -17,6 +17,9 @@ export type StoredAppConfig = {
     model: string;
     apiKey?: string;
   };
+  webSearch?: {
+    tavilyApiKey?: string;
+  };
   [key: string]: unknown;
 };
 
@@ -48,6 +51,12 @@ function hasValidEmbeddingConfig(value: Record<string, unknown>) {
     && (value.embedding.apiKey === undefined || typeof value.embedding.apiKey === "string");
 }
 
+function hasValidWebSearchConfig(value: Record<string, unknown>) {
+  if (value.webSearch === undefined) return true;
+  if (!isRecord(value.webSearch)) return false;
+  return value.webSearch.tavilyApiKey === undefined || typeof value.webSearch.tavilyApiKey === "string";
+}
+
 export function parseAppConfig(
   source: string,
   options: ParseAppConfigOptions = {},
@@ -56,8 +65,9 @@ export function parseAppConfig(
   const isLegacyVersion = isRecord(value) && (value.version === undefined || value.version === 1);
   if (!isRecord(value)
     || (value.version !== 2 && !(options.allowLegacyVersion && isLegacyVersion))
-    || !hasValidChatConfig(value, Boolean(options.allowLegacyVersion && isLegacyVersion))
-    || !hasValidEmbeddingConfig(value)) {
+      || !hasValidChatConfig(value, Boolean(options.allowLegacyVersion && isLegacyVersion))
+      || !hasValidEmbeddingConfig(value)
+      || !hasValidWebSearchConfig(value)) {
     throw new SyntaxError("Invalid PDFMuse configuration");
   }
 

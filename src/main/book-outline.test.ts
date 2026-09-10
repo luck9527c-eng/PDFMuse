@@ -7,6 +7,7 @@ import {
   buildOutlineTree,
   createBookOutlineModule,
   detectHeadingCandidates,
+  findOutlineSectionPath,
   type OpenOutlineDocument,
   type OutlineTextLine,
 } from "./book-outline.js";
@@ -151,5 +152,17 @@ describe("book outline", () => {
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes }));
     expect(result).toMatchObject({ status: "generated", nodes: [] });
     expect(outline.get(BOOK_ID)).toEqual([]);
+  });
+  it("finds the deepest section path for a reading page", () => {
+    const nodes = buildOutlineTree([
+      { label: "第5章 存储系统", page: 120, level: 1, explicit: true },
+      { label: "5.2 主存储器", page: 140, level: 2, explicit: true },
+      { label: "5.2.3 技术指标", page: 146, level: 3, explicit: true },
+      { label: "第6章 中央处理器", page: 200, level: 1, explicit: true },
+    ], 220);
+    expect(findOutlineSectionPath(nodes, 147)).toBe("第5章 存储系统 › 5.2 主存储器 › 5.2.3 技术指标");
+    expect(findOutlineSectionPath(nodes, 143)).toBe("第5章 存储系统 › 5.2 主存储器");
+    expect(findOutlineSectionPath(nodes, 210)).toBe("第6章 中央处理器");
+    expect(findOutlineSectionPath([], 100)).toBeUndefined();
   });
 });

@@ -4,10 +4,24 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createBookIndex, tokenizeForIndex, type EmbeddingProvider } from "./book-index.js";
+import { createBookIndex, keepStrongHits, tokenizeForIndex, type EmbeddingProvider } from "./book-index.js";
 import { createLibraryModule } from "../library.js";
 
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
+
+describe("keepStrongHits", () => {
+  it("drops hits below 60% of the top score and always keeps the best", () => {
+    const hits = [
+      { score: 0.9, page: 1 },
+      { score: 0.7, page: 2 },
+      { score: 0.5, page: 3 },
+      { score: 0.2, page: 4 },
+    ];
+    expect(keepStrongHits(hits).map((hit) => hit.page)).toEqual([1, 2]);
+    expect(keepStrongHits([{ score: 0.4, page: 1 }])).toHaveLength(1);
+    expect(keepStrongHits([])).toEqual([]);
+  });
+});
 
 describe("tokenizeForIndex", () => {
   it("splits CJK text into single-character tokens and keeps words intact", () => {

@@ -1,30 +1,35 @@
+import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, net } from "electron";
 
 import { preflightDataHome } from "./data-home.js";
 import { createEmbeddingConnectionModule } from "./embedding-connection.js";
 import { scheduleEmbeddingJobIfConfigured } from "./embedding-job-scheduler.js";
 import { createLibraryModule } from "./library.js";
 import { createModelConnectionModule } from "./model-connection.js";
-import { readAppConfig } from "./config-store.js";
+import { readAppConfig, updateAppConfig, type StoredAppConfig } from "./config-store.js";
 import { createAgentHost, type AgentHost } from "./agent/agent-host.js";
 import { createBookIndex } from "./agent/book-index.js";
+import { buildConversationExportFilename, buildConversationMarkdown, selectExportableMessages } from "./agent/conversation-export.js";
 import type { ResolvedModelConnection } from "./agent/model-runtime.js";
 import { createToolRegistry } from "./agent/tool-registry.js";
-import { createMemoryModule } from "./agent/memory.js";
+import { createWebSearchModule } from "./agent/web-search.js";
 import { createOcrModule, createWorkerOcrEngine } from "./ocr.js";
 import { createBackgroundJobModule } from "./background-jobs.js";
-import { createBookOutlineModule } from "./book-outline.js";
+import { createBookOutlineModule, findOutlineSectionPath } from "./book-outline.js";
 import { prioritizedPageOrder } from "./ocr-page-order.js";
 import { createReaderProfileModule } from "./reader-profile.js";
+import { createAppearanceSettingsModule } from "./appearance-settings.js";
 import type {
   AgentStreamEvent,
   BackgroundJobMutationResult,
+  ExportConversationResult,
   LibraryMutationResult,
   ScheduleBackgroundJobInput,
   SaveEmbeddingConnectionInput,
+  SaveWebSearchConnectionResult,
   SaveModelConnectionInput,
   StartupPreflight,
   TestEmbeddingConnectionInput,
@@ -37,7 +42,6 @@ let startupPreflight: StartupPreflight;
 let closeLibrary: (() => void) | undefined;
 let closeAgentHost: (() => void) | undefined;
 let closeBookIndex: (() => void) | undefined;
-let closeMemory: (() => void) | undefined;
 let closeOcr: (() => void) | undefined;
 let closeBackgroundJobs: (() => void) | undefined;
 let closeBookOutline: (() => void) | undefined;
@@ -95,9 +99,13 @@ app.whenReady().then(async () => {
     const isOwnedBook = (bookId: unknown): bookId is string => (
       typeof bookId === "string" && !mutatingBookIds.has(bookId) && library.has(bookId)
     );
+    const getBookTitle = (bookId: unknown): string => (
+      typeof bookId === "string" ? library.list().find((book) => book.id === bookId)?.title ?? "" : ""
+    );
     closeLibrary = library.close;
     const configPath = path.join(startupPreflight.dataHome, "config.json");
     const readerProfile = createReaderProfileModule(startupPreflight.dataHome);
+    const appearanceSettings = createAppearanceSettingsModule(startupPreflight.dataHome);
     const bookIndex = createBookIndex(startupPreflight.dataHome, {
       onEmbeddingError: (error) => {
         const diagnostic = error instanceof Error
@@ -115,8 +123,6 @@ app.whenReady().then(async () => {
       },
     });
     closeBookIndex = bookIndex.close;
-    const memory = createMemoryModule(startupPreflight.dataHome);
-    closeMemory = memory.close;
     const ocr = createOcrModule(startupPreflight.dataHome, createWorkerOcrEngine({
       command: path.join(applicationDirectory(), "resources", "ocr-runtime", process.platform === "win32" ? "python.exe" : "python"),
       args: [path.join(applicationDirectory(), "resources", "ocr-worker", "rapidocr_worker.py")],
@@ -199,7 +205,12 @@ app.whenReady().then(async () => {
         }
       })
       .catch((error) => console.error("读取嵌入模型配置失败，无法清理历史语义索引任务。", error));
-    const toolRegistry = createToolRegistry({ memoryConfigured: true });
+    // 网络搜索：默认 DuckDuckGo（免 Key，Electron net.fetch 遵循系统代理），配置 Tavily Key 后优先并支持降级。
+    const webSearch = createWebSearchModule({
+      loadTavilyApiKey: async () => (await readAppConfig(configPath)).webSearch?.tavilyApiKey,
+      fetchImpl: (input, init) => net.fetch(input, init),
+    });
+    const toolRegistry = createToolRegistry();
     const agentHost: AgentHost = createAgentHost({
       dataHome: startupPreflight.dataHome,
       emit: broadcastAgentEvent,
@@ -215,15 +226,15 @@ app.whenReady().then(async () => {
           : undefined;
       },
       loadReaderProfile: async () => (await readerProfile.get()).content,
-      loadBookTitle: (bookId) => library.list().find((book) => book.id === bookId)?.title,
-      memory,
+      loadBookTitle: (bookId) => getBookTitle(bookId) || undefined,
+      resolveReadingSection: (bookId, page) => findOutlineSectionPath(bookOutline.get(bookId) ?? [], page),
       isKnownBook: isOwnedBook,
       buildTools: (context) => toolRegistry.buildAgentTools(() => ({
         bookId: context.bookId,
         focus: context.focus,
         reportEvidence: context.reportEvidence,
         bookIndex,
-        memory: context.memory,
+        webSearch,
       })),
       indexConversationMessage: async (bookId, message) => {
         await bookIndex.indexConversationMessage(bookId, message);
@@ -304,8 +315,53 @@ app.whenReady().then(async () => {
       "embedding-connection:test",
       (_event, input: TestEmbeddingConnectionInput) => embeddingConnection.test(input),
     );
+    ipcMain.handle("web-search-connection:get", async () => ({
+      tavilyApiKeySet: Boolean((await readAppConfig(configPath)).webSearch?.tavilyApiKey),
+    }));
+    ipcMain.handle("web-search-connection:save", async (_event, input: unknown): Promise<SaveWebSearchConnectionResult> => {
+      if (!input || typeof input !== "object") {
+        return { ok: false, code: "VALIDATION_ERROR", message: "网络搜索配置无效。" };
+      }
+      const value = input as { tavilyApiKey?: unknown; clearApiKey?: unknown };
+      const incomingKey = typeof value.tavilyApiKey === "string" ? value.tavilyApiKey.trim() : "";
+      if (value.tavilyApiKey !== undefined && !incomingKey && value.tavilyApiKey !== "") {
+        return { ok: false, code: "VALIDATION_ERROR", message: "Tavily API Key 必须是文本。" };
+      }
+      try {
+        const config = await updateAppConfig(configPath, (current: StoredAppConfig) => {
+          const key = value.clearApiKey
+            ? undefined
+            : (incomingKey || current.webSearch?.tavilyApiKey);
+          return { ...current, webSearch: key ? { tavilyApiKey: key } : undefined };
+        });
+        return { ok: true, connection: { tavilyApiKeySet: Boolean(config.webSearch?.tavilyApiKey) } };
+      } catch {
+        return { ok: false, code: "WRITE_ERROR", message: "无法保存网络搜索配置，原有配置未更改。" };
+      }
+    });
     ipcMain.handle("agent:get-conversation", (_event, bookId: unknown) => agentHost.getConversation(bookId));
+    ipcMain.handle("agent:get-run-diagnostics", (_event, bookId: unknown) => agentHost.listDiagnostics(bookId));
     ipcMain.handle("agent:clear-conversation", (_event, bookId: unknown) => agentHost.clearConversation(bookId));
+    ipcMain.handle("agent:export-conversation", async (_event, bookId: unknown): Promise<ExportConversationResult> => {
+      const messages = agentHost.getConversation(bookId);
+      if (selectExportableMessages(messages).length === 0) {
+        return { outcome: "failed", message: "本书会话为空，没有可导出的对话。" };
+      }
+      const title = getBookTitle(bookId);
+      const exportedAt = new Date();
+      const save = await dialog.showSaveDialog({
+        title: "导出会话为 Markdown",
+        defaultPath: buildConversationExportFilename(title, exportedAt),
+        filters: [{ name: "Markdown 文件", extensions: ["md"] }],
+      });
+      if (!save.filePath) return { outcome: "cancelled" };
+      try {
+        await writeFile(save.filePath, buildConversationMarkdown({ title, messages, exportedAt }), "utf8");
+        return { outcome: "saved", path: save.filePath };
+      } catch {
+        return { outcome: "failed", message: "无法写入导出文件，请检查保存位置后重试。" };
+      }
+    });
     ipcMain.handle("ocr:get-page", (_event, bookId: unknown, page: unknown) => (
       isOwnedBook(bookId) && typeof page === "number" ? ocr.getPage(bookId, page) : undefined
     ));
@@ -375,33 +431,12 @@ app.whenReady().then(async () => {
     ipcMain.handle("background-jobs:pause", (_event, jobId: unknown) => mutateOwnedJob(jobId, "pause"));
     ipcMain.handle("background-jobs:resume", (_event, jobId: unknown) => mutateOwnedJob(jobId, "resume"));
     ipcMain.handle("background-jobs:cancel", (_event, jobId: unknown) => mutateOwnedJob(jobId, "cancel"));
-    ipcMain.handle("memory:list-proposals", (_event, bookId: unknown) => isOwnedBook(bookId) ? memory.listProposals(bookId) : []);
-    ipcMain.handle("memory:list", (_event, bookId: unknown) => isOwnedBook(bookId) ? memory.listMemories(bookId) : []);
-    ipcMain.handle("memory:audit", (_event, bookId: unknown) => isOwnedBook(bookId) ? memory.listAudit(bookId) : []);
-    ipcMain.handle("memory:review-proposal", (_event, input: unknown) => {
-      if (!input || typeof input !== "object") return { ok: false, code: "VALIDATION_ERROR", message: "记忆审核操作无效。" };
-      const value = input as { bookId?: unknown; proposalId?: unknown; action?: unknown };
-      if (!isOwnedBook(value.bookId) || typeof value.proposalId !== "string" || (value.action !== "approve" && value.action !== "reject")) {
-        return { ok: false, code: "VALIDATION_ERROR", message: "记忆审核操作无效。" };
-      }
-      return memory.review({ bookId: value.bookId, proposalId: value.proposalId, action: value.action }, value.bookId);
-    });
-    ipcMain.handle("memory:revoke", (_event, input: unknown) => {
-      if (!input || typeof input !== "object") return { ok: false, code: "VALIDATION_ERROR", message: "撤销记忆操作无效。" };
-      const value = input as { bookId?: unknown; memoryId?: unknown };
-      if (!isOwnedBook(value.bookId) || typeof value.memoryId !== "string") return { ok: false, code: "VALIDATION_ERROR", message: "撤销记忆操作无效。" };
-      return memory.revoke(value.memoryId, value.bookId);
-    });
-    ipcMain.handle("agent:approve-tool", (_event, input: unknown) => {
-      if (!input || typeof input !== "object") return { ok: false, message: "审批操作无效。" };
-      const value = input as { approvalId?: unknown; approved?: unknown };
-      if (typeof value.approvalId !== "string" || typeof value.approved !== "boolean") return { ok: false, message: "审批操作无效。" };
-      return agentHost.approveTool({ approvalId: value.approvalId, approved: value.approved });
-    });
     ipcMain.handle("agent:start-run", (_event, input: unknown) => agentHost.start(input));
     ipcMain.handle("agent:cancel-run", (_event, runId: unknown) => agentHost.cancel(runId));
     ipcMain.handle("reader-profile:get", () => readerProfile.get());
     ipcMain.handle("reader-profile:save", (_event, input: unknown) => readerProfile.save(input));
+    ipcMain.handle("appearance-settings:get", () => appearanceSettings.get());
+    ipcMain.handle("appearance-settings:save", (_event, input: unknown) => appearanceSettings.save(input));
   }
   createWindow();
   app.on("activate", () => {
@@ -420,8 +455,6 @@ app.once("before-quit", () => {
   closeAgentHost = undefined;
   closeBookIndex?.();
   closeBookIndex = undefined;
-  closeMemory?.();
-  closeMemory = undefined;
   closeOcr?.();
   closeOcr = undefined;
 });

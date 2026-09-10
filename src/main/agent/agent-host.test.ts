@@ -242,7 +242,7 @@ describe("agent host", () => {
       push({ type: "done", reason: "stop", message: assistantMessage("第一轮回答") });
     });
     buildHost({ createStreamFn: () => first.streamFn });
-    await startRun("第一个问题");
+    await startRun("第一个问题", { currentPage: 2 });
     await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"));
 
     events = [];
@@ -255,6 +255,7 @@ describe("agent host", () => {
       createStreamFn: () => second.streamFn,
       loadReaderProfile: async () => "我是工程师，偏好先结论后展开。",
       loadBookTitle: async () => "计算机组成原理（第3版）",
+      resolveReadingSection: async () => "第5章 › 5.2 主存储器",
     });
 
     const focus = {
@@ -282,6 +283,10 @@ describe("agent host", () => {
     expect(serialized).toContain("Selected Passage");
     expect(serialized).toContain("选中的原文片段");
     expect(serialized).not.toContain("当前阅读位置");
+    // 无选段时，当前阅读页以 Reading Focus 进入问题消息。
+    expect(JSON.stringify(first.requests[0]!.context.messages)).toContain("Reading Focus · Reader 当前阅读到第 2 页");
+    // Main 侧解析的章节路径注入 Reading Focus，帮助模型定位相对引用。
+    expect(serialized).toContain("所在章节「第5章 › 5.2 主存储器」");
 
     const conversation = host.getConversation(BOOK_ID);
     expect(conversation).toHaveLength(4);
@@ -313,16 +318,244 @@ describe("agent host", () => {
     expect(result.ok).toBe(true);
     await waitFor(() => lifecyclePhase(events).includes("end"), 5_000);
 
-    expect(calls).toBe(2);
-    expect(fake.requests[1]?.context.messages.some((message) => (
+    // OpenClaw 切点在预算不足时保留最新回答原文，把被切开的问题作为分轮前缀单独摘要：
+    // 1 主摘要 + 2 分轮前缀摘要 + 3 回答。
+    expect(calls).toBe(3);
+    expect(fake.requests[2]?.context.messages.some((message) => (
       typeof message.content === "string" && message.content.includes("Conversation Summary")
     ))).toBe(true);
     const conversation = host.getConversation(BOOK_ID);
     expect(conversation.filter((message) => message.role === "reader")).toHaveLength(9);
     expect(conversation.at(-1)?.body).toBe("压缩后回答");
     const persisted = createSessionStore(dataHome);
-    expect(persisted.getSummary(session.id)?.summary).toBe("历史摘要");
+    expect(persisted.getSummary(session.id)?.summary).toContain("历史摘要");
+    expect(persisted.getSummary(session.id)?.summary).toContain("压缩后回答");
     persisted.close();
+  });
+
+  it("indexes only newly completed messages per run via the watermark", async () => {
+    const indexed: Array<{ role: string; body: string }> = [];
+    const streamFns = ["回答一", "回答二", "回答三"].map((body) => createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage(body) });
+    }));
+    let call = 0;
+    buildHost({
+      createStreamFn: () => streamFns[call++]!.streamFn,
+      indexConversationMessage: (_bookId, message) => indexed.push({ role: message.role, body: message.body }),
+    });
+
+    let finishedRuns = 0;
+    for (const question of ["问题一", "问题二", "问题三"]) {
+      finishedRuns += 1;
+      const result = await startRun(question);
+      expect(result.ok).toBe(true);
+      await waitFor(() => lifecyclePhase(events).filter((phase) => phase === "end").length >= finishedRuns);
+    }
+
+    // 历史消息不重复索引：每轮只新增该轮的问与答。
+    expect(indexed.map((item) => item.body)).toEqual([
+      "问题一", "回答一", "问题二", "回答二", "问题三", "回答三",
+    ]);
+  });
+
+  it("captures run diagnostics for requests, tool calls and usage", async () => {
+    const library = createLibraryModule(dataHome);
+    const bookIndex = createBookIndex(dataHome);
+    const opened = await library.openPath(FIXTURE);
+    expect(opened.ok).toBe(true);
+    const fixtureBookId = opened.ok ? opened.book.id : "";
+    const registry = createToolRegistry();
+
+    const requests: CapturedRequest[] = [];
+    const streamFn = async (model: Model, context: Context, options?: SimpleStreamOptions) => {
+      const request: CapturedRequest = { model, context, options };
+      requests.push(request);
+      const stream = new AssistantMessageEventStream();
+      void Promise.resolve().then(() => {
+        if (requests.length === 1) {
+          const toolCallMessage = assistantMessage("", "toolUse");
+          toolCallMessage.content = [{ type: "toolCall", id: "call-diag-1", name: "book_search", arguments: { query: "Chapter One" } }];
+          stream.push({ type: "start", partial: toolCallMessage });
+          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-diag-1", name: "book_search", arguments: { query: "Chapter One" } }, partial: toolCallMessage });
+          stream.push({ type: "done", reason: "toolUse", message: toolCallMessage });
+          return;
+        }
+        stream.push({ type: "start", partial: assistantMessage("") });
+        stream.push({ type: "done", reason: "stop", message: assistantMessage("诊断用回答。") });
+      });
+      return stream;
+    };
+
+    buildHost({
+      createStreamFn: () => streamFn,
+      buildTools: (context) => registry.buildAgentTools(() => ({
+        bookId: context.bookId,
+        reportEvidence: context.reportEvidence,
+        bookIndex,
+      })),
+    });
+
+    const result = await host.start({ bookId: fixtureBookId, question: "诊断问题" });
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    const diagnostics = host.listDiagnostics(fixtureBookId);
+    expect(diagnostics).toHaveLength(1);
+    const run = diagnostics[0]!;
+    expect(run.status).toBe("complete");
+    expect(run.requests).toHaveLength(2);
+    expect(run.requests[0]!.role).toBe("main");
+    expect(run.requests[1]!.role).toBe("tool-turn");
+    expect(run.requests[0]!.systemPrompt).toContain("PDFMuse");
+    expect(run.requests[0]!.toolNames).toContain("book_search");
+    expect(run.requests[1]!.messages.some((message) => JSON.stringify(message).includes("book_search"))).toBe(true);
+    expect(run.requests[0]!.durationMs).toBeGreaterThanOrEqual(0);
+    expect(run.requests[0]!.usage?.totalTokens).toBeGreaterThan(0);
+    expect(run.toolCalls).toHaveLength(1);
+    expect(run.toolCalls[0]).toMatchObject({ name: "book_search", parameters: { query: "Chapter One" } });
+    expect(run.toolCalls[0]!.resultText).toContain("Chapter One");
+    expect(run.toolCalls[0]!.evidence?.[0]?.page).toBe(1);
+    expect(run.timeline.some((entry) => entry.kind === "run-start")).toBe(true);
+    expect(run.totalDurationMs).toBeGreaterThanOrEqual(0);
+    // 诊断事件实时推送（请求快照 + 完成 + 工具）。
+    const diagnosticEvents = events.filter((event): event is Extract<AgentStreamEvent, { stream: "diagnostics" }> => event.stream === "diagnostics");
+    expect(diagnosticEvents.filter((event) => event.kind === "request")).toHaveLength(2);
+    expect(diagnosticEvents.filter((event) => event.kind === "request-complete")).toHaveLength(2);
+    expect(diagnosticEvents.filter((event) => event.kind === "tool")).toHaveLength(1);
+
+    bookIndex.close();
+    library.close();
+  });
+
+  it("blocks book_search beyond the per-run cap and still answers", async () => {
+    const library = createLibraryModule(dataHome);
+    const bookIndex = createBookIndex(dataHome);
+    const opened = await library.openPath(FIXTURE);
+    expect(opened.ok).toBe(true);
+    const fixtureBookId = opened.ok ? opened.book.id : "";
+    const registry = createToolRegistry();
+
+    const requests: CapturedRequest[] = [];
+    const streamFn = async (model: Model, context: Context, options?: SimpleStreamOptions) => {
+      const request: CapturedRequest = { model, context, options };
+      requests.push(request);
+      const stream = new AssistantMessageEventStream();
+      void Promise.resolve().then(() => {
+        if (requests.length <= 4) {
+          // 连续四次请求检索；第四次应被上限拦截。
+          const toolCallMessage = assistantMessage("", "toolUse");
+          const callId = `call-cap-${requests.length}`;
+          toolCallMessage.content = [{ type: "toolCall", id: callId, name: "book_search", arguments: { query: `Chapter ${requests.length}` } }];
+          stream.push({ type: "start", partial: toolCallMessage });
+          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: callId, name: "book_search", arguments: { query: `Chapter ${requests.length}` } }, partial: toolCallMessage });
+          stream.push({ type: "done", reason: "toolUse", message: toolCallMessage });
+          return;
+        }
+        stream.push({ type: "start", partial: assistantMessage("") });
+        stream.push({ type: "done", reason: "stop", message: assistantMessage("基于已有结果回答。") });
+      });
+      return stream;
+    };
+
+    buildHost({
+      createStreamFn: () => streamFn,
+      buildTools: (context) => registry.buildAgentTools(() => ({
+        bookId: context.bookId,
+        reportEvidence: context.reportEvidence,
+        bookIndex,
+      })),
+    });
+
+    const result = await host.start({ bookId: fixtureBookId, question: "连续检索的问题" });
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    const diagnostics = host.listDiagnostics(fixtureBookId);
+    const run = diagnostics.at(-1)!;
+    const searchCalls = run.toolCalls.filter((toolCall) => toolCall.name === "book_search");
+    expect(searchCalls).toHaveLength(4);
+    expect(searchCalls[3]!.resultText).toContain("上限");
+    expect(run.requests).toHaveLength(5);
+    const conversation = host.getConversation(fixtureBookId);
+    expect(conversation.at(-1)?.body).toBe("基于已有结果回答。");
+
+    bookIndex.close();
+    library.close();
+  });
+
+  it("aggregates evidence per page by best score with an eight-entry cap", async () => {
+    // 注入一个返回可控证据列表的假工具，验证聚合规则。
+    const fakeTool = {
+      name: "fake_evidence",
+      label: "假证据工具",
+      description: "测试用",
+      parameters: { type: "object", properties: {} },
+      async execute() {
+        return {
+          content: [{ type: "text" as const, text: "完成" }],
+          details: {
+            displaySummary: "完成",
+            contentText: "完成",
+            evidence: [
+              { source: "pdf" as const, page: 10, snippet: "低分", trust: "trusted" as const, score: 0.3 },
+              { source: "pdf" as const, page: 10, snippet: "高分", trust: "trusted" as const, score: 0.8 },
+              ...Array.from({ length: 10 }, (_, index) => ({
+                source: "pdf" as const,
+                page: 20 + index,
+                snippet: `第 ${20 + index} 页`,
+                trust: "trusted" as const,
+                score: 0.4 + index * 0.01,
+              })),
+            ],
+          },
+        };
+      },
+    };
+    const requests: CapturedRequest[] = [];
+    const streamFn = async (model: Model, context: Context, options?: SimpleStreamOptions) => {
+      const request: CapturedRequest = { model, context, options };
+      requests.push(request);
+      const stream = new AssistantMessageEventStream();
+      void Promise.resolve().then(() => {
+        if (requests.length === 1) {
+          const toolCallMessage = assistantMessage("", "toolUse");
+          toolCallMessage.content = [{ type: "toolCall", id: "call-agg-1", name: "fake_evidence", arguments: {} }];
+          stream.push({ type: "start", partial: toolCallMessage });
+          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-agg-1", name: "fake_evidence", arguments: {} }, partial: toolCallMessage });
+          stream.push({ type: "done", reason: "toolUse", message: toolCallMessage });
+          return;
+        }
+        stream.push({ type: "start", partial: assistantMessage("") });
+        stream.push({ type: "done", reason: "stop", message: assistantMessage("聚合测试回答") });
+      });
+      return stream;
+    };
+    buildHost({
+      createStreamFn: () => streamFn,
+      buildTools: (context) => [{
+        ...fakeTool,
+        async execute(toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: unknown) {
+          const outcome = await fakeTool.execute();
+          context.reportEvidence((outcome.details as { evidence: never[] }).evidence);
+          return { content: outcome.content };
+        },
+      } as never],
+    });
+
+    const result = await startRun("证据聚合问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    const conversation = host.getConversation(BOOK_ID);
+    const evidence = conversation.at(-1)?.evidence ?? [];
+    // 第 10 页只保留 0.8 分那条；总量截到 8 条且按页码升序展示。
+    expect(evidence).toHaveLength(8);
+    expect(evidence.find((item) => item.page === 10)?.snippet).toBe("高分");
+    expect(evidence.map((item) => item.page)).toEqual([...evidence.map((item) => item.page)].sort((left, right) => left - right));
+    // 截断按分数：0.4 分的第 20 页被挤掉，0.49 分的第 29 页保留。
+    expect(evidence.some((item) => item.page === 20)).toBe(false);
+    expect(evidence.some((item) => item.page === 29)).toBe(true);
   });
 
   it("passes current-turn screenshot blocks to the model without indexing them", async () => {
@@ -619,18 +852,17 @@ describe("agent host", () => {
       const stream = new AssistantMessageEventStream();
       void Promise.resolve().then(() => {
         if (requests.length === 1) {
-          // 第一轮：模型请求检索本书。
-          const toolCallMessage = assistantMessage("", "toolUse");
-          toolCallMessage.content = [{
-            type: "toolCall",
-            id: "call-book-1",
-            name: "book_search",
-            arguments: { query: "Chapter One" },
-          }];
+          // 第一轮：模型先说一句再请求检索本书（多段回答，前段不得被后段覆盖）。
+          const toolCallMessage = assistantMessage("让我先检索原文。", "toolUse");
+          toolCallMessage.content = [
+            { type: "text", text: "让我先检索原文。" },
+            { type: "toolCall", id: "call-book-1", name: "book_search", arguments: { query: "Chapter One" } },
+          ];
           stream.push({ type: "start", partial: toolCallMessage });
+          stream.push({ type: "text_delta", contentIndex: 0, delta: "让我先检索原文。" });
           stream.push({
             type: "toolcall_end",
-            contentIndex: 0,
+            contentIndex: 1,
             toolCall: { type: "toolCall", id: "call-book-1", name: "book_search", arguments: { query: "Chapter One" } },
             partial: toolCallMessage,
           });
@@ -670,10 +902,10 @@ describe("agent host", () => {
     expect(toolEvents.map((event) => event.phase)).toEqual(["start", "update", "end"]);
     expect(toolEvents[0]?.name).toBe("book_search");
 
-    // Evidence 持久化到 assistant 消息并指向真实页码。
+    // Evidence 持久化到 assistant 消息并指向真实页码；工具轮前段的回答不得被后段覆盖。
     const conversation = host.getConversation(fixtureBookId);
     expect(conversation.at(-1)?.status).toBe("complete");
-    expect(conversation.at(-1)?.body).toBe("第一章内容如下。");
+    expect(conversation.at(-1)?.body).toBe("让我先检索原文。第一章内容如下。");
     expect(conversation.at(-1)?.evidence?.[0]).toMatchObject({ source: "pdf", page: 1, trust: "trusted" });
     expect(conversation.at(-1)?.evidence?.[0]?.snippet).toContain("Chapter One");
 

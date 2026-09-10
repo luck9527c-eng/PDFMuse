@@ -4,7 +4,7 @@ import {
   BookOpen,
   BookMinus,
   Bot,
-  Check,
+  Bug,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -17,6 +17,7 @@ import {
   ImagePlus,
   EllipsisVertical,
   Library,
+  Download,
   Loader2,
   LockKeyhole,
   MessageSquareText,
@@ -26,7 +27,6 @@ import {
   PanelRightClose,
   Play,
   Plus,
-  RefreshCw,
   Search,
   ScanText,
   Send,
@@ -39,15 +39,12 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 
 import type {
-  AgentStreamEvent,
   AgentImageAttachment,
+  AppearanceSettings,
   BackgroundJob,
-  BookMemory,
+  ConversationMessage,
   OcrPageResult,
   RecognizedPageText,
-  MemoryProposal,
-  MemoryAuditEntry,
-  ConversationMessage,
   LibraryBook,
   OpenedPdfBook,
   OpenPdfBookResult,
@@ -55,29 +52,21 @@ import type {
   SelectedPassage,
   StartupPreflight,
 } from "../shared/contracts";
+import { APPEARANCE_DEFAULTS, MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES } from "../shared/contracts";
 import { OCR_INPUT_VERSION, OCR_RENDER_SCALE } from "../shared/ocr-config";
-import { MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES } from "../shared/contracts";
 import { IconButton } from "./components/IconButton";
+import { ConversationMessageItem } from "./components/ConversationMessageItem";
+import { DiagnosticsDrawer } from "./components/DiagnosticsDrawer";
 import { MarkdownView } from "./components/MarkdownView";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PdfViewer, type OutlineNode, type PdfViewerHandle, type ViewerSelection, type ViewerState } from "./pdf/PdfViewer";
-import { createAgentEventBuffer } from "./agent-event-buffer";
-import { getConversationReferencePage } from "./conversation-reference";
+import { applyAppearanceSettings } from "./appearance";
+import { findMissingApiMethods } from "./api-compat";
+import { getConversationReferencePages } from "./conversation-reference";
 import { createReadingStateWriter } from "./reading-state-persistence";
+import { useBookConversation } from "./use-book-conversation";
 
 type PassagePopover = Extract<ViewerSelection, { kind: "selected" }>;
-type StreamingReply = { runId: string; sessionId: string; body: string };
-type ComposerSubmission = { runId: string; question: string; passage?: SelectedPassage; attachments: AgentImageAttachment[] };
-type PendingApproval = { approvalId: string; runId: string; toolName?: string };
-
-function ConversationReferenceButton({ page, onOpen }: { page?: number; onOpen(page: number): void }) {
-  if (!page) return null;
-  return <button className="evidence-tag" onClick={() => onOpen(page)}>参考：PDF 第 {page} 页</button>;
-}
-
-const TOOL_TITLES: Record<string, string> = {
-  book_search: "检索本书",
-};
 
 const BACKGROUND_JOB_KIND_LABELS: Record<BackgroundJob["kind"], string> = {
   ocr: "文字识别",
@@ -272,6 +261,9 @@ type LibraryViewProps = {
   loading: boolean;
   unavailableBookId?: string;
   warnings: string[];
+  appearance: AppearanceSettings;
+  onAppearancePreview(settings: AppearanceSettings): void;
+  onAppearanceSaved(settings: AppearanceSettings): void;
   onChoose(): Promise<void>;
   onDropFile(file?: File): Promise<void>;
   onOpenBook(bookId: string): Promise<void>;
@@ -286,6 +278,9 @@ function LibraryView({
   loading,
   unavailableBookId,
   warnings,
+  appearance,
+  onAppearancePreview,
+  onAppearanceSaved,
   onChoose,
   onDropFile,
   onOpenBook,
@@ -340,7 +335,7 @@ function LibraryView({
       >
         <header className="library-topbar">
           <div className="library-brand"><span>PM</span><strong>PDFMuse</strong></div>
-          <SettingsDialog warnings={warnings} />
+          <SettingsDialog warnings={warnings} appearance={appearance} onAppearancePreview={onAppearancePreview} onAppearanceSaved={onAppearanceSaved} />
         </header>
         <section className="library-content">
           <div className="library-heading">
@@ -412,7 +407,7 @@ function LibraryView({
                 <>
                   <Dialog.Title>确认删除本书数据</Dialog.Title>
                   <Dialog.Description id="library-manage-description">
-                    PDFMuse 将永久删除《{managedBook?.title}》的阅读位置、对话、记忆、OCR 结果、目录和索引。PDF 原文件不会被修改或删除。
+                    PDFMuse 将永久删除《{managedBook?.title}》的阅读位置、对话、OCR 结果、目录和索引。PDF 原文件不会被修改或删除。
                   </Dialog.Description>
                   <div className="library-manage-warning">此操作无法撤销。</div>
                   <div className="library-manage-actions">
@@ -425,7 +420,7 @@ function LibraryView({
                   <Dialog.Title>管理《{managedBook?.title}》</Dialog.Title>
                   <Dialog.Description id="library-manage-description">选择如何处理这本书。两种操作都不会修改或删除 PDF 原文件。</Dialog.Description>
                   <div className="library-manage-option">
-                    <div><strong>移出书库</strong><p>从当前书库隐藏，阅读位置、对话、记忆和索引继续保留。以后重新打开同一 PDF 即可恢复。</p></div>
+                    <div><strong>移出书库</strong><p>从当前书库隐藏，阅读位置、对话和索引继续保留。以后重新打开同一 PDF 即可恢复。</p></div>
                     <button className="secondary-command" disabled={busy} onClick={() => managedBook && void runBookMutation(() => onRemove(managedBook.id))}><BookMinus size={16} />移出</button>
                   </div>
                   <div className="library-manage-option destructive">
@@ -467,6 +462,16 @@ export function App() {
     });
   }
   const [preflight, setPreflight] = useState<StartupPreflight>();
+
+  // preload 版本错配检测：渲染端热更新而 Electron 未重启时，缺失的方法在这里可见，
+  // 用横幅提示重启，而不是让首次调用抛 TypeError 导致整树卸载（白屏）。
+  const missingApiMethods = useMemo(() => findMissingApiMethods(window.pdfMuse), []);
+  const apiMismatchBanner = missingApiMethods.length > 0 ? (
+    <div className="api-mismatch-banner" role="alert">
+      <span>界面已更新，部分功能暂不可用（缺失 {missingApiMethods.length} 个接口）。请重启 PDFMuse 保持版本一致。</span>
+    </div>
+  ) : null;
+
   const [startupReady, setStartupReady] = useState(false);
   const [book, setBook] = useState<OpenedPdfBook>();
   const [libraryBooks, setLibraryBooks] = useState<LibraryBook[]>([]);
@@ -498,40 +503,58 @@ export function App() {
   const [draft, setDraft] = useState("");
   const [attachedPassage, setAttachedPassage] = useState<SelectedPassage>();
   const [attachments, setAttachments] = useState<AgentImageAttachment[]>([]);
-  const [conversation, setConversation] = useState<ConversationMessage[]>([]);
-  const [memoryProposals, setMemoryProposals] = useState<MemoryProposal[]>([]);
-  const [bookMemories, setBookMemories] = useState<BookMemory[]>([]);
   const [recognizedPage, setRecognizedPage] = useState<RecognizedPageText>();
   const [ocrLoading, setOcrLoading] = useState(false);
   const [ocrNotice, setOcrNotice] = useState("");
   const [pageRenderRevision, setPageRenderRevision] = useState(0);
   const [backgroundJobs, setBackgroundJobs] = useState<BackgroundJob[]>([]);
   const [generatedOutline, setGeneratedOutline] = useState<OutlineNode[]>();
-  const [memoryAudit, setMemoryAudit] = useState<MemoryAuditEntry[]>([]);
-  const [pendingApproval, setPendingApproval] = useState<PendingApproval>();
-  const [streamingReply, setStreamingReply] = useState<StreamingReply>();
-  const [toolStatus, setToolStatus] = useState<string>();
-  const [agentNotice, setAgentNotice] = useState("");
-  const [conversationLoading, setConversationLoading] = useState(false);
   const [clearConversationOpen, setClearConversationOpen] = useState(false);
   const [clearingConversation, setClearingConversation] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
-  const activeRunRef = useRef<StreamingReply | undefined>(undefined);
-  const agentEventBufferRef = useRef(createAgentEventBuffer());
-  const pendingComposerRef = useRef<ComposerSubmission | undefined>(undefined);
-  const draftRef = useRef(draft);
-  const passageRef = useRef(attachedPassage);
   const attachmentsRef = useRef(attachments);
   const activeBookIdRef = useRef<string | undefined>(undefined);
   const currentPageRef = useRef(viewerState.page);
   const ocrRequestsRef = useRef(new Map<string, Promise<OcrPageResult>>());
-  draftRef.current = draft;
-  passageRef.current = attachedPassage;
   attachmentsRef.current = attachments;
   currentPageRef.current = viewerState.page;
 
+  // AI 助手域：事件路由、乐观上屏与会话状态收敛在 useBookConversation，这里只消费。
+  const {
+    state: conversationState,
+    busy,
+    ask,
+    cancel,
+    dismissNotice,
+    notify,
+    retry,
+    clear,
+    exportMarkdown,
+    refreshDiagnostics,
+  } = useBookConversation(book, () => currentPageRef.current);
+
   useEffect(() => {
     void (window.pdfMuse?.getStartupPreflight() ?? Promise.resolve(browserPreflight)).then(setPreflight);
+  }, []);
+
+  const [appearance, setAppearance] = useState<AppearanceSettings>(APPEARANCE_DEFAULTS);
+
+  useEffect(() => {
+    void (window.pdfMuse?.getAppearanceSettings() ?? Promise.resolve(APPEARANCE_DEFAULTS))
+      .then((settings) => {
+        setAppearance(settings);
+        applyAppearanceSettings(settings);
+      })
+      .catch(() => applyAppearanceSettings(APPEARANCE_DEFAULTS));
+  }, []);
+
+  const previewAppearance = useCallback((settings: AppearanceSettings) => {
+    applyAppearanceSettings(settings);
+  }, []);
+
+  const handleAppearanceSaved = useCallback((settings: AppearanceSettings) => {
+    setAppearance(settings);
+    applyAppearanceSettings(settings);
   }, []);
 
   const refreshLibrary = useCallback(async () => {
@@ -548,28 +571,11 @@ export function App() {
     }
   }, []);
 
-  const refreshConversation = useCallback(async (bookId: string) => {
-    if (!window.pdfMuse) return;
-    setConversationLoading(true);
-    try {
-      setConversation(await window.pdfMuse.getBookConversation(bookId));
-    } catch {
-      setAgentNotice("无法读取本书对话记录。");
-    } finally {
-      setConversationLoading(false);
-    }
-  }, []);
-
-  const refreshMemoryProposals = useCallback(async (bookId: string) => {
-    if (!window.pdfMuse) return;
-    try {
-      const proposals = await window.pdfMuse.listMemoryProposals(bookId);
-      setMemoryProposals(proposals.filter((proposal) => proposal.status === "pending"));
-      setBookMemories(await window.pdfMuse.listBookMemories(bookId));
-      setMemoryAudit(await window.pdfMuse.listMemoryAudit(bookId));
-    } catch {
-      setAgentNotice("无法读取待确认的本书记忆。");
-    }
+  const resetReaderSideState = useCallback(() => {
+    setRecognizedPage(undefined);
+    setOcrNotice("");
+    setBackgroundJobs([]);
+    setGeneratedOutline(undefined);
   }, []);
 
   const refreshBackgroundJobs = useCallback(async (bookId: string) => {
@@ -585,22 +591,6 @@ export function App() {
     } catch {
       setBackgroundJobs([]);
     }
-  }, []);
-
-  const resetConversationState = useCallback(() => {
-    setConversation([]);
-    setMemoryProposals([]);
-    setBookMemories([]);
-    setMemoryAudit([]);
-    setRecognizedPage(undefined);
-    setOcrNotice("");
-    setBackgroundJobs([]);
-    setGeneratedOutline(undefined);
-    setPendingApproval(undefined);
-    setStreamingReply(undefined);
-    setToolStatus(undefined);
-    setAgentNotice("");
-    activeRunRef.current = undefined;
   }, []);
 
   useEffect(() => {
@@ -664,9 +654,7 @@ export function App() {
     setViewerError("");
     setLibraryError("");
     setUnavailableBookId(undefined);
-    resetConversationState();
-    void refreshConversation(openedBook.id);
-    void refreshMemoryProposals(openedBook.id);
+    resetReaderSideState();
     const pdfMuseApi = window.pdfMuse;
     if (pdfMuseApi) {
       void (async () => {
@@ -688,7 +676,7 @@ export function App() {
     setAttachedPassage(undefined);
     setAttachments([]);
     setSelectionFeedback(undefined);
-  }, [refreshBackgroundJobs, refreshConversation, refreshMemoryProposals, resetConversationState]);
+  }, [refreshBackgroundJobs, resetReaderSideState]);
 
   useEffect(() => {
     if (!book || !window.pdfMuse) return;
@@ -948,9 +936,9 @@ export function App() {
     setLibraryError("");
     setUnavailableBookId(undefined);
     setLibraryLoading(true);
-    resetConversationState();
+    resetReaderSideState();
     void refreshLibrary();
-  }, [refreshLibrary, resetConversationState]);
+  }, [refreshLibrary, resetReaderSideState]);
 
   const ocrUnavailable = preflight?.ok === true
     && preflight.warnings.some((warning) => warning.includes("OCR"));
@@ -1037,166 +1025,18 @@ export function App() {
     stateWriterRef.current?.schedule({ bookId: book.id, state: readingStateRef.current });
   }, [book, leftOpen, rightOpen]);
 
-  const handleAgentEvent = useCallback((event: AgentStreamEvent) => {
-      const active = activeRunRef.current;
-      if (active && event.runId === active.runId) {
-        if (event.stream === "assistant") {
-          activeRunRef.current = { ...active, body: active.body + event.delta };
-          setStreamingReply(activeRunRef.current);
-        } else if (event.stream === "tool") {
-          const title = TOOL_TITLES[event.name] ?? event.name;
-          setToolStatus(event.phase === "end" ? `${title}完成` : `${title}中...`);
-        } else if (event.stream === "lifecycle" && event.phase === "waiting-approval" && event.approvalId) {
-          setPendingApproval({ approvalId: event.approvalId, runId: event.runId, toolName: event.toolName });
-        } else if (event.stream === "lifecycle" && (event.phase === "end" || event.phase === "cancelled" || event.phase === "error")) {
-          const submission = pendingComposerRef.current;
-          if (submission?.runId === event.runId) {
-            if (event.phase === "end"
-              && draftRef.current === submission.question
-              && passageRef.current === submission.passage
-              && attachmentsRef.current.length === submission.attachments.length
-              && attachmentsRef.current.every((item, index) => item.id === submission.attachments[index]?.id)) {
-              setDraft("");
-              setAttachedPassage(undefined);
-              setAttachments([]);
-            }
-            pendingComposerRef.current = undefined;
-          }
-          activeRunRef.current = undefined;
-          setPendingApproval(undefined);
-          setStreamingReply(undefined);
-          setToolStatus(undefined);
-          if (book) void refreshConversation(book.id);
-          if (book) void refreshMemoryProposals(book.id);
-        }
-      }
-  }, [book, refreshConversation, refreshMemoryProposals]);
-
-  // Agent 事件订阅：runId 返回前先缓冲，随后按原始顺序回放，避免丢失首批增量。
-  useEffect(() => {
-    if (!window.pdfMuse) return;
-    return window.pdfMuse.onAgentEvent((event) => {
-      const routed = agentEventBufferRef.current.route(event, activeRunRef.current?.runId);
-      for (const item of routed) handleAgentEvent(item);
-    });
-  }, [handleAgentEvent]);
-
-  const askAgent = useCallback(async (question: string, passage?: SelectedPassage, imageAttachments: AgentImageAttachment[] = []) => {
-    if (!book || !window.pdfMuse || activeRunRef.current) return undefined;
-    setAgentNotice("");
-    agentEventBufferRef.current.beginStart();
-    try {
-      const result = await window.pdfMuse.startAgentRun({
-        bookId: book.id,
-        question,
-        focus: {
-          currentPage: viewerState.page,
-          ...(passage ? { selectedPassage: passage } : {}),
-        },
-        ...(imageAttachments.length > 0 ? { attachments: imageAttachments } : {}),
-      });
-      if (!result.ok) {
-        agentEventBufferRef.current.cancelStart();
-        setAgentNotice(result.message);
-        return undefined;
-      }
-      // Reader 问题立即上屏；终态时 refreshConversation 会以持久化数据替换。
-      setConversation((current) => [
-        ...current,
-        {
-          id: `pending-${result.runId}`,
-          sessionId: result.sessionId,
-          runId: result.runId,
-          role: "reader",
-          body: question,
-          status: "complete",
-          ...(passage ? { passage: { page: passage.page, text: passage.text, rects: passage.rects } } : {}),
-          createdAt: new Date().toISOString(),
-        },
-      ]);
-      activeRunRef.current = { runId: result.runId, sessionId: result.sessionId, body: "" };
-      pendingComposerRef.current = { runId: result.runId, question, passage, attachments: imageAttachments };
-      setStreamingReply(activeRunRef.current);
-      const bufferedEvents = agentEventBufferRef.current.activate(result.runId);
-      for (const event of bufferedEvents) handleAgentEvent(event);
-      return result;
-    } catch {
-      agentEventBufferRef.current.cancelStart();
-      setAgentNotice("无法发起回答，请重试。");
-      return undefined;
-    }
-  }, [book, handleAgentEvent, viewerState.page]);
-
   const clearBookConversation = useCallback(async () => {
-    if (!book || !window.pdfMuse || activeRunRef.current) return;
     setClearingConversation(true);
-    setAgentNotice("");
-    try {
-      const result = await window.pdfMuse.clearBookConversation(book.id);
-      if (!result.ok) {
-        setAgentNotice(result.message);
-        return;
-      }
-      setConversation([]);
-      setClearConversationOpen(false);
-      setAgentNotice("本书会话已清空。");
-    } catch {
-      setAgentNotice("无法清空本书会话，请重试。");
-    } finally {
-      setClearingConversation(false);
-    }
-  }, [book]);
-
-  const stopAgent = useCallback(async () => {
-    const active = activeRunRef.current;
-    if (!active || !window.pdfMuse) return;
-    try {
-      await window.pdfMuse.cancelAgentRun(active.runId);
-    } catch {
-      // 取消失败时等待运行自然结束。
-    }
-  }, []);
-
-  const resolveAgentApproval = useCallback(async (approved: boolean) => {
-    if (!window.pdfMuse || !pendingApproval) return;
-    const result = await window.pdfMuse.approveAgentTool({ approvalId: pendingApproval.approvalId, approved });
-    if (!result.ok) setAgentNotice(result.message);
-    setPendingApproval(undefined);
-  }, [pendingApproval]);
-
-  const reviewMemoryProposal = useCallback(async (proposalId: string, action: "approve" | "reject") => {
-    if (!window.pdfMuse || !book) return;
-    try {
-      const result = await window.pdfMuse.reviewMemoryProposal({ bookId: book.id, proposalId, action });
-      if (!result.ok) {
-        setAgentNotice(result.message);
-        return;
-      }
-      await refreshMemoryProposals(book.id);
-    } catch {
-      setAgentNotice("无法更新本书记忆，请重试。");
-    }
-  }, [book, refreshMemoryProposals]);
-
-  const revokeBookMemory = useCallback(async (memoryId: string) => {
-    if (!window.pdfMuse || !book) return;
-    try {
-      const result = await window.pdfMuse.revokeBookMemory({ bookId: book.id, memoryId });
-      if (!result.ok) {
-        setAgentNotice(result.message);
-        return;
-      }
-      await refreshMemoryProposals(book.id);
-    } catch {
-      setAgentNotice("无法撤销本书记忆，请重试。");
-    }
-  }, [book, refreshMemoryProposals]);
+    const outcome = await clear();
+    setClearingConversation(false);
+    if (outcome === "ok") setClearConversationOpen(false);
+  }, [clear]);
 
   const explain = useCallback((selectedPassage: SelectedPassage) => {
     setRightOpen(true);
     setPassage(undefined);
-    void askAgent("请解释这段内容。", selectedPassage);
-  }, [askAgent]);
+    void ask("请解释这段内容。", selectedPassage);
+  }, [ask]);
 
   const askAboutPassage = useCallback((selectedPassage: SelectedPassage) => {
     setAttachedPassage(selectedPassage);
@@ -1215,40 +1055,26 @@ export function App() {
     }
   }, []);
 
-  const retryRun = useCallback((message: ConversationMessage) => {
-    if (!book) return;
-    const readerQuestion = conversation
-      .slice(0, conversation.findIndex((item) => item.id === message.id))
-      .reverse()
-      .find((item) => item.role === "reader" && item.runId === message.runId);
-    if (!readerQuestion) return;
-    // 重试沿用原 Selected Passage 的完整 Evidence 坐标。
-    const passage = readerQuestion.passage
-      ? { bookId: book.id, page: readerQuestion.passage.page, text: readerQuestion.passage.text, rects: readerQuestion.passage.rects }
-      : undefined;
-    void askAgent(readerQuestion.body, passage);
-  }, [askAgent, book, conversation]);
-
   const addClipboardImages = useCallback(async (items: DataTransferItem[]) => {
     const remaining = MAX_AGENT_IMAGE_ATTACHMENTS - attachmentsRef.current.length;
     if (remaining <= 0) {
-      setAgentNotice(`最多添加 ${MAX_AGENT_IMAGE_ATTACHMENTS} 张截图。`);
+      notify(`最多添加 ${MAX_AGENT_IMAGE_ATTACHMENTS} 张截图。`);
       return;
     }
     const files = items.slice(0, remaining).map((item) => item.getAsFile()).filter((file): file is File => Boolean(file));
     if (files.length < items.slice(0, remaining).length) {
-      setAgentNotice("无法读取剪贴板截图，请重试。");
+      notify("无法读取剪贴板截图，请重试。");
       return;
     }
     const accepted: AgentImageAttachment[] = [];
     for (const file of files) {
       const mimeType = file.type.toLowerCase();
       if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mimeType)) {
-        setAgentNotice("仅支持 PNG、JPEG、WEBP 或 GIF 截图。");
+        notify("仅支持 PNG、JPEG、WEBP 或 GIF 截图。");
         continue;
       }
       if (file.size > MAX_AGENT_IMAGE_BYTES) {
-        setAgentNotice("单张截图不能超过 8 MB。");
+        notify("单张截图不能超过 8 MB。");
         continue;
       }
       const dataUrl = await new Promise<string | undefined>((resolve) => {
@@ -1259,7 +1085,7 @@ export function App() {
       });
       const data = dataUrl?.split(",", 2)[1];
       if (!data) {
-        setAgentNotice("读取截图失败，请重试。");
+        notify("读取截图失败，请重试。");
         continue;
       }
       accepted.push({
@@ -1270,9 +1096,9 @@ export function App() {
     }
     if (accepted.length > 0) {
       setAttachments((current) => [...current, ...accepted].slice(0, MAX_AGENT_IMAGE_ATTACHMENTS));
-      setAgentNotice("");
+      notify("");
     }
-    if (items.length > remaining) setAgentNotice(`最多添加 ${MAX_AGENT_IMAGE_ATTACHMENTS} 张截图，超出的图片未添加。`);
+    if (items.length > remaining) notify(`最多添加 ${MAX_AGENT_IMAGE_ATTACHMENTS} 张截图，超出的图片未添加。`);
   }, []);
 
   const handleComposerPaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -1284,26 +1110,46 @@ export function App() {
 
   const sendDraft = useCallback(async () => {
     const question = draft.trim();
-    if (!question || activeRunRef.current) return;
+    if (!question || busy) return;
     const passage = attachedPassage;
     const imageAttachments = attachments;
-    await askAgent(question, passage, imageAttachments);
-  }, [askAgent, attachedPassage, attachments, draft]);
+    setDraft("");
+    setAttachedPassage(undefined);
+    setAttachments([]);
+    const accepted = await ask(question, passage, imageAttachments);
+    if (!accepted) {
+      // 启动失败时恢复已提交的问题与附件；用户随后输入的新草稿优先。
+      setDraft((current) => current || question);
+      setAttachedPassage((current) => current ?? passage);
+      setAttachments((current) => (current.length > 0 ? current : imageAttachments));
+    }
+  }, [ask, attachedPassage, attachments, busy, draft]);
 
   const passageByRun = useMemo(() => {
     const map = new Map<string, { page: number; text: string }>();
-    for (const message of conversation) {
+    for (const message of conversationState.messages) {
       if (message.role === "reader" && message.passage) map.set(message.runId, message.passage);
     }
     return map;
-  }, [conversation]);
+  }, [conversationState.messages]);
+
+  // 稳定引用：memo 化的会话消息项依赖它跳过重渲染。
+  const goToPage = useCallback((page: number) => viewerRef.current?.goToPage(page), []);
+
+  // 运行详情抽屉：入口在消息与流式气泡上；打开时拉取环形缓冲补历史。
+  const [debugRunId, setDebugRunId] = useState<string>();
+  const openDiagnostics = useCallback((runId: string) => setDebugRunId(runId), []);
+  const openMessageDiagnostics = useCallback((message: ConversationMessage) => setDebugRunId(message.runId), []);
+  useEffect(() => {
+    if (debugRunId) void refreshDiagnostics();
+  }, [debugRunId, refreshDiagnostics]);
 
   // 流式输出期间保持对话底部可见。
   useEffect(() => {
     const container = conversationRef.current;
     if (!container) return;
     container.scrollTop = container.scrollHeight;
-  }, [conversation, streamingReply]);
+  }, [conversationState.messages, conversationState.streaming]);
 
   if (!preflight) return <div className="boot-state">正在检查数据目录...</div>;
   if (!preflight.ok) {
@@ -1319,11 +1165,12 @@ export function App() {
   }
   if (!startupReady) return <div className="boot-state">正在恢复最近阅读...</div>;
   if (!book) {
-    return <><LibraryView books={libraryBooks} error={libraryError} loading={libraryLoading} unavailableBookId={unavailableBookId} warnings={preflight.warnings} onChoose={openBook} onDropFile={openDroppedBook} onOpenBook={openLibraryBook} onRelocate={relocateLibraryBook} onRemove={removeLibraryBook} onDeleteData={deleteLibraryBookData} /><PasswordDialog request={passwordRequest} onCancel={() => setPasswordRequest(undefined)} onUnlock={unlockPdf} /></>;
+    return <>{apiMismatchBanner}<LibraryView books={libraryBooks} error={libraryError} loading={libraryLoading} unavailableBookId={unavailableBookId} warnings={preflight.warnings} appearance={appearance} onAppearancePreview={previewAppearance} onAppearanceSaved={handleAppearanceSaved} onChoose={openBook} onDropFile={openDroppedBook} onOpenBook={openLibraryBook} onRelocate={relocateLibraryBook} onRemove={removeLibraryBook} onDeleteData={deleteLibraryBookData} /><PasswordDialog request={passwordRequest} onCancel={() => setPasswordRequest(undefined)} onUnlock={unlockPdf} /></>;
   }
 
   return (
     <Tooltip.Provider>
+      {apiMismatchBanner}
       <div
         className={`workspace ${leftOpen ? "left-open" : ""} ${rightOpen ? "right-open" : ""}`}
         style={{ "--left-width": `${leftWidth}px`, "--right-width": `${rightWidth}px` } as CSSProperties}
@@ -1338,7 +1185,7 @@ export function App() {
           </div>
           <div className="top-actions">
             <span className="data-home-status" title={preflight.dataHome}><span />数据目录</span>
-            <SettingsDialog warnings={preflight.warnings} />
+            <SettingsDialog warnings={preflight.warnings} appearance={appearance} onAppearancePreview={previewAppearance} onAppearanceSaved={handleAppearanceSaved} />
             <IconButton label={rightOpen ? "收起 AI 助手" : "展开 AI 助手"} onClick={() => setRightOpen((value) => !value)}><PanelRightClose /></IconButton>
           </div>
         </header>
@@ -1436,106 +1283,51 @@ export function App() {
             <div className="sidebar-resize-handle right" role="separator" aria-label="调整右侧栏宽度" aria-orientation="vertical" onPointerDown={(event) => beginSidebarResize("right", event)} />
             <header className="assistant-header">
               <div className="assistant-heading"><span className="assistant-title"><Sparkles size={16} />AI 助手</span><span className="assistant-context">本书对话 · 当前 PDF 书籍</span></div>
-              <IconButton label="清空本书会话" disabled={conversation.length === 0 || Boolean(streamingReply) || conversationLoading} onClick={() => setClearConversationOpen(true)}><Trash2 /></IconButton>
+              <IconButton label="导出会话为 Markdown" disabled={conversationState.messages.length === 0 || busy || conversationState.loading} onClick={() => void exportMarkdown()}><Download /></IconButton>
+              <IconButton label="清空本书会话" disabled={conversationState.messages.length === 0 || busy || conversationState.loading} onClick={() => setClearConversationOpen(true)}><Trash2 /></IconButton>
             </header>
             <div className="conversation" ref={conversationRef}>
-              {conversation.length === 0 && !streamingReply && !conversationLoading ? (
+              {conversationState.messages.length === 0 && !conversationState.streaming && !conversationState.loading ? (
                 <div className="conversation-empty"><Bot size={24} /><strong>从原文开始</strong><span>选中文字后解释，或直接询问这本 PDF 书籍。</span></div>
               ) : (
                 <>
-                  {conversationLoading && conversation.length === 0 && <div className="conversation-loading">正在读取对话...</div>}
-                  {conversation.map((message) => (
-                    <article className={`message ${message.role}`} key={message.id}>
-                      <div className="message-role">{message.role === "reader" ? "你" : "PDFMuse"}</div>
-                      {message.role === "reader" ? (
-                        <>
-                          <p>{message.body}</p>
-                          {message.passage && <div className="passage-quote">引用原文 · 第 {message.passage.page} 页</div>}
-                        </>
-                      ) : (
-                        <>
-                          {message.body ? <MarkdownView markdown={message.body} /> : null}
-                          {message.status === "error" && (
-                            <div className="message-failure" role="alert">
-                              <span>{message.errorMessage ?? "回答生成失败。"}</span>
-                              <button className="secondary-command retry-command" onClick={() => retryRun(message)}><RefreshCw size={12} />重试</button>
-                            </div>
-                          )}
-                          {message.status === "cancelled" && message.body && <div className="message-interrupted">回答已停止，以上为已生成内容。</div>}
-                          <ConversationReferenceButton
-                            page={getConversationReferencePage(message, passageByRun.get(message.runId)?.page)}
-                            onOpen={(page) => viewerRef.current?.goToPage(page)}
-                          />
-                        </>
-                      )}
-                    </article>
+                  {conversationState.loading && conversationState.messages.length === 0 && <div className="conversation-loading">正在读取对话...</div>}
+                  {conversationState.messages.map((message) => (
+                    <ConversationMessageItem
+                      key={message.id}
+                      message={message}
+                      referencePages={getConversationReferencePages(message, passageByRun.get(message.runId)?.page)}
+                      onRetry={retry}
+                      onOpenPage={goToPage}
+                      onOpenDiagnostics={openMessageDiagnostics}
+                    />
                   ))}
-                  {streamingReply && (
+                  {conversationState.streaming && (
                     <article className="message assistant streaming">
-                      <div className="message-role">PDFMuse</div>
-                      {streamingReply.body ? <MarkdownView markdown={streamingReply.body} /> : <div className="streaming-hint"><Loader2 size={13} className="spin" />正在生成回答...</div>}
-                      {toolStatus && <div className="tool-status" role="status"><Search size={12} className="spin" />{toolStatus}</div>}
-                      {streamingReply.body && <span className="streaming-cursor" aria-hidden />}
+                      <div className="message-role">
+                        <span>PDFMuse</span>
+                        <button
+                          className="diag-entry"
+                          aria-label="查看运行详情"
+                          title="查看运行详情（发给模型的内容与 AI 的行为）"
+                          onClick={() => openDiagnostics(conversationState.streaming!.runId)}
+                        ><Bug size={12} /></button>
+                      </div>
+                      {conversationState.streaming.body ? <MarkdownView markdown={conversationState.streaming.body} streaming /> : <div className="streaming-hint"><Loader2 size={13} className="spin" />正在生成回答...</div>}
+                      {conversationState.toolStatus && <div className="tool-status" role="status"><Search size={12} className="spin" />{conversationState.toolStatus}</div>}
+                      {conversationState.streaming.body && <span className="streaming-cursor" aria-hidden />}
                     </article>
                   )}
                 </>
               )}
             </div>
-            {agentNotice && (
+            {conversationState.notice && (
               <div className="agent-notice" role="alert">
-                <span>{agentNotice}</span>
-                <button aria-label="关闭提示" onClick={() => setAgentNotice("")}><X size={13} /></button>
+                <span>{conversationState.notice}</span>
+                <button aria-label="关闭提示" onClick={dismissNotice}><X size={13} /></button>
               </div>
             )}
             <div className="composer-wrap">
-              {pendingApproval && (
-                <section className="memory-proposals approval-request" aria-label="等待确认">
-                  <div className="memory-proposals-title">智能体请求保存一条本书记忆</div>
-                  <p>确认后会创建待审核候选，仍需在下方再次审核后才会进入本书记忆。</p>
-                  <div className="memory-proposal-actions">
-                    <button aria-label="允许智能体提议记忆" title="允许" onClick={() => void resolveAgentApproval(true)}><Check size={13} />允许</button>
-                    <button aria-label="拒绝智能体提议记忆" title="拒绝" onClick={() => void resolveAgentApproval(false)}><X size={13} />拒绝</button>
-                  </div>
-                </section>
-              )}
-              {memoryProposals.length > 0 && (
-                <section className="memory-proposals" aria-label="待确认的本书记忆">
-                  <div className="memory-proposals-title">待确认的本书记忆</div>
-                  {memoryProposals.map((proposal) => (
-                    <article className="memory-proposal" key={proposal.id}>
-                      <p title={proposal.content}>{proposal.content}</p>
-                      <small>{proposal.source === "pdf" ? "PDF 原文" : proposal.source === "conversation" ? "较早对话" : proposal.source === "summary" ? "会话摘要" : "网页资料"} · 待核实</small>
-                      <div className="memory-proposal-actions">
-                        <button aria-label="确认记忆" title="确认记忆" onClick={() => void reviewMemoryProposal(proposal.id, "approve")}><Check size={13} />确认</button>
-                        <button aria-label="拒绝记忆" title="拒绝记忆" onClick={() => void reviewMemoryProposal(proposal.id, "reject")}><X size={13} />拒绝</button>
-                      </div>
-                    </article>
-                  ))}
-                </section>
-              )}
-              {bookMemories.length > 0 && (
-                <section className="book-memories" aria-label="本书记忆">
-                  <div className="memory-proposals-title">本书记忆</div>
-                  {bookMemories.map((memory) => (
-                    <article className="book-memory" key={memory.id}>
-                      <p title={memory.content}>{memory.content}</p>
-                      <small>{memory.source === "pdf" ? "PDF 原文" : memory.source === "conversation" ? "较早对话" : memory.source === "summary" ? "会话摘要" : "网页资料"} · {memory.trust === "trusted" ? "已确认" : "待核实"}</small>
-                      <button aria-label="撤销本条记忆" title="撤销本条记忆" onClick={() => void revokeBookMemory(memory.id)}><X size={12} />撤销</button>
-                    </article>
-                  ))}
-                </section>
-              )}
-              {memoryAudit.length > 0 && (
-                <details className="memory-audit">
-                  <summary>记忆变更记录</summary>
-                  {memoryAudit.slice(0, 8).map((entry) => (
-                    <div className="memory-audit-row" key={entry.id}>
-                      <span>{entry.action === "proposal_created" ? "创建候选" : entry.action === "proposal_approved" ? "确认记忆" : entry.action === "proposal_rejected" ? "拒绝候选" : entry.action === "memory_revoked" ? "撤销记忆" : entry.action}</span>
-                      <time>{new Date(entry.createdAt).toLocaleString("zh-CN")}</time>
-                    </div>
-                  ))}
-                </details>
-              )}
               {attachedPassage && <div className="passage-chip"><span>已选原文 · 第 {attachedPassage.page} 页</span><p>{attachedPassage.text}</p><button aria-label="移除已选原文" onClick={() => setAttachedPassage(undefined)}><X size={14} /></button></div>}
               {attachments.length > 0 && (
                 <div className="attachment-strip" aria-label="截图附件">
@@ -1549,12 +1341,18 @@ export function App() {
               )}
               <div className="composer">
                 <textarea ref={composerRef} value={draft} onChange={(event) => setDraft(event.target.value)} onPaste={handleComposerPaste} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendDraft(); } }} placeholder={attachments.length > 0 ? "已添加截图，输入问题..." : "询问这本 PDF 书籍..."} rows={2} />
-                {streamingReply
-                  ? <button className="send-button stop" aria-label="停止回答" onClick={() => void stopAgent()}><Square size={14} /></button>
+                {conversationState.streaming
+                  ? <button className="send-button stop" aria-label="停止回答" onClick={() => void cancel()}><Square size={14} /></button>
                   : <button className="send-button" aria-label="发送问题" disabled={!draft.trim()} onClick={() => void sendDraft()}><Send size={17} /></button>}
               </div>
               <div className="composer-meta" title={`粘贴截图，最多 ${MAX_AGENT_IMAGE_ATTACHMENTS} 张`} aria-label={`截图附件 ${attachments.length}/${MAX_AGENT_IMAGE_ATTACHMENTS}`}><ImagePlus size={12} />{attachments.length > 0 && <span>{attachments.length}/{MAX_AGENT_IMAGE_ATTACHMENTS}</span>}</div>
             </div>
+            {debugRunId && (
+              <DiagnosticsDrawer
+                run={conversationState.diagnostics[debugRunId]}
+                onClose={() => setDebugRunId(undefined)}
+              />
+            )}
           </aside>
         )}
 
@@ -1572,7 +1370,7 @@ export function App() {
             <Dialog.Overlay className="dialog-overlay" />
             <Dialog.Content className="settings-dialog conversation-clear-dialog" aria-describedby="clear-conversation-description">
               <div className="dialog-heading">
-                <div><Dialog.Title>清空本书会话</Dialog.Title><Dialog.Description id="clear-conversation-description">将删除这本 PDF 的全部聊天记录和会话摘要。本书记忆、OCR 与 PDF 索引会保留。</Dialog.Description></div>
+                <div><Dialog.Title>清空本书会话</Dialog.Title><Dialog.Description id="clear-conversation-description">将删除这本 PDF 的全部聊天记录和会话摘要。OCR 与 PDF 索引会保留。</Dialog.Description></div>
                 <Dialog.Close asChild><IconButton label="关闭清空会话确认" disabled={clearingConversation}><X /></IconButton></Dialog.Close>
               </div>
               <div className="library-manage-actions">

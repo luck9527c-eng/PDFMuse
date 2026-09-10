@@ -16,6 +16,16 @@ const CJK_PATTERN = /[\u3000-\u9fff\uff00-\uffef]/;
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
 const TEXT_EXTRACTION_VERSION = "v2-structured-lines";
 
+/**
+ * 相对阈值截断：丢弃不足最高分 60% 的弱命中，避免「最不差的 N 个」式噪声
+ * （语义余弦几乎恒为正，无阈值时全书页面都有正分）。首条（最高分）恒保留。
+ */
+export function keepStrongHits<T extends { score: number }>(items: readonly T[], ratio = 0.6): T[] {
+  const top = items[0]?.score ?? 0;
+  if (top <= 0) return [...items];
+  return items.filter((item) => item.score >= top * ratio);
+}
+
 export function tokenizeForIndex(text: string) {
   return Array.from(text)
     .map((char) => (CJK_PATTERN.test(char) ? ` ${char} ` : char))
@@ -251,6 +261,9 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   );
   const pageTextStatement = database.prepare(
     "SELECT page, text FROM book_pages WHERE book_id = ? AND extraction_version = ? ORDER BY page ASC",
+  );
+  const readPagesStatement = database.prepare(
+    "SELECT page, text FROM book_pages WHERE book_id = ? AND extraction_version = ? AND page >= ? AND page <= ? ORDER BY page ASC",
   );
   const embeddingRowsStatement = database.prepare(`
     SELECT source, source_id, page, text, vector_json, model, dimensions, content_hash
@@ -666,8 +679,12 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       const currentPage = focus?.currentPage;
       const scored = [...candidates.values()]
         .map((candidate) => {
+          // 阅读位置先验：选段页最强，当前页 ±1 窗口次之（复习/讲解的小节通常跨 2-3 页）。
+          const nearCurrentPage = currentPage !== undefined
+            && candidate.page !== undefined
+            && Math.abs(candidate.page - currentPage) <= 1;
           const focusBoost = candidate.source === "pdf"
-            ? (candidate.page === selectedPage ? 0.3 : 0) + (candidate.page === currentPage ? 0.1 : 0)
+            ? (candidate.page === selectedPage ? 0.3 : 0) + (nearCurrentPage ? 0.2 : 0)
             : 0;
           const base = retrievalMode === "hybrid"
             ? candidate.semantic * 0.65 + candidate.lexical * 0.35
@@ -682,7 +699,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
           || left.candidate.sourceId.localeCompare(right.candidate.sourceId)
         ));
 
-      const hits: BookSearchHit[] = scored.slice(0, Math.max(1, limit)).map(({ candidate, score }) => ({
+      const hits: BookSearchHit[] = keepStrongHits(scored.slice(0, Math.max(1, limit))).map(({ candidate, score }) => ({
         source: candidate.source,
         ...(candidate.page === undefined ? {} : { page: candidate.page }),
         sourceId: candidate.sourceId,
@@ -721,6 +738,16 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       const row = bookRowStatement.get(bookId) as BookRow | undefined;
       if (!row) throw new Error("书库中没有这本书。");
       return loadBookBytes(row.current_path, row.saved_password ?? undefined);
+    },
+
+    /** 读取指定页码范围（含端点）的已索引整页文本；供 read_pages 工具整页阅读。 */
+    readPages(bookId: string, fromPage: number, toPage: number): Array<{ page: number; text: string }> {
+      return readPagesStatement.all(bookId, TEXT_EXTRACTION_VERSION, fromPage, toPage) as Array<{ page: number; text: string }>;
+    },
+
+    /** 渲染指定页为 PNG（base64）；供 read_page_image 工具给模型看公式与结构的原图。 */
+    async renderPageImage(bookId: string, page: number, scale = 2) {
+      return renderPageForOcr(bookId, page, scale);
     },
 
     stats(bookId: string) {

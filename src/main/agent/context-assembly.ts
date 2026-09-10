@@ -1,5 +1,5 @@
-import type { AgentImageAttachment, BookContext, MemorySearchResult, ReadingFocus } from "../../shared/contracts.js";
-import type { AssistantMessage, ImageContent, Message, UserMessage } from "./openclaw-core.js";
+import type { AgentImageAttachment, BookContext, ReadingFocus } from "../../shared/contracts.js";
+import type { AssistantMessage, ImageContent, Message, SessionTreeEntry, UserMessage } from "./openclaw-core.js";
 
 const SYSTEM_PROMPT = [
   "你是 PDFMuse，一位帮助 Reader 精读 PDF 书籍的中文阅读助手。",
@@ -41,6 +41,11 @@ export function buildQuestionContent(question: string, focus?: ReadingFocus) {
   if (focus?.selectedPassage) {
     sections.push(`【Selected Passage · 第 ${focus.selectedPassage.page} 页】\n${focus.selectedPassage.text}`);
   }
+  if (focus) {
+    const bits = [`Reader 当前阅读到第 ${focus.currentPage} 页`];
+    if (focus.sectionTitle) bits.push(`所在章节「${focus.sectionTitle}」`);
+    sections.push(`【Reading Focus · ${bits.join("，")}】`);
+  }
   sections.push(`【Reader 的问题】\n${question}`);
   return sections.join("\n\n");
 }
@@ -81,6 +86,32 @@ export function historyMessagesToLlmMessages(
 }
 
 /**
+ * 持久化消息 → OpenClaw 会话树条目；可用性过滤与 historyMessagesToLlmMessages 一致，
+ * 供 prepareCompaction/compact 在树语义上选择切点。
+ */
+export function toSessionEntries(
+  history: ReadonlyArray<{
+    id: string;
+    createdAt: string;
+    role: "reader" | "assistant";
+    body: string;
+    status: string;
+  }>,
+): SessionTreeEntry[] {
+  const usable = history.filter(
+    (message) => message.role === "reader" || message.status === "complete",
+  );
+  const messages = historyMessagesToLlmMessages(usable);
+  return usable.map((source, index) => ({
+    type: "message" as const,
+    id: source.id,
+    parentId: null,
+    timestamp: source.createdAt,
+    message: messages[index]!,
+  }));
+}
+
+/**
  * 把已持久化的会话消息转换为下一轮模型上下文。
  * 错误或被取消的回答不进入模型上下文，但在 Reader 侧保留展示。
  */
@@ -91,7 +122,6 @@ export function historyToLlmMessages(
   limit = 12,
   attachments: readonly AgentImageAttachment[] = [],
   summary?: string,
-  memories: readonly MemorySearchResult[] = [],
 ): Message[] {
   const recent = historyMessagesToLlmMessages(history).slice(-limit);
   const messages: Message[] = [];
@@ -99,13 +129,6 @@ export function historyToLlmMessages(
     messages.push({ role: "user", content: `【Conversation Summary】\n${summary.trim()}`, timestamp: 0 });
   }
   messages.push(...recent);
-  if (memories.length > 0) {
-    messages.push({
-      role: "user",
-      content: `【相关本书记忆（仅供参考）】\n${memories.slice(0, 6).map((memory) => `- ${memory.content}`).join("\n")}`,
-      timestamp: 0,
-    });
-  }
   const imageBlocks: ImageContent[] = attachments.map((attachment) => ({
     type: "image",
     data: attachment.data,

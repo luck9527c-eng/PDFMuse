@@ -478,6 +478,7 @@ export function createLibraryModule(dataHome: string) {
           "semantic_embeddings",
           "book_pages_fts",
           "book_pages",
+          // Book Memory 已移除（ADR 0006）；遗留表在删除书籍数据时一并清理。
           "memory_fts",
           "memory_audit",
           "memory_proposals",
