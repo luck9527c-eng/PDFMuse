@@ -1,63 +1,53 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 
-import {
-  loadKatex,
-  renderFormula,
-  renderMarkdownHtml,
-  splitFormulas,
-  type MarkdownSegment,
-} from "../markdown";
+import { loadKatex, renderFormula, renderMarkdownWithFormulaSlots } from "../markdown";
 import { splitSettledMarkdown } from "../streaming-markdown";
 
-function FormulaSpan({ formula, display }: { formula: string; display: boolean }) {
-  const ref = useRef<HTMLSpanElement>(null);
-  const [failed, setFailed] = useState(false);
+/**
+ * Markdown 安全体：GFM + 公式槽位。公式以占位符参与 Markdown 解析（加粗/列表
+ * 不被行内公式撕碎），消毒后替换为槽位，此处惰性加载 KaTeX 注水。
+ * 注水通过 MutationObserver 自愈：渲染层任何原因重建 innerHTML 后，
+ * 新出现的未注水槽位会被自动补注（流式增量期间公式也保持渲染）。
+ */
+function MarkdownBody({ markdown }: { markdown: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const html = useMemo(() => renderMarkdownWithFormulaSlots(markdown), [markdown]);
 
   useEffect(() => {
-    let cancelled = false;
-    void loadKatex().then((katex) => {
-      if (cancelled || !katex || !ref.current) return;
-      try {
-        ref.current.innerHTML = renderFormula(katex, formula, display);
-      } catch {
-        if (!cancelled) setFailed(true);
-      }
-    });
-    return () => {
-      cancelled = true;
+    const container = ref.current;
+    if (!container || !html.includes("formula-slot")) return;
+
+    let hydrating = false;
+    const hydratePending = () => {
+      if (hydrating) return;
+      const pending = container.querySelectorAll<HTMLSpanElement>("span.formula-slot:not([data-hydrated])");
+      if (pending.length === 0) return;
+      hydrating = true;
+      void loadKatex().then((katex) => {
+        hydrating = false;
+        if (!katex) return;
+        for (const slot of pending) {
+          // 先标记再写入，避免注水自身触发的变更形成循环。
+          slot.dataset.hydrated = "1";
+          try {
+            slot.innerHTML = renderFormula(katex, slot.dataset.formula ?? "", slot.dataset.display === "1");
+          } catch {
+            // 保留槽位内的原始公式文本作为回退。
+          }
+        }
+      });
     };
-  }, [display, formula]);
 
-  if (failed) {
-    return <code className="formula-fallback">{formula}</code>;
-  }
-  return <span className={display ? "formula-display" : "formula-inline"} ref={ref} aria-label="公式" />;
+    hydratePending();
+    const observer = new MutationObserver(hydratePending);
+    observer.observe(container, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [html]);
+
+  return <div className="markdown-body" ref={ref} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-function MarkdownBody({ markdown }: { markdown: string }) {
-  const segments = useMemo(() => splitFormulas(markdown), [markdown]);
-  if (segments.every((segment: MarkdownSegment) => segment.kind === "text" && !segment.value)) {
-    return null;
-  }
-  return (
-    <>
-      {segments.map((segment, index) =>
-        segment.kind === "text"
-          ? (segment.value.trim() ? <TextHtml key={index} markdown={segment.value} /> : null)
-          : <FormulaSpan key={index} formula={segment.value} display={segment.display} />,
-      )}
-    </>
-  );
-}
-
-function TextHtml({ markdown }: { markdown: string }) {
-  const html = useMemo(() => renderMarkdownHtml(markdown), [markdown]);
-  return <div className="markdown-body" dangerouslySetInnerHTML={{ __html: html }} />;
-}
-
-/**
- * 已完成块的稳定渲染：流式期间前缀不随增量变化，memo 让解析与消毒每块只跑一次。
- */
+/** 已完成块的稳定渲染：流式期间前缀不随增量变化，memo 让解析与消毒每块只跑一次。 */
 const SettledMarkdown = memo(function SettledMarkdown({ markdown }: { markdown: string }) {
   return <MarkdownBody markdown={markdown} />;
 });

@@ -1,6 +1,8 @@
 import DOMPurify from "dompurify";
 import { marked } from "marked";
 
+import { parseFenceSpans } from "../../vendor/openclaw-agent-core/packages/markdown-core/src/index.js";
+
 marked.setOptions({ gfm: true, breaks: false });
 
 if (typeof window !== "undefined") {
@@ -48,6 +50,53 @@ export function splitFormulas(markdown: string): MarkdownSegment[] {
     segments.push({ kind: "text", value: markdown.slice(lastIndex) });
   }
   return segments;
+}
+
+/**
+ * 公式占位符渲染：先把公式替换为纯文本占位符再走 Markdown 解析，
+ * 保证含行内公式的加粗/斜体/列表不被撕碎（段落结构完整），
+ * 消毒后再把占位符替换为 KaTeX 槽位（由视图层异步注水）。
+ * 围栏代码块与行内代码中的 $ 不视为公式。
+ */
+const PLACEHOLDER_PREFIX = "PMFRM";
+const INLINE_CODE_PATTERN = /`[^`\n]+`/g;
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+export function renderMarkdownWithFormulaSlots(markdown: string): string {
+  const masked: Array<[number, number]> = [];
+  const fenceSpans = parseFenceSpans(markdown);
+  for (const span of fenceSpans) masked.push([span.start, span.end]);
+  for (const match of markdown.matchAll(INLINE_CODE_PATTERN)) {
+    masked.push([match.index ?? 0, (match.index ?? 0) + match[0].length]);
+  }
+  const inMaskedRegion = (index: number) => masked.some(([start, end]) => index >= start && index < end);
+
+  const slots: Array<{ formula: string; display: boolean; placeholder: string }> = [];
+  let text = "";
+  let lastIndex = 0;
+  for (const match of markdown.matchAll(FORMULA_PATTERN)) {
+    const index = match.index ?? 0;
+    if (inMaskedRegion(index)) continue;
+    const placeholder = `${PLACEHOLDER_PREFIX}${slots.length}`;
+    slots.push({
+      formula: (match[1] ?? match[2] ?? "").trim(),
+      display: match[1] !== undefined,
+      placeholder,
+    });
+    text += markdown.slice(lastIndex, index) + placeholder;
+    lastIndex = index + match[0].length;
+  }
+  text += markdown.slice(lastIndex);
+
+  let html = renderMarkdownHtml(text);
+  for (const slot of slots) {
+    const slotHtml = `<span class="formula-slot ${slot.display ? "formula-display" : "formula-inline"}" data-formula="${escapeHtml(slot.formula)}" data-display="${slot.display ? 1 : 0}">$${escapeHtml(slot.formula)}$</span>`;
+    html = html.split(slot.placeholder).join(slotHtml);
+  }
+  return html;
 }
 
 let katexLoader: Promise<typeof import("katex") | undefined> | undefined;
