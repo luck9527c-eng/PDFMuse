@@ -58,6 +58,7 @@ import { IconButton } from "./components/IconButton";
 import { ConversationMessageItem } from "./components/ConversationMessageItem";
 import { DiagnosticsDrawer } from "./components/DiagnosticsDrawer";
 import { MarkdownView } from "./components/MarkdownView";
+import { OutlinePanel } from "./components/OutlinePanel";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PdfViewer, type OutlineNode, type PdfViewerHandle, type ViewerSelection, type ViewerState } from "./pdf/PdfViewer";
 import { applyAppearanceSettings } from "./appearance";
@@ -89,102 +90,6 @@ const browserPreflight: StartupPreflight = {
   dataHome: "浏览器预览模式",
   warnings: ["桌面文件访问仅在 Electron 中启用。"],
 };
-
-function flattenOutline(nodes: OutlineNode[]): OutlineNode[] {
-  return nodes.flatMap((node) => [node, ...flattenOutline(node.children)]);
-}
-
-function findOutlinePath(nodes: OutlineNode[], targetId: string): string[] {
-  for (const node of nodes) {
-    if (node.id === targetId) return [node.id];
-    const childPath = findOutlinePath(node.children, targetId);
-    if (childPath.length > 0) return [node.id, ...childPath];
-  }
-  return [];
-}
-
-function OutlineTree({
-  nodes,
-  activeId,
-  expanded,
-  onToggle,
-  onGoToPage,
-}: {
-  nodes: OutlineNode[];
-  activeId?: string;
-  expanded: Set<string>;
-  onToggle(id: string): void;
-  onGoToPage(page: number): void;
-}) {
-  if (nodes.length === 0) {
-    return <p className="outline-empty">未检测到可用章节。</p>;
-  }
-
-  return (
-    <div className="outline-tree">
-      {nodes.map((node) => (
-        <div className="outline-group" key={node.id}>
-          <div className={`outline-row ${node.id === activeId ? "current" : ""}`} data-outline-id={node.id}>
-            {node.children.length > 0 ? (
-              <button className="outline-toggle" aria-label={expanded.has(node.id) ? "折叠章节" : "展开章节"} onClick={() => onToggle(node.id)}>
-                {expanded.has(node.id) ? <ChevronDown /> : <ChevronRight />}
-              </button>
-            ) : <span className="outline-spacer" />}
-            <button className="outline-item" disabled={!node.page} onClick={() => node.page && onGoToPage(node.page)}>
-              <span>{node.label}</span>
-              {node.page && <span className="outline-page">{node.page}</span>}
-            </button>
-          </div>
-          {node.children.length > 0 && expanded.has(node.id) && (
-            <OutlineTree nodes={node.children} activeId={activeId} expanded={expanded} onToggle={onToggle} onGoToPage={onGoToPage} />
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function OutlinePanel({ nodes, page, emptyMessage, onGoToPage }: { nodes: OutlineNode[]; page: number; emptyMessage: string; onGoToPage(page: number): void }) {
-  const rootRef = useRef<HTMLDivElement>(null);
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const activeId = useMemo(() => {
-    let active: OutlineNode | undefined;
-    for (const node of flattenOutline(nodes)) {
-      if (node.page !== undefined && node.page <= page && (!active?.page || node.page >= active.page)) active = node;
-    }
-    return active?.id;
-  }, [nodes, page]);
-
-  useEffect(() => {
-    setExpanded(new Set(flattenOutline(nodes).filter((node) => node.children.length > 0).map((node) => node.id)));
-  }, [nodes]);
-
-  useEffect(() => {
-    if (!activeId) return;
-    setExpanded((current) => new Set([...current, ...findOutlinePath(nodes, activeId)]));
-    requestAnimationFrame(() => {
-      rootRef.current?.querySelector(`[data-outline-id="${activeId}"]`)?.scrollIntoView({ block: "nearest" });
-    });
-  }, [activeId, nodes]);
-
-  if (nodes.length === 0) return <p className="outline-empty">{emptyMessage}</p>;
-
-  return (
-    <div className="outline-panel" ref={rootRef}>
-      <OutlineTree
-        nodes={nodes}
-        activeId={activeId}
-        expanded={expanded}
-        onToggle={(id) => setExpanded((current) => {
-          const next = new Set(current);
-          if (next.has(id)) next.delete(id); else next.add(id);
-          return next;
-        })}
-        onGoToPage={onGoToPage}
-      />
-    </div>
-  );
-}
 
 function PdfThumbnail({ page, current, load, onOpen }: { page: number; current: boolean; load(): Promise<string | undefined>; onOpen(): void }) {
   const itemRef = useRef<HTMLButtonElement>(null);
@@ -587,7 +492,8 @@ export function App() {
       ]);
       if (activeBookIdRef.current !== bookId) return;
       setBackgroundJobs(jobs);
-      setGeneratedOutline(outline);
+      // 轮询返回的是 IPC 反序列化的新数组：内容没变时保留旧引用，避免下游 nodes 依赖被身份抖动触发。
+      setGeneratedOutline((current) => (JSON.stringify(current) === JSON.stringify(outline) ? current : outline));
     } catch {
       setBackgroundJobs([]);
     }
