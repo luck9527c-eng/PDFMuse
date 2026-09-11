@@ -14,6 +14,7 @@ import { createAgentHost, type AgentHost } from "./agent/agent-host.js";
 import { createBookIndex } from "./agent/book-index.js";
 import { buildConversationExportFilename, buildConversationMarkdown, selectExportableMessages } from "./agent/conversation-export.js";
 import type { ResolvedModelConnection } from "./agent/model-runtime.js";
+import { buildAiOutlineCompleter } from "./agent/outline-ai.js";
 import { createToolRegistry } from "./agent/tool-registry.js";
 import { createWebSearchModule } from "./agent/web-search.js";
 import { createOcrModule, createWorkerOcrEngine } from "./ocr.js";
@@ -131,7 +132,23 @@ app.whenReady().then(async () => {
       engineVersion: OCR_ENGINE_VERSION,
     }));
     closeOcr = ocr.close;
-    const bookOutline = createBookOutlineModule(startupPreflight.dataHome);
+    const loadChatConnection = async (): Promise<ResolvedModelConnection | undefined> => {
+      const config = await readAppConfig(configPath);
+      return config.chat
+        ? {
+          protocol: config.chat.protocol,
+          baseUrl: config.chat.baseUrl,
+          model: config.chat.model,
+          ...(config.chat.apiKey ? { apiKey: config.chat.apiKey } : {}),
+        }
+        : undefined;
+    };
+    const bookOutline = createBookOutlineModule(startupPreflight.dataHome, {
+      aiOutline: {
+        renderPage: async (bookId, page, scale) => bookIndex.renderPageImage(bookId, page, scale),
+        complete: buildAiOutlineCompleter({ loadConnection: loadChatConnection }),
+      },
+    });
     closeBookOutline = bookOutline.close;
     const scheduleOptionalEmbedding = (input: Omit<ScheduleBackgroundJobInput, "kind">) => (
       scheduleEmbeddingJobIfConfigured(input, {
@@ -185,6 +202,10 @@ app.whenReady().then(async () => {
           }
           context.checkpoint(`ocr-order:${focusPage}:${index + 1}`, index + 1, book.pageCount);
         }
+        // OCR 全书完成后正文锚点才齐：重排目录任务（AI 结论与页候选已缓存，重建只重跑装配）。
+        if (!context.signal.aborted) {
+          backgroundJobs.schedule({ bookId: job.bookId, kind: "outline", priority: 5, total: book.pageCount });
+        }
       },
       outline: async (job, context) => {
         const result = await bookOutline.rebuild(
@@ -214,17 +235,7 @@ app.whenReady().then(async () => {
     const agentHost: AgentHost = createAgentHost({
       dataHome: startupPreflight.dataHome,
       emit: broadcastAgentEvent,
-      loadModelConnection: async (): Promise<ResolvedModelConnection | undefined> => {
-        const config = await readAppConfig(configPath);
-        return config.chat
-          ? {
-            protocol: config.chat.protocol,
-            baseUrl: config.chat.baseUrl,
-            model: config.chat.model,
-            ...(config.chat.apiKey ? { apiKey: config.chat.apiKey } : {}),
-          }
-          : undefined;
-      },
+      loadModelConnection: loadChatConnection,
       loadReaderProfile: async () => (await readerProfile.get()).content,
       loadBookTitle: (bookId) => getBookTitle(bookId) || undefined,
       resolveReadingSection: (bookId, page) => findOutlineSectionPath(bookOutline.get(bookId) ?? [], page),

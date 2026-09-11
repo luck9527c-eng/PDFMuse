@@ -5,16 +5,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   assembleOutline,
-  buildOutlineTree,
   createBookOutlineModule,
   detectHeadingCandidates,
   findOutlineSectionPath,
-  harvestTocRows,
+  type BookOutlineAiDeps,
   type OpenOutlineDocument,
-  type OutlineTextLine,
   type OutlineHeading,
+  type OutlineTextLine,
   type TocRow,
 } from "./book-outline.js";
+import type { BookOutlineNode } from "../shared/contracts.js";
 import { createOcrModule, type OcrEngine } from "./ocr.js";
 
 const BOOK_ID = "a".repeat(64);
@@ -34,6 +34,31 @@ function documentSource(
     },
     async close() { return undefined; },
   });
+}
+
+function aiOutlineDeps(
+  entries: Array<{ label: string; level: 1 | 2; printedPage: number | null }>,
+  tocPages: number[] = [],
+): {
+  deps: BookOutlineAiDeps;
+  completeCalls: number;
+} {
+  const state = { completeCalls: 0 };
+  return {
+    deps: {
+      renderPage: async () => ({ imageData: "aW1n" }),
+      complete: async () => {
+        state.completeCalls += 1;
+        return JSON.stringify({
+          hasToc: entries.length > 0,
+          tocPages,
+          entries: entries.map((entry) => ({ ...entry, printedPage: entry.printedPage })),
+          continuesAt: null,
+        });
+      },
+    },
+    get completeCalls() { return state.completeCalls; },
+  };
 }
 
 describe("book outline", () => {
@@ -61,7 +86,7 @@ describe("book outline", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
-  it("detects explicit and typographic headings and builds hierarchy", () => {
+  it("detects explicit and typographic headings", () => {
     const first = detectHeadingCandidates(1, [
       { text: "第一章 基础", size: 24, y: 700 },
       { text: "普通正文内容。", size: 12, y: 650 },
@@ -72,8 +97,27 @@ describe("book outline", () => {
     ]);
     expect(first[0]).toMatchObject({ label: "第一章 基础", level: 1, explicit: true });
     expect(second[0]).toMatchObject({ label: "1.1 核心概念", level: 2, explicit: true });
-    expect(buildOutlineTree([...first, ...second], 2)).toMatchObject([
-      { label: "第一章 基础", page: 1, children: [{ label: "1.1 核心概念", page: 2 }] },
+  });
+
+  it("drops list items and math fragments but keeps pinyin-annotated titles", () => {
+    const candidates = detectHeadingCandidates(23, [
+      { text: "第一章 品数与板哦", size: 15, y: 18 },
+      { text: "2. 函数的几种特性", size: 21, y: 300 },
+      { text: "这个函数的图形如图1-6所示.", size: 17, y: 400 },
+      { text: "对任一x∈X都成立，那么称函数f(x)在X上有上界，而K称为函数f(x)在X上的", size: 19, y: 500 },
+      { text: "V-β", size: 24, y: 600 },
+      { text: "v≥V0,", size: 25, y: 660 },
+    ]);
+    expect(candidates).toEqual([
+      expect.objectContaining({ label: "第一章 品数与板哦", level: 1, explicit: true }),
+    ]);
+    const titles = detectHeadingCandidates(7, [
+      { text: "窃(qiè)读记", size: 40, y: 100 },
+      { text: "转过街角，看见饭店的招牌，闻见炒菜的香味，听", size: 18, y: 200 },
+      { text: "见锅勺敲打的声音，我放慢了脚步。放学后急匆匆地", size: 18, y: 240 },
+    ]);
+    expect(titles).toEqual([
+      expect.objectContaining({ label: "窃(qiè)读记" }),
     ]);
   });
 
@@ -87,13 +131,14 @@ describe("book outline", () => {
     expect(outline.get(BOOK_ID)).toBeUndefined();
   });
 
-  it("uses recognized text when a scanned page has no native text", async () => {
+  it("assembles the outline from ai entries and body anchors", async () => {
     closeOcr?.();
+    // p.1 是印刷目录页（同名列出章节），p.2/p.3 是正文真标题页。
     const engine: OcrEngine = {
       name: "测试 OCR",
       model: "测试模型",
       async recognize(input) {
-        const heading = input.page === 1 ? "第一章 扫描内容" : "1.1 识别小节";
+        const heading = input.page === 1 ? "第一章 扫描内容" : input.page === 2 ? "第一章 扫描内容" : "1.1 识别小节";
         return {
           width: input.width,
           height: input.height,
@@ -107,16 +152,88 @@ describe("book outline", () => {
     };
     const ocr = createOcrModule(dataHome, engine);
     closeOcr = ocr.close;
-    for (const page of [1, 2]) {
+    for (const page of [1, 2, 3]) {
       await ocr.recognizePage({ bookId: BOOK_ID, page, imageData: "a", width: 600, height: 800 });
     }
-    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource([[], []]) });
+    const ai = aiOutlineDeps([
+      { label: "第一章 扫描内容", level: 1, printedPage: 1 },
+      { label: "1.1 识别小节", level: 2, printedPage: 2 },
+    ], [1]);
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource([[], [], []]),
+      aiOutline: ai.deps,
+    });
     closeOutline = outline.close;
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(result.status).toBe("generated");
+    expect(ai.completeCalls).toBe(1);
+    // 第一章 锚定到正文页 p.2，而不是目录页 p.1。
     expect(outline.get(BOOK_ID)).toMatchObject([
-      { label: "第一章 扫描内容", page: 1, children: [{ label: "1.1 识别小节", page: 2 }] },
+      { label: "第一章 扫描内容", page: 2, children: [{ label: "1.1 识别小节", page: 3 }] },
     ]);
+  });
+
+  it("caches ai entries across rebuilds and clears them on invalidate", async () => {
+    const ai = aiOutlineDeps([{ label: "第一章 缓存", level: 1, printedPage: 1 }]);
+    const pages: OutlineTextLine[][] = [
+      [{ text: "第一章 缓存", size: 24, y: 700 }, { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 }],
+    ];
+    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages), aiOutline: ai.deps });
+    closeOutline = outline.close;
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(ai.completeCalls).toBe(1);
+    outline.invalidate(BOOK_ID);
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(ai.completeCalls).toBe(2);
+  });
+
+  it("falls back to an empty outline when the model finds no toc", async () => {
+    const ai = aiOutlineDeps([]);
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource([[{ text: "第一章 无目录", size: 24, y: 700 }]]),
+      aiOutline: ai.deps,
+    });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(result).toMatchObject({ status: "generated", nodes: [] });
+    expect(outline.get(BOOK_ID)).toEqual([]);
+  });
+
+  it("does not cache a failed ai run", async () => {
+    let calls = 0;
+    const deps: BookOutlineAiDeps = {
+      renderPage: async () => ({ imageData: "aW1n" }),
+      complete: async () => {
+        calls += 1;
+        throw new Error("网络错误");
+      },
+    };
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource([[{ text: "第一章 断网", size: 24, y: 700 }]]),
+      aiOutline: deps,
+    });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(result).toMatchObject({ status: "generated", nodes: [] });
+    // 失败不落缓存：下一次重建会重新调用模型。
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(calls).toBe(2);
+  });
+
+  it("does not cache an aborted ai run as a no-toc verdict", async () => {    const ai = aiOutlineDeps([{ label: "第一章 中止", level: 1, printedPage: 1 }]);
+    const pages: OutlineTextLine[][] = [
+      [{ text: "第一章 中止", size: 24, y: 700 }, { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 }],
+    ];
+    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages), aiOutline: ai.deps });
+    closeOutline = outline.close;
+    const controller = new AbortController();
+    controller.abort();
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }), controller.signal);
+    expect(result).toMatchObject({ status: "partial", processedPages: 0 });
+    // 半成品未入库：下一次重建会重新调用模型。
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(ai.completeCalls).toBe(1);
   });
 
   it("resumes from persisted page candidates after interruption", async () => {
@@ -140,284 +257,6 @@ describe("book outline", () => {
     expect(visited).toEqual([1, 2, 3]);
   });
 
-  it("recognizes the real fixture embedded outline without persisting a replacement", async () => {
-    const outline = createBookOutlineModule(dataHome);
-    closeOutline = outline.close;
-    const bytes = new Uint8Array(await readFile(NAVIGATION_FIXTURE));
-    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes }));
-    expect(result.status).toBe("embedded");
-    expect(outline.get(BOOK_ID)).toBeUndefined();
-  });
-
-  it("does not turn a repeated page header into a generated outline", async () => {
-    const outline = createBookOutlineModule(dataHome);
-    closeOutline = outline.close;
-    const bytes = new Uint8Array(await readFile(NO_OUTLINE_FIXTURE));
-    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes }));
-    expect(result).toMatchObject({ status: "generated", nodes: [] });
-    expect(outline.get(BOOK_ID)).toEqual([]);
-  });
-  it("finds the deepest section path for a reading page", () => {
-    const nodes = buildOutlineTree([
-      { label: "第5章 存储系统", page: 120, level: 1, explicit: true },
-      { label: "5.2 主存储器", page: 140, level: 2, explicit: true },
-      { label: "5.2.3 技术指标", page: 146, level: 3, explicit: true },
-      { label: "第6章 中央处理器", page: 200, level: 1, explicit: true },
-    ], 220);
-    expect(findOutlineSectionPath(nodes, 147)).toBe("第5章 存储系统 › 5.2 主存储器 › 5.2.3 技术指标");
-    expect(findOutlineSectionPath(nodes, 143)).toBe("第5章 存储系统 › 5.2 主存储器");
-    expect(findOutlineSectionPath(nodes, 210)).toBe("第6章 中央处理器");
-    expect(findOutlineSectionPath([], 100)).toBeUndefined();
-  });
-
-  it("harvests printed toc rows by merging same-row fragments", () => {
-    // 数据取自高等数学第 12 页的真实 OCR 输出（y 为距页顶距离，size 为行框高度）。
-    const { tocPage, rows } = harvestTocRows([
-      { text: "目录", size: 37, y: 101 },
-      { text: "第一章 函数与极限", size: 21, y: 232 },
-      { text: "第一节", size: 13, y: 264 },
-      { text: "映射与函数", size: 14, y: 264 },
-      { text: "一、映射(1)", size: 14, y: 282 },
-      { text: "习题1-1(15)", size: 17, y: 282 },
-      { text: "第二节", size: 15, y: 299 },
-      { text: "数列的极限", size: 14, y: 299 },
-      { text: "18", size: 12, y: 304 },
-      { text: "一、数列极限的定义(18)", size: 18, y: 316 },
-      { text: "习题1-2(25)", size: 14, y: 321 },
-      { text: "极限运算法则", size: 16, y: 406 },
-      { text: "第五节", size: 15, y: 407 },
-      { text: "……37", size: 10, y: 412 },
-    ]);
-    expect(tocPage).toBe(true);
-    expect(rows.find((row) => row.type === "chapter")).toMatchObject({
-      label: "第一章 函数与极限",
-      printedPage: 1,
-    });
-    expect(rows.find((row) => row.type === "section" && row.ordinal === 1)).toMatchObject({
-      label: "第一节 映射与函数",
-      printedPage: 1,
-    });
-    expect(rows.find((row) => row.type === "section" && row.ordinal === 2)).toMatchObject({
-      label: "第二节 数列的极限",
-      printedPage: 18,
-    });
-    expect(rows.find((row) => row.type === "section" && row.ordinal === 5)).toMatchObject({
-      label: "第五节 极限运算法则",
-      printedPage: 37,
-    });
-    expect(rows.some((row) => row.label.includes("习题") || row.label.startsWith("一、"))).toBe(false);
-  });
-
-  it("harvests numeric-section toc rows (计算机组成原理 style)", () => {
-    const { tocPage, rows } = harvestTocRows([
-      { text: "目", size: 30, y: 100 },
-      { text: "录", size: 30, y: 100 },
-      { text: "CONTENTS", size: 18, y: 140 },
-      { text: "第1章 概论", size: 16, y: 200 },
-      { text: "1.1", size: 14, y: 230 },
-      { text: "电子计算机与存储程序控制", size: 14, y: 231 },
-      { text: "1.1.1 电子计算机的发展…", size: 13, y: 260 },
-      { text: "2", size: 11, y: 266 },
-      { text: "1.2", size: 14, y: 290 },
-      { text: "计算机的硬件组成", size: 14, y: 291 },
-      { text: "3", size: 11, y: 296 },
-      { text: "1.3", size: 14, y: 320 },
-      { text: "计算机系统", size: 14, y: 321 },
-      { text: "8", size: 11, y: 326 },
-      { text: "1.4", size: 14, y: 350 },
-      { text: "计算机的工作过程和主要性能指标", size: 14, y: 351 },
-      { text: "30", size: 11, y: 356 },
-    ]);
-    expect(tocPage).toBe(true);
-    expect(rows).toEqual([
-      expect.objectContaining({ label: "第1章 概论", type: "chapter", ordinal: 1, printedPage: 2 }),
-      expect.objectContaining({ label: "1.1 电子计算机与存储程序控制", type: "section", ordinal: 1, scope: 1, printedPage: 2 }),
-      expect.objectContaining({ label: "1.2 计算机的硬件组成", type: "section", ordinal: 2, scope: 1, printedPage: 3 }),
-      expect.objectContaining({ label: "1.3 计算机系统", type: "section", ordinal: 3, scope: 1, printedPage: 8 }),
-      expect.objectContaining({ label: "1.4 计算机的工作过程和主要性能指标", type: "section", ordinal: 4, scope: 1, printedPage: 30 }),
-    ]);
-  });
-
-  it("does not classify a clause-numbered body page as a printed toc", () => {
-    // 数据取自招标文件正文：条款编号 9.2/10.1 形似数字节，页码来自句中 (1)。
-    const { tocPage, rows } = harvestTocRows([
-      { text: "第四章 评标", size: 18, y: 60 },
-      { text: "9.2除非招标文件的技术规格中另有规定，投标人在投标文件中及其与采购人和采购代理机构的所有往来文件中的计量单位均应采用中华人民共和国法定计量单位", size: 14, y: 140 },
-      { text: "9.3投标人所提供的货物和服务均应以人民币报价，货币单位：元。", size: 14, y: 180 },
-      { text: "10.1招标文件规定组织踏勘现场的，采购人按招标文件规定的时间、地点组织投标人踏勘项目现场。", size: 14, y: 220 },
-      { text: "10.2投标人自行承担踏勘现场发生的责任、风险和自身费用。", size: 14, y: 260 },
-      { text: "9.4报价包含一切税费(1)", size: 14, y: 300 },
-      { text: "9.5报价有效期满足要求(1)", size: 14, y: 340 },
-      { text: "9.6投标保证金已缴纳(1)", size: 14, y: 380 },
-      { text: "9.7账户信息真实有效(1)", size: 14, y: 420 },
-    ]);
-    expect(tocPage).toBe(false);
-    expect(rows).toEqual([]);
-  });
-
-  it("does not classify a body page as a printed toc", () => {
-    const { tocPage, rows } = harvestTocRows([
-      { text: "第一章 品数与板哦", size: 15, y: 18 },
-      { text: "f(3)=1+3=4.这个函数的图形如图1-6所示.", size: 17, y: 97 },
-      { text: "y=[x]", size: 15, y: 158 },
-      { text: "V-β", size: 22, y: 200 },
-      { text: "v≥V0,", size: 23, y: 260 },
-      { text: "习题1-2", size: 14, y: 700 },
-    ]);
-    expect(tocPage).toBe(false);
-    expect(rows).toEqual([]);
-  });
-
-  it("drops list items and math fragments from heading candidates", () => {
-    const candidates = detectHeadingCandidates(23, [
-      { text: "第一章 品数与板哦", size: 15, y: 18 },
-      { text: "2. 函数的几种特性", size: 21, y: 300 },
-      { text: "这个函数的图形如图1-6所示.", size: 17, y: 400 },
-      { text: "对任一x∈X都成立，那么称函数f(x)在X上有上界，而K称为函数f(x)在X上的", size: 19, y: 500 },
-      { text: "V-β", size: 24, y: 600 },
-      { text: "v≥V0,", size: 25, y: 660 },
-    ]);
-    expect(candidates).toEqual([
-      expect.objectContaining({ label: "第一章 品数与板哦", level: 1, explicit: true }),
-    ]);
-  });
-
-  it("resolves the printed-to-pdf offset by voting and clips out-of-range entries", () => {
-    const tocRows: TocRow[] = [
-      { label: "第一章 函数与极限", printedPage: 1, type: "chapter", ordinal: 1 },
-      { label: "第一节 映射与函数", printedPage: 2, type: "section", ordinal: 1 },
-      { label: "第二节 数列的极限", printedPage: 18, type: "section", ordinal: 2 },
-      { label: "第二章 导数与微分", printedPage: 60, type: "chapter", ordinal: 2 },
-      { label: "第一节 导数概念", printedPage: 61, type: "section", ordinal: 1 },
-      { label: "第十二章 无穷级数", printedPage: 330, type: "chapter", ordinal: 12 },
-    ];
-    const headings: OutlineHeading[] = [
-      { label: "第一章 函数与极限", page: 18, level: 1, explicit: true },
-      { label: "第一节 映射与函数", page: 19, level: 2, explicit: true },
-      { label: "第二节 数列的极限", page: 35, level: 2, explicit: true },
-      { label: "第一章 品数与板哦", page: 23, level: 1, explicit: true },
-      { label: "第一节 映射与函数", page: 40, level: 2, explicit: true },
-      { label: "第二章 导数与微分", page: 77, level: 1, explicit: true },
-    ];
-    const result = assembleOutline([{ page: 12, headings, tocRows }], 150);
-    expect(result.strategy).toBe("toc");
-    expect(result.nodes).toMatchObject([
-      {
-        label: "第一章 函数与极限", page: 18,
-        children: [
-          { label: "第一节 映射与函数", page: 19 },
-          { label: "第二节 数列的极限", page: 35 },
-        ],
-      },
-      {
-        label: "第二章 导数与微分", page: 77,
-        children: [{ label: "第一节 导数概念", page: 78 }],
-      },
-    ]);
-    expect(result.nodes.some((node) => node.label.includes("无穷级数"))).toBe(false);
-  });
-
-  it("lets a numberless chapter inherit its first resolvable section", () => {
-    const tocRows: TocRow[] = [
-      { label: "第一章 函数与极限", printedPage: undefined, type: "chapter", ordinal: 1 },
-      { label: "第一节 映射与函数", printedPage: 2, type: "section", ordinal: 1 },
-      { label: "第二章 导数与微分", printedPage: 60, type: "chapter", ordinal: 2 },
-    ];
-    const headings: OutlineHeading[] = [
-      { label: "第一章 函数与极限", page: 18, level: 1, explicit: true },
-      { label: "第一节 映射与函数", page: 19, level: 2, explicit: true },
-      { label: "第二章 导数与微分", page: 77, level: 1, explicit: true },
-    ];
-    const result = assembleOutline([{ page: 12, headings, tocRows }], 150);
-    expect(result.strategy).toBe("toc");
-    expect(result.nodes[0]).toMatchObject({ label: "第一章 函数与极限", page: 19 });
-  });
-
-  it("falls back to hardened heuristics when offset votes are insufficient", () => {
-    const tocRows: TocRow[] = [
-      { label: "第一章 函数与极限", printedPage: 1, type: "chapter", ordinal: 1 },
-      { label: "第一节 映射与函数", printedPage: 2, type: "section", ordinal: 1 },
-    ];
-    const headings: OutlineHeading[] = [
-      { label: "第一章 函数与极限", page: 18, level: 1, explicit: true },
-      { label: "1. 映射概念", page: 20, level: 3, explicit: false },
-    ];
-    const result = assembleOutline([{ page: 12, headings, tocRows }], 150);
-    expect(result.strategy).toBe("heuristic");
-    expect(result.nodes).toMatchObject([{ label: "第一章 函数与极限", page: 18, children: [{ label: "1. 映射概念", page: 20 }] }]);
-  });
-
-  it("suppresses running headers by scoped ordinal first occurrence", () => {
-    const headings: OutlineHeading[] = [
-      { label: "第一章 函数与极限", page: 18, level: 1, explicit: true },
-      { label: "第一节 映射与函数", page: 18, level: 2, explicit: true },
-      { label: "第一章 品数与板哦", page: 23, level: 1, explicit: true },
-      { label: "第一节 映射与函数", page: 24, level: 2, explicit: true },
-      { label: "第一章 品数与极限", page: 40, level: 1, explicit: true },
-      { label: "第二章 导数与微分", page: 77, level: 1, explicit: true },
-      { label: "第一节 导数概念", page: 77, level: 2, explicit: true },
-    ];
-    const result = assembleOutline([{ page: 1, headings, tocRows: [] }], 150);
-    expect(result.strategy).toBe("heuristic");
-    expect(result.nodes).toMatchObject([
-      {
-        label: "第一章 函数与极限", page: 18,
-        children: [{ label: "第一节 映射与函数", page: 18 }],
-      },
-      {
-        label: "第二章 导数与微分", page: 77,
-        children: [{ label: "第一节 导数概念", page: 77 }],
-      },
-    ]);
-  });
-
-  it("generates a toc-first outline from printed toc pages in rebuild", async () => {
-    const tocPage = [
-      { text: "目录", size: 37, y: 101 },
-      { text: "第一章 函数与极限", size: 21, y: 232 },
-      { text: "1", size: 12, y: 240 },
-      { text: "第一节", size: 13, y: 264 },
-      { text: "映射与函数(2)", size: 14, y: 264 },
-      { text: "第二章 导数与微分", size: 21, y: 340 },
-      { text: "3", size: 12, y: 348 },
-      { text: "第一节", size: 13, y: 372 },
-      { text: "导数概念(3)", size: 14, y: 372 },
-    ];
-    const pages: OutlineTextLine[][] = [
-      tocPage,
-      [
-        { text: "第一章 函数与极限", size: 32, y: 700 },
-        { text: "初等数学的研究对象基本上是不变的量，而高等数学的研究对象则是变动的", size: 19, y: 650 },
-        { text: "量.所谓函数关系就是变量之间的一种依赖关系，极限方法是研究变量的一种基本方", size: 20, y: 630 },
-      ],
-      [
-        { text: "第一章 函数与极限", size: 16, y: 780 },
-        { text: "第一节 映射与函数", size: 23, y: 700 },
-        { text: "映射是现代数学中的一个基本概念，而函数是微积分的研究对象，也是映射的一", size: 19, y: 650 },
-        { text: "种.本节主要介绍映射、函数及有关概念，函数的性质与运算等.", size: 18, y: 630 },
-      ],
-      [
-        { text: "第二章 导数与微分", size: 30, y: 700 },
-        { text: "第一节 导数概念", size: 22, y: 660 },
-        { text: "为了进一步说明导数概念，我们下面来讨论两个具体问题.", size: 19, y: 620 },
-      ],
-    ];
-    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages) });
-    closeOutline = outline.close;
-    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
-    expect(result.status).toBe("generated");
-    expect(outline.get(BOOK_ID)).toMatchObject([
-      {
-        label: "第一章 函数与极限", page: 2,
-        children: [{ label: "第一节 映射与函数", page: 3 }],
-      },
-      {
-        label: "第二章 导数与微分", page: 4,
-        children: [{ label: "第一节 导数概念", page: 4 }],
-      },
-    ]);
-  });
-
   it("discards stale page candidates when the outline version changes", async () => {
     const visited: number[] = [];
     const pages = [1, 2].map((page) => [
@@ -439,6 +278,129 @@ describe("book outline", () => {
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(result).toMatchObject({ status: "generated", processedPages: 2 });
     expect(visited).toEqual([1, 2]);
-    expect(outline.get(BOOK_ID)).toMatchObject([{ label: "第一章 标题1", page: 1 }]);
+    expect(outline.get(BOOK_ID)).toEqual([]);
+  });
+
+  it("recognizes the real fixture embedded outline without persisting a replacement", async () => {
+    const outline = createBookOutlineModule(dataHome);
+    closeOutline = outline.close;
+    const bytes = new Uint8Array(await readFile(NAVIGATION_FIXTURE));
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes }));
+    expect(result.status).toBe("embedded");
+    expect(outline.get(BOOK_ID)).toBeUndefined();
+  });
+
+  it("does not turn a repeated page header into a generated outline", async () => {
+    const outline = createBookOutlineModule(dataHome);
+    closeOutline = outline.close;
+    const bytes = new Uint8Array(await readFile(NO_OUTLINE_FIXTURE));
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes }));
+    expect(result).toMatchObject({ status: "generated", nodes: [] });
+    expect(outline.get(BOOK_ID)).toEqual([]);
+  });
+
+  it("resolves the printed-to-pdf offset by voting and clips out-of-range entries", () => {
+    const tocRows: TocRow[] = [
+      { label: "第一章 函数与极限", level: 1, printedPage: 1 },
+      { label: "第一节 映射与函数", level: 2, printedPage: 2 },
+      { label: "第二节 数列的极限", level: 2, printedPage: 18 },
+      { label: "第二章 导数与微分", level: 1, printedPage: 60 },
+      { label: "第一节 导数概念", level: 2, printedPage: 61 },
+      { label: "第十二章 无穷级数", level: 1, printedPage: 330 },
+    ];
+    const headings: OutlineHeading[] = [
+      { label: "第一章 函数与极限", page: 18, level: 1, explicit: true },
+      { label: "第一节 映射与函数", page: 19, level: 2, explicit: true },
+      { label: "第二节 数列的极限", page: 35, level: 2, explicit: true },
+      { label: "第一章 品数与板哦", page: 23, level: 1, explicit: true },
+      { label: "第一节 映射与函数", page: 40, level: 2, explicit: true },
+      { label: "第二章 导数与微分", page: 77, level: 1, explicit: true },
+    ];
+    const result = assembleOutline(headings, tocRows, 150);
+    expect(result.strategy).toBe("toc");
+    expect(result.nodes).toMatchObject([
+      {
+        label: "第一章 函数与极限", page: 18,
+        children: [
+          { label: "第一节 映射与函数", page: 19 },
+          { label: "第二节 数列的极限", page: 35 },
+        ],
+      },
+      {
+        label: "第二章 导数与微分", page: 77,
+        children: [{ label: "第一节 导数概念", page: 78 }],
+      },
+    ]);
+    expect(result.nodes.some((node) => node.label.includes("无穷级数"))).toBe(false);
+  });
+
+  it("anchors chapters without printed pages to body headings", () => {
+    const tocRows: TocRow[] = [
+      { label: "第三章 无锚", level: 1, printedPage: undefined },
+      { label: "3.1 有页码", level: 2, printedPage: 5 },
+      { label: "3.2 有页码", level: 2, printedPage: 8 },
+    ];
+    const headings: OutlineHeading[] = [
+      { label: "3.1 有页码", page: 22, level: 2, explicit: true },
+      { label: "3.2 有页码", page: 25, level: 2, explicit: true },
+    ];
+    const result = assembleOutline(headings, tocRows, 150);
+    expect(result.strategy).toBe("toc");
+    expect(result.nodes).toMatchObject([
+      { label: "第三章 无锚", page: 22, children: [{ label: "3.1 有页码", page: 22 }, { label: "3.2 有页码", page: 25 }] },
+    ]);
+  });
+
+  it("matches lesson titles across pinyin annotations and adopts leading lessons", () => {
+    const tocRows: TocRow[] = [
+      { label: "1 窃读记", level: 2, printedPage: 2 },
+      { label: "第一组", level: 1, printedPage: undefined },
+      { label: "2* 小苗与大树的对话", level: 2, printedPage: 7 },
+    ];
+    const headings: OutlineHeading[] = [
+      { label: "窃(qiè)读记", page: 7, level: 1, explicit: false },
+      { label: "第一组", page: 6, level: 1, explicit: true },
+      { label: "小苗与大树的对话", page: 12, level: 1, explicit: false },
+    ];
+    const result = assembleOutline(headings, tocRows, 189);
+    expect(result.strategy).toBe("toc");
+    expect(result.nodes).toMatchObject([
+      {
+        label: "第一组", page: 6,
+        children: [
+          { label: "1 窃读记", page: 7 },
+          { label: "2* 小苗与大树的对话", page: 12 },
+        ],
+      },
+    ]);
+  });
+
+  it("returns an empty outline when offset votes are insufficient", () => {
+    const tocRows: TocRow[] = [
+      { label: "第一章 函数与极限", level: 1, printedPage: 1 },
+      { label: "1. 映射概念", level: 2, printedPage: 2 },
+    ];
+    const headings: OutlineHeading[] = [
+      { label: "第一章 函数与极限", page: 18, level: 1, explicit: true },
+    ];
+    const result = assembleOutline(headings, tocRows, 150);
+    expect(result).toEqual({ nodes: [], strategy: "empty" });
+  });
+
+  it("finds the deepest section path for a reading page", () => {
+    const nodes: BookOutlineNode[] = [
+      {
+        id: "1", label: "第5章 存储系统", page: 120, children: [
+          { id: "2", label: "5.2 主存储器", page: 140, children: [
+            { id: "3", label: "5.2.3 技术指标", page: 146, children: [] },
+          ] },
+        ],
+      },
+      { id: "4", label: "第6章 中央处理器", page: 200, children: [] },
+    ];
+    expect(findOutlineSectionPath(nodes, 147)).toBe("第5章 存储系统 › 5.2 主存储器 › 5.2.3 技术指标");
+    expect(findOutlineSectionPath(nodes, 143)).toBe("第5章 存储系统 › 5.2 主存储器");
+    expect(findOutlineSectionPath(nodes, 210)).toBe("第6章 中央处理器");
+    expect(findOutlineSectionPath([], 100)).toBeUndefined();
   });
 });

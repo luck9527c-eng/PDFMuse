@@ -2,6 +2,7 @@ import type { ModelProtocol } from "../../shared/contracts.js";
 import {
   createLlmRuntime,
   registerBuiltInApiProviders,
+  type CompleteSimpleFn,
   type Model,
   type SimpleStreamOptions,
   type StreamFn,
@@ -43,6 +44,18 @@ export function createModelStreamFn(connection: ResolvedModelConnection): Stream
       sessionId: undefined,
     };
     return llmRuntime.streamSimple(model, context, merged);
+  };
+}
+
+/** 注入 API Key 的一次性（非流式对话轮）调用，供目录提取等单轮任务复用。 */
+export function createModelCompleteFn(connection: ResolvedModelConnection): CompleteSimpleFn {
+  return (model, context, options) => {
+    const merged: SimpleStreamOptions = {
+      ...options,
+      apiKey: connection.apiKey,
+      sessionId: undefined,
+    };
+    return llmRuntime.completeSimple(model, context, merged);
   };
 }
 
