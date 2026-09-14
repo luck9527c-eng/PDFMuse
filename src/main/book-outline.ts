@@ -482,7 +482,11 @@ function isAiEntry(value: unknown): value is AiOutlineEntry {
 
 export function createBookOutlineModule(
   dataHome: string,
-  options: { openDocument?: OpenOutlineDocument; aiOutline?: BookOutlineAiDeps } = {},
+  options: {
+    openDocument?: OpenOutlineDocument;
+    aiOutline?: BookOutlineAiDeps;
+    onOutlineChange?: (bookId: string) => void;
+  } = {},
 ) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
   database.exec(`
@@ -561,6 +565,7 @@ export function createBookOutlineModule(
       database.prepare("DELETE FROM book_outline_pages WHERE book_id = ?").run(bookId);
       database.prepare("DELETE FROM book_outline_ai WHERE book_id = ?").run(bookId);
     }
+    options.onOutlineChange?.(bookId);
   }
 
   async function rebuild(
@@ -662,6 +667,7 @@ export function createBookOutlineModule(
         total_pages = excluded.total_pages,
         updated_at = excluded.updated_at
       `).run(bookId, OUTLINE_VERSION, JSON.stringify(nodes), document.pageCount, timestamp);
+      options.onOutlineChange?.(bookId);
       return { status: "generated" as const, nodes, processedPages, totalPages: document.pageCount };
     } finally {
       await document.close();

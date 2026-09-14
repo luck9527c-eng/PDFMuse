@@ -60,6 +60,22 @@ describe("background jobs", () => {
     expect(scheduled).toMatchObject({ ok: true, job: { checkpoint: "ocr-order:6:12" } });
   });
 
+  it("notifies job changes per book for push delivery", async () => {
+    const notified: string[] = [];
+    module = createBackgroundJobModule(
+      dataHome,
+      { index: async (_job, context) => { context.checkpoint("page:1", 1, 2); } },
+      (bookId) => notified.push(bookId),
+    );
+    module.schedule({ bookId: BOOK_A, kind: "index", total: 2 });
+    await waitFor(() => module?.list(BOOK_A)[0]?.status === "completed");
+    module.schedule({ bookId: BOOK_B, kind: "index" });
+    await waitFor(() => module?.list(BOOK_B)[0]?.status === "completed");
+    // 入队、运行、检查点、完成各阶段都要通知，渲染层才能以推送替代轮询。
+    expect(notified.filter((bookId) => bookId === BOOK_A).length).toBeGreaterThanOrEqual(3);
+    expect(notified).toContain(BOOK_B);
+  });
+
   it("persists checkpoint and resumes a paused job", async () => {
     let runs = 0;
     let resolvePause: (() => void) | undefined;

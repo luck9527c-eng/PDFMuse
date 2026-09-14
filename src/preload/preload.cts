@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 
-import type { AgentStreamEvent, PDFMuseApi } from "../shared/contracts.js";
+import type { AgentStreamEvent, BackgroundStateEvent, PDFMuseApi } from "../shared/contracts.js";
 
 const api: PDFMuseApi = {
   getStartupPreflight: () => ipcRenderer.invoke("app:get-startup-preflight"),
@@ -46,6 +46,11 @@ const api: PDFMuseApi = {
     const channel = (_event: Electron.IpcRendererEvent, payload: AgentStreamEvent) => listener(payload);
     ipcRenderer.on("agent:event", channel);
     return () => ipcRenderer.removeListener("agent:event", channel);
+  },
+  onBackgroundEvent: (listener) => {
+    const channel = (_event: Electron.IpcRendererEvent, payload: BackgroundStateEvent) => listener(payload);
+    ipcRenderer.on("background:event", channel);
+    return () => ipcRenderer.removeListener("background:event", channel);
   },
   getReaderProfile: () => ipcRenderer.invoke("reader-profile:get"),
   saveReaderProfile: (input) => ipcRenderer.invoke("reader-profile:save", input),

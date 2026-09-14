@@ -73,7 +73,11 @@ function isDiskFullError(error: unknown) {
   return code === "ENOSPC" || code === "SQLITE_FULL" || /database or disk is full/i.test(message);
 }
 
-export function createBackgroundJobModule(dataHome: string, executors: Partial<Record<BackgroundJobKind, JobExecutor>> = {}) {
+export function createBackgroundJobModule(
+  dataHome: string,
+  executors: Partial<Record<BackgroundJobKind, JobExecutor>> = {},
+  onJobsChange?: (bookId: string) => void,
+) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
   const createTable = `
     CREATE TABLE IF NOT EXISTS background_jobs (
@@ -138,6 +142,12 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
   let pumping = false;
   let closed = false;
 
+  // 写路径统一通知（ADR-0008）：任何可见状态变化都按书回调一次，渲染层以推送替代轮询。
+  const notify = (bookId: string) => {
+    if (!onJobsChange || closed) return;
+    onJobsChange(bookId);
+  };
+
   const rowFor = (id: string) => database.prepare(`
     SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, claim_id, error_message, created_at, updated_at
     FROM background_jobs WHERE id = ?
@@ -145,7 +155,9 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
 
   function update(id: string, fields: string, values: SQLInputValue[]) {
     if (closed) return;
+    const bookId = rowFor(id)?.book_id;
     database.prepare(`UPDATE background_jobs SET ${fields}, updated_at = ? WHERE id = ?`).run(...values, now(), id);
+    if (bookId) notify(bookId);
   }
 
   function settleRequestedAction(id: string) {
@@ -194,8 +206,9 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
               checkpoint(value, progress, total = running.total) {
                 if (closed) return;
                 const boundedProgress = Math.max(0, Math.min(total, Math.floor(progress)));
-                database.prepare("UPDATE background_jobs SET progress = ?, total = ?, checkpoint = ?, updated_at = ? WHERE id = ? AND status = 'running' AND claim_id = ?")
+                const result = database.prepare("UPDATE background_jobs SET progress = ?, total = ?, checkpoint = ?, updated_at = ? WHERE id = ? AND status = 'running' AND claim_id = ?")
                   .run(boundedProgress, total, value ?? null, now(), row.id, claimId);
+                if (Number(result.changes) > 0) notify(row.book_id);
               },
             });
             if (!closed && !settleRequestedAction(row.id)) {
@@ -255,6 +268,7 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
         INSERT INTO background_jobs (id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, created_at, updated_at)
         VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?)
       `).run(id, input.bookId, input.kind, priority, 0, total, checkpoint ?? null, maxAttempts, inputVersion ?? null, timestamp, timestamp);
+      notify(input.bookId);
       // Reader-triggered OCR is interactive; it may pause a lower-priority batch job.
       if (input.kind === "ocr" && priority > 0) {
         for (const [activeId, state] of active) {
@@ -311,7 +325,11 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
     },
     clearFailed(kind: BackgroundJobKind) {
       if (closed || !KINDS.includes(kind)) return 0;
-      return Number(database.prepare("DELETE FROM background_jobs WHERE kind = ? AND status = 'failed'").run(kind).changes);
+      const failedBookIds = (database.prepare("SELECT DISTINCT book_id FROM background_jobs WHERE kind = ? AND status = 'failed'").all(kind) as Array<{ book_id: string }>)
+        .map((row) => row.book_id);
+      const changes = Number(database.prepare("DELETE FROM background_jobs WHERE kind = ? AND status = 'failed'").run(kind).changes);
+      for (const bookId of failedBookIds) notify(bookId);
+      return changes;
     },
     async cancelBook(bookId: string) {
       if (!BOOK_ID_PATTERN.test(bookId) || closed) return;

@@ -14,7 +14,7 @@ const ALL_METHODS = [
   "getRunDiagnostics", "clearBookConversation", "exportBookConversation", "recognizePage", "getRecognizedPage", "searchBook", "getBookOutline",
   "listBackgroundJobs", "scheduleBackgroundJob", "pauseBackgroundJob", "resumeBackgroundJob",
   "cancelBackgroundJob", "startAgentRun", "cancelAgentRun",
-  "onAgentEvent", "getReaderProfile", "saveReaderProfile", "getAppearanceSettings", "saveAppearanceSettings",
+  "onAgentEvent", "onBackgroundEvent", "getReaderProfile", "saveReaderProfile", "getAppearanceSettings", "saveAppearanceSettings",
   "getWebSearchConnection", "saveWebSearchConnection",
 ];
 

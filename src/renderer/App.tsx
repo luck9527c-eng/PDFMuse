@@ -238,8 +238,7 @@ export function App() {
       ]);
       if (activeBookIdRef.current !== bookId) return;
       setBackgroundJobs(jobs);
-      // 轮询返回的是 IPC 反序列化的新数组：内容没变时保留旧引用，避免下游 nodes 依赖被身份抖动触发。
-      setGeneratedOutline((current) => (JSON.stringify(current) === JSON.stringify(outline) ? current : outline));
+      setGeneratedOutline(outline);
     } catch {
       setBackgroundJobs([]);
     }
@@ -330,12 +329,21 @@ export function App() {
     setSelectionFeedback(undefined);
   }, [refreshBackgroundJobs, resetReaderSideState]);
 
+  // 后台状态走推送（ADR-0008）：开书拉一次初值，此后由任务/目录变更事件驱动，不再轮询。
   useEffect(() => {
     if (!book || !window.pdfMuse) return;
     void refreshBackgroundJobs(book.id);
-    const timer = window.setInterval(() => void refreshBackgroundJobs(book.id), 1_500);
-    return () => window.clearInterval(timer);
   }, [book, refreshBackgroundJobs]);
+
+  useEffect(() => {
+    const unsubscribe = window.pdfMuse?.onBackgroundEvent((event) => {
+      const bookId = activeBookIdRef.current;
+      if (!bookId || event.bookId !== bookId) return;
+      if (event.kind === "jobs") setBackgroundJobs(event.jobs);
+      else setGeneratedOutline(event.nodes);
+    });
+    return () => unsubscribe?.();
+  }, []);
 
   const visibleBackgroundJob = useMemo(() => {
     const rank: Record<BackgroundJob["status"], number> = {
@@ -360,8 +368,7 @@ export function App() {
         ? window.pdfMuse.resumeBackgroundJob
         : window.pdfMuse.cancelBackgroundJob;
     await method(visibleBackgroundJob.id);
-    await refreshBackgroundJobs(book.id);
-  }, [book, refreshBackgroundJobs, visibleBackgroundJob]);
+  }, [book, visibleBackgroundJob]);
 
   const effectiveOutline = viewerState.outline.length > 0 ? viewerState.outline : generatedOutline ?? [];
   const outlineJob = backgroundJobs.find((job) => job.kind === "outline");

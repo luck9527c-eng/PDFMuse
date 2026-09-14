@@ -39,6 +39,7 @@ const REQUIRED_API_METHODS = {
   startAgentRun: true,
   cancelAgentRun: true,
   onAgentEvent: true,
+  onBackgroundEvent: true,
   getReaderProfile: true,
   saveReaderProfile: true,
   getAppearanceSettings: true,

@@ -352,6 +352,11 @@ export type ExportConversationResult =
   | { outcome: "cancelled" }
   | { outcome: "failed"; message: string };
 
+/** 后台状态推送（ADR-0008）：任务与生成目录的变更以完整状态分片 + 单调 revision 推送，渲染层订阅而非轮询。 */
+export type BackgroundStateEvent =
+  | { revision: number; kind: "jobs"; bookId: string; jobs: BackgroundJob[] }
+  | { revision: number; kind: "outline"; bookId: string; nodes: BookOutlineNode[] | undefined };
+
 export type AgentStreamEvent =
   | {
       stream: "lifecycle";
@@ -547,6 +552,7 @@ export interface PDFMuseApi {
   startAgentRun(input: StartAgentRunInput): Promise<StartAgentRunResult>;
   cancelAgentRun(runId: string): Promise<void>;
   onAgentEvent(listener: (event: AgentStreamEvent) => void): () => void;
+  onBackgroundEvent(listener: (event: BackgroundStateEvent) => void): () => void;
   getReaderProfile(): Promise<ReaderProfileState>;
   saveReaderProfile(input: SaveReaderProfileInput): Promise<SaveReaderProfileResult>;
   getAppearanceSettings(): Promise<AppearanceSettings>;

@@ -387,6 +387,27 @@ describe("book outline", () => {
     expect(result).toEqual({ nodes: [], strategy: "empty" });
   });
 
+  it("notifies outline changes for push delivery", async () => {
+    const notified: string[] = [];
+    const ai = aiOutlineDeps([{ label: "第一章 推送", level: 1, printedPage: 1 }]);
+    const pages: OutlineTextLine[][] = [
+      [{ text: "第一章 推送", size: 24, y: 700 }, { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 }],
+    ];
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource(pages),
+      aiOutline: ai.deps,
+      onOutlineChange: (bookId) => notified.push(bookId),
+    });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(result.status).toBe("generated");
+    expect(notified).toEqual([BOOK_ID]);
+    outline.invalidate(BOOK_ID);
+    expect(notified).toEqual([BOOK_ID, BOOK_ID]);
+    outline.invalidate("not-a-book-id");
+    expect(notified).toEqual([BOOK_ID, BOOK_ID]);
+  });
+
   it("finds the deepest section path for a reading page", () => {
     const nodes: BookOutlineNode[] = [
       {

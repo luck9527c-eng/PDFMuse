@@ -26,6 +26,7 @@ import { createReaderProfileModule } from "./reader-profile.js";
 import { createAppearanceSettingsModule } from "./appearance-settings.js";
 import type {
   AgentStreamEvent,
+  BackgroundStateEvent,
   BackgroundJobMutationResult,
   ExportConversationResult,
   LibraryMutationResult,
@@ -51,6 +52,16 @@ let closeBookOutline: (() => void) | undefined;
 function broadcastAgentEvent(event: AgentStreamEvent) {
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.isDestroyed()) window.webContents.send("agent:event", event);
+  }
+}
+
+// 后台状态推送（ADR-0008）：模块只发「某书变了」通知，这里组装完整状态分片 + 单调 revision 广播。
+let backgroundStateRevision = 0;
+type BackgroundStateEventInput = BackgroundStateEvent extends infer Variant ? Variant extends BackgroundStateEvent ? Omit<Variant, "revision"> : never : never;
+function broadcastBackgroundState(event: BackgroundStateEventInput) {
+  const payload: BackgroundStateEvent = { ...event, revision: (backgroundStateRevision += 1) };
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send("background:event", payload);
   }
 }
 
@@ -149,6 +160,7 @@ app.whenReady().then(async () => {
         renderPage: async (bookId, page, scale) => bookIndex.renderPageImage(bookId, page, scale),
         complete: buildAiOutlineCompleter({ loadConnection: loadChatConnection }),
       },
+      onOutlineChange: (bookId) => broadcastBackgroundState({ kind: "outline", bookId, nodes: bookOutline.get(bookId) }),
     });
     closeBookOutline = bookOutline.close;
     const scheduleOptionalEmbedding = (input: Omit<ScheduleBackgroundJobInput, "kind">) => (
@@ -215,7 +227,7 @@ app.whenReady().then(async () => {
         context.checkpoint(`page:${result.processedPages}`, result.processedPages, result.totalPages);
         if (context.signal.aborted) throw new Error("目录补全任务已暂停或取消。");
       },
-    });
+    }, (bookId) => broadcastBackgroundState({ kind: "jobs", bookId, jobs: backgroundJobs.list(bookId) }));
     closeBackgroundJobs = backgroundJobs.close;
     void readAppConfig(configPath)
       .then((config) => {
