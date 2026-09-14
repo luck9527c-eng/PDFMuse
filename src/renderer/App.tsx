@@ -62,6 +62,7 @@ import { getConversationReferencePages } from "./conversation-reference";
 import { createReadingStateWriter } from "./reading-state-persistence";
 import { useBookConversation } from "./use-book-conversation";
 import { useBookText } from "./use-book-text";
+import { useReadingStateTracker } from "./use-reading-state-tracker";
 
 type PassagePopover = Extract<ViewerSelection, { kind: "selected" }>;
 
@@ -91,25 +92,6 @@ export function App() {
   const viewerRef = useRef<PdfViewerHandle>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const startupRestoreStartedRef = useRef(false);
-  const readingStateRef = useRef<ReadingState>({
-    page: 1,
-    scrollTop: 0,
-    zoomMode: "page-width",
-    zoomScale: 100,
-    leftSidebarOpen: true,
-    rightSidebarOpen: true,
-  });
-  const leftOpenRef = useRef(true);
-  const rightOpenRef = useRef(true);
-  const stateWriterRef = useRef<ReturnType<typeof createReadingStateWriter<{
-    bookId: string;
-    state: ReadingState;
-  }>> | null>(null);
-  if (!stateWriterRef.current) {
-    stateWriterRef.current = createReadingStateWriter(({ bookId, state }) => {
-      void window.pdfMuse?.updateLibraryBookState(bookId, state).catch(() => undefined);
-    });
-  }
   const [preflight, setPreflight] = useState<StartupPreflight>();
 
   // preload 版本错配检测：渲染端热更新而 Electron 未重启时，缺失的方法在这里可见，
@@ -186,6 +168,9 @@ export function App() {
     recognizeCurrentPage,
     setOcrNotice,
   } = useBookText({ book, page: viewerState.page, renderRevision: viewerState.renderRevision, viewer: viewerRef });
+
+  // 阅读状态 tracker：组装、节流写入与切书/卸载 flush 全部由它独占。
+  const { trackViewerState } = useReadingStateTracker({ book, leftOpen, rightOpen });
 
   useEffect(() => {
     void (window.pdfMuse?.getStartupPreflight() ?? Promise.resolve(browserPreflight)).then(setPreflight);
@@ -286,10 +271,6 @@ export function App() {
 
   const activateBook = useCallback((openedBook: OpenedPdfBook) => {
     activeBookIdRef.current = openedBook.id;
-    stateWriterRef.current?.flush();
-    readingStateRef.current = openedBook.readingState;
-    leftOpenRef.current = openedBook.readingState.leftSidebarOpen;
-    rightOpenRef.current = openedBook.readingState.rightSidebarOpen;
     setViewerState({
       page: openedBook.readingState.page,
       pages: openedBook.pageCount,
@@ -441,8 +422,6 @@ export function App() {
     })();
   }, [activateBook, handleOpenResult, preflight, refreshLibrary]);
 
-  useEffect(() => () => stateWriterRef.current?.flush(), []);
-
   const openBook = useCallback(async () => {
     if (!window.pdfMuse) return;
     try {
@@ -537,7 +516,6 @@ export function App() {
 
   const showLibrary = useCallback(() => {
     activeBookIdRef.current = undefined;
-    stateWriterRef.current?.flush();
     setBook(undefined);
     setViewerError("");
     setPassage(undefined);
@@ -550,18 +528,8 @@ export function App() {
 
   const handleViewerState = useCallback((state: ViewerState) => {
     setViewerState(state);
-    if (!book) return;
-    const readingState: ReadingState = {
-      page: state.page,
-      scrollTop: state.scrollTop,
-      zoomMode: state.zoomMode,
-      zoomScale: state.scale,
-      leftSidebarOpen: leftOpenRef.current,
-      rightSidebarOpen: rightOpenRef.current,
-    };
-    readingStateRef.current = readingState;
-    stateWriterRef.current?.schedule({ bookId: book.id, state: readingState });
-  }, [book]);
+    trackViewerState(state);
+  }, [trackViewerState]);
 
   const handleViewerSelection = useCallback((selection?: ViewerSelection) => {
     if (!selection) {
@@ -583,18 +551,6 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [selectionFeedback]);
 
-  useEffect(() => {
-    leftOpenRef.current = leftOpen;
-    rightOpenRef.current = rightOpen;
-    if (!book) return;
-    readingStateRef.current = {
-      ...readingStateRef.current,
-      leftSidebarOpen: leftOpen,
-      rightSidebarOpen: rightOpen,
-    };
-    stateWriterRef.current?.schedule({ bookId: book.id, state: readingStateRef.current });
-  }, [book, leftOpen, rightOpen]);
-
   const clearBookConversation = useCallback(async () => {
     setClearingConversation(true);
     const outcome = await clear();
@@ -612,8 +568,17 @@ export function App() {
     setAttachedPassage(selectedPassage);
     setRightOpen(true);
     setPassage(undefined);
-    requestAnimationFrame(() => composerRef.current?.focus());
-  }, []);
+    // 已展开时同步聚焦：不留延迟回调——渲染繁忙时迟到的 focus 会塌掉其后新建的页面选区。
+    if (rightOpen) composerRef.current?.focus();
+  }, [rightOpen]);
+
+  // 右栏由收起转展开的场合，composer 在提交后才挂载，此时补一次聚焦。
+  const prevRightOpenRef = useRef(rightOpen);
+  useEffect(() => {
+    const expanded = !prevRightOpenRef.current && rightOpen;
+    prevRightOpenRef.current = rightOpen;
+    if (expanded && attachedPassage) composerRef.current?.focus();
+  }, [rightOpen, attachedPassage]);
 
   const copyPassage = useCallback(async (selectedPassage: SelectedPassage) => {
     setPassage(undefined);
