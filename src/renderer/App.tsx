@@ -38,8 +38,6 @@ import type {
   AppearanceSettings,
   BackgroundJob,
   ConversationMessage,
-  OcrPageResult,
-  RecognizedPageText,
   LibraryBook,
   OpenedPdfBook,
   OpenPdfBookResult,
@@ -48,7 +46,6 @@ import type {
   StartupPreflight,
 } from "../shared/contracts";
 import { APPEARANCE_DEFAULTS, MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES } from "../shared/contracts";
-import { OCR_INPUT_VERSION, OCR_RENDER_SCALE } from "../shared/ocr-config";
 import { IconButton } from "./components/IconButton";
 import { ConversationMessageItem } from "./components/ConversationMessageItem";
 import { DiagnosticsDrawer } from "./components/DiagnosticsDrawer";
@@ -64,6 +61,7 @@ import { findMissingApiMethods } from "./api-compat";
 import { getConversationReferencePages } from "./conversation-reference";
 import { createReadingStateWriter } from "./reading-state-persistence";
 import { useBookConversation } from "./use-book-conversation";
+import { useBookText } from "./use-book-text";
 
 type PassagePopover = Extract<ViewerSelection, { kind: "selected" }>;
 
@@ -138,6 +136,7 @@ export function App() {
     outline: [],
     findCurrent: 0,
     findTotal: 0,
+    renderRevision: 0,
   });
   const [viewerError, setViewerError] = useState("");
   const [leftOpen, setLeftOpen] = useState(true);
@@ -154,10 +153,6 @@ export function App() {
   const [draft, setDraft] = useState("");
   const [attachedPassage, setAttachedPassage] = useState<SelectedPassage>();
   const [attachments, setAttachments] = useState<AgentImageAttachment[]>([]);
-  const [recognizedPage, setRecognizedPage] = useState<RecognizedPageText>();
-  const [ocrLoading, setOcrLoading] = useState(false);
-  const [ocrNotice, setOcrNotice] = useState("");
-  const [pageRenderRevision, setPageRenderRevision] = useState(0);
   const [backgroundJobs, setBackgroundJobs] = useState<BackgroundJob[]>([]);
   const [generatedOutline, setGeneratedOutline] = useState<OutlineNode[]>();
   const [clearConversationOpen, setClearConversationOpen] = useState(false);
@@ -166,7 +161,6 @@ export function App() {
   const attachmentsRef = useRef(attachments);
   const activeBookIdRef = useRef<string | undefined>(undefined);
   const currentPageRef = useRef(viewerState.page);
-  const ocrRequestsRef = useRef(new Map<string, Promise<OcrPageResult>>());
   attachmentsRef.current = attachments;
   currentPageRef.current = viewerState.page;
 
@@ -183,6 +177,15 @@ export function App() {
     exportMarkdown,
     refreshDiagnostics,
   } = useBookConversation(book, () => currentPageRef.current);
+
+  // Text Availability 域：开书任务调度门控、Recognized Text 缓存去重、邻页预取与重渲染复查收敛在 useBookText。
+  const {
+    recognizedPage,
+    ocrLoading,
+    ocrNotice,
+    recognizeCurrentPage,
+    setOcrNotice,
+  } = useBookText({ book, page: viewerState.page, renderRevision: viewerState.renderRevision, viewer: viewerRef });
 
   useEffect(() => {
     void (window.pdfMuse?.getStartupPreflight() ?? Promise.resolve(browserPreflight)).then(setPreflight);
@@ -223,8 +226,6 @@ export function App() {
   }, []);
 
   const resetReaderSideState = useCallback(() => {
-    setRecognizedPage(undefined);
-    setOcrNotice("");
     setBackgroundJobs([]);
     setGeneratedOutline(undefined);
   }, []);
@@ -298,6 +299,7 @@ export function App() {
       outline: [],
       findCurrent: 0,
       findTotal: 0,
+      renderRevision: 0,
     });
     setLeftOpen(openedBook.readingState.leftSidebarOpen);
     setRightOpen(openedBook.readingState.rightSidebarOpen);
@@ -306,28 +308,12 @@ export function App() {
     setLibraryError("");
     setUnavailableBookId(undefined);
     resetReaderSideState();
-    const pdfMuseApi = window.pdfMuse;
-    if (pdfMuseApi) {
-      void (async () => {
-        await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "index", priority: 10, total: openedBook.pageCount });
-        await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "outline", priority: 5, total: openedBook.pageCount });
-        const preflight = await pdfMuseApi.getStartupPreflight();
-        if (preflight.ok && !preflight.warnings.some((warning) => warning.includes("OCR"))) {
-          await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "ocr", priority: 20, total: openedBook.pageCount, maxAttempts: 3, inputVersion: OCR_INPUT_VERSION, startPage: openedBook.currentPage });
-        }
-        const embedding = await pdfMuseApi.getEmbeddingConnection();
-        if (embedding.baseUrl && embedding.model) {
-          await pdfMuseApi.scheduleBackgroundJob({ bookId: openedBook.id, kind: "embedding", priority: 0, total: openedBook.pageCount });
-        }
-        await refreshBackgroundJobs(openedBook.id);
-      })().catch(() => undefined);
-    }
     setPanMode(false);
     setPassage(undefined);
     setAttachedPassage(undefined);
     setAttachments([]);
     setSelectionFeedback(undefined);
-  }, [refreshBackgroundJobs, resetReaderSideState]);
+  }, [resetReaderSideState]);
 
   // 后台状态走推送（ADR-0008）：开书拉一次初值，此后由任务/目录变更事件驱动，不再轮询。
   useEffect(() => {
@@ -532,43 +518,6 @@ export function App() {
     }
   }, [refreshLibrary]);
 
-  const ensureRecognizedPage = useCallback((targetBook: OpenedPdfBook, page: number) => {
-    const key = `${targetBook.id}:${page}`;
-    const pending = ocrRequestsRef.current.get(key);
-    if (pending) return pending;
-    const request = (async (): Promise<OcrPageResult> => {
-      if (!window.pdfMuse) return { ok: false, code: "UNAVAILABLE", message: "文字识别功能不可用。" };
-      const cached = await window.pdfMuse.getRecognizedPage(targetBook.id, page);
-      if (cached?.inputVersion === OCR_INPUT_VERSION) return { ok: true, page: cached };
-      const image = await viewerRef.current?.getPageImage(page, OCR_RENDER_SCALE);
-      if (!image) return { ok: false, code: "FAILED", message: "当前页面尚未准备好，请稍后重试。" };
-      return window.pdfMuse.recognizePage({
-        bookId: targetBook.id,
-        page,
-        imageData: image.data,
-        width: image.width,
-        height: image.height,
-      });
-    })().finally(() => ocrRequestsRef.current.delete(key));
-    ocrRequestsRef.current.set(key, request);
-    return request;
-  }, []);
-
-  const recognizeCurrentPage = useCallback(async () => {
-    if (!book || !window.pdfMuse || ocrLoading) return;
-    setOcrLoading(true);
-    setOcrNotice("");
-    try {
-      const result = await ensureRecognizedPage(book, viewerState.page);
-      if (result.ok) setRecognizedPage(result.page);
-      else setOcrNotice(result.message);
-    } catch {
-      setOcrNotice("当前页识别失败，请稍后重试。");
-    } finally {
-      setOcrLoading(false);
-    }
-  }, [book, ensureRecognizedPage, ocrLoading, viewerState.page]);
-
   const findInBook = useCallback(async (query: string, previous = false) => {
     const normalized = query.trim();
     viewerRef.current?.find(normalized, previous);
@@ -598,44 +547,6 @@ export function App() {
     resetReaderSideState();
     void refreshLibrary();
   }, [refreshLibrary, resetReaderSideState]);
-
-  const ocrUnavailable = preflight?.ok === true
-    && preflight.warnings.some((warning) => warning.includes("OCR"));
-
-  useEffect(() => {
-    if (!book || !window.pdfMuse) {
-      setRecognizedPage(undefined);
-      return;
-    }
-    setRecognizedPage(undefined);
-    if (ocrUnavailable) return;
-    let disposed = false;
-    let prefetchTimer = 0;
-    const page = viewerState.page;
-    void (async () => {
-      if (await viewerRef.current?.hasNativeText(page)) return;
-      const result = await ensureRecognizedPage(book, page);
-      if (disposed) return;
-      if (result.ok) setRecognizedPage(result.page);
-      prefetchTimer = window.setTimeout(() => {
-        void (async () => {
-          for (const neighbor of [page + 1, page - 1]) {
-            if (disposed || neighbor < 1 || neighbor > book.pageCount) continue;
-            if (await viewerRef.current?.hasNativeText(neighbor)) continue;
-            await ensureRecognizedPage(book, neighbor);
-          }
-        })();
-      }, 250);
-    })();
-    return () => {
-      disposed = true;
-      window.clearTimeout(prefetchTimer);
-    };
-  }, [book, ensureRecognizedPage, ocrUnavailable, pageRenderRevision, viewerState.page]);
-
-  const handlePageRendered = useCallback((page: number) => {
-    if (page === currentPageRef.current) setPageRenderRevision((revision) => revision + 1);
-  }, []);
 
   const handleViewerState = useCallback((state: ViewerState) => {
     setViewerState(state);
@@ -934,7 +845,7 @@ export function App() {
             </form>
           )}
           {ocrNotice && <div className="reader-notice" role="status"><span>{ocrNotice}</span><button aria-label="关闭识别提示" onClick={() => setOcrNotice("")}><X size={14} /></button></div>}
-          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} panMode={panMode} recognizedPage={recognizedPage} onStateChange={handleViewerState} onSelectionChange={handleViewerSelection} onPageRendered={handlePageRendered} onError={setViewerError} />}
+          {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} panMode={panMode} recognizedPage={recognizedPage} onStateChange={handleViewerState} onSelectionChange={handleViewerSelection} onError={setViewerError} />}
         </main>
 
         {rightOpen && (

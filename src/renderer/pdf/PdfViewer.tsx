@@ -31,6 +31,8 @@ export type ViewerState = {
   outline: OutlineNode[];
   findCurrent: number;
   findTotal: number;
+  /** pdfjs 页面重渲染修订：单一事实源在查看器内，页面重绘后递增，消费方据此复查文字层。 */
+  renderRevision: number;
 };
 
 export interface PdfViewerHandle {
@@ -64,7 +66,6 @@ type Props = {
   onStateChange(state: ViewerState): void;
   onSelectionChange(selection?: ViewerSelection): void;
   onError(message: string): void;
-  onPageRendered?(page: number): void;
   recognizedPage?: RecognizedPageText;
 };
 
@@ -99,7 +100,7 @@ async function resolveOutline(
 }
 
 export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
-  { book, panMode, onStateChange, onSelectionChange, onError, onPageRendered, recognizedPage },
+  { book, panMode, onStateChange, onSelectionChange, onError, recognizedPage },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -116,6 +117,8 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
   } | null>(null);
   const panModeRef = useRef(panMode);
   const [loading, setLoading] = useState(true);
+  // ref 供 reportState 闭包读取最新值，state 驱动内部文字层重挂载。
+  const renderRevisionRef = useRef(0);
   const [renderRevision, setRenderRevision] = useState(0);
 
   useEffect(() => {
@@ -272,6 +275,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         outline,
         findCurrent,
         findTotal,
+        renderRevision: renderRevisionRef.current,
       });
     };
     let findCurrent = 0;
@@ -281,8 +285,9 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       reportState();
     });
     const reportPageRendered = (event: { pageNumber: number }) => {
+      renderRevisionRef.current += 1;
       setRenderRevision((revision) => revision + 1);
-      onPageRendered?.(event.pageNumber);
+      reportState();
     };
     eventBus.on("pagerendered", reportPageRendered);
     eventBus.on("scalechanging", () => reportState());
@@ -502,7 +507,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       viewer.cleanup();
       void loadingTask.destroy();
     };
-  }, [book, onError, onPageRendered, onSelectionChange, onStateChange]);
+  }, [book, onError, onSelectionChange, onStateChange]);
 
   useEffect(() => {
     const viewerElement = viewerElementRef.current;
