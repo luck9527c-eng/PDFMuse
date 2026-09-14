@@ -745,7 +745,7 @@ try {
   assert.equal(storedConfig.embedding.apiKey, "smoke-embedding-secret", "Main did not persist the embedding API key");
   await evaluate(
     page.webSocketDebuggerUrl,
-    `document.querySelector('[aria-label="模型与阅读设置"]')?.click()`,
+    `document.querySelector('[aria-label="设置"]')?.click()`,
   );
   const settingsText = await waitForText(page.webSocketDebuggerUrl, "保存配置");
   assert.match(settingsText, /测试连接/, "model connection test command is unavailable");
@@ -957,9 +957,18 @@ try {
   );
   const toolAnswer = toolConversation.at(-1);
   assert.equal(toolAnswer.status, "complete", "the tool-assisted answer is not complete");
-  assert.equal(toolAnswer.evidence?.[0]?.page, 2, "pdf evidence was not persisted with the answer");
-  assert.equal(toolAnswer.evidence?.[0]?.source, "pdf", "the persisted evidence is not marked as a pdf source");
-  assert.match(toolAnswer.evidence?.[0]?.snippet ?? "", /Chapter Two/, "the persisted evidence snippet is invalid");
+  // 证据按页码升序持久化（每页最优、上限 8 条），第 2 页的证据不一定是首条。
+  const pageTwoEvidence = toolAnswer.evidence?.find((item) => item.page === 2);
+  assert.equal(
+    pageTwoEvidence?.source,
+    "pdf",
+    `pdf evidence for page 2 was not persisted: ${JSON.stringify(toolAnswer.evidence)}`,
+  );
+  assert.match(
+    pageTwoEvidence?.snippet ?? "",
+    /Chapter Two/,
+    `the persisted evidence snippet is invalid: ${JSON.stringify(toolAnswer.evidence)}`,
+  );
 
   await stopElectron(child);
   await unlink(fixturePath);
