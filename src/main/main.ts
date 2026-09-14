@@ -15,6 +15,7 @@ import { createBookIndex } from "./agent/book-index.js";
 import { buildConversationExportFilename, buildConversationMarkdown, selectExportableMessages } from "./agent/conversation-export.js";
 import type { ResolvedModelConnection } from "./agent/model-runtime.js";
 import { buildAiOutlineCompleter } from "./agent/outline-ai.js";
+import { createSessionStore } from "./agent/session-store.js";
 import { createToolRegistry } from "./agent/tool-registry.js";
 import { createWebSearchModule } from "./agent/web-search.js";
 import { createOcrModule, createWorkerOcrEngine } from "./ocr.js";
@@ -119,6 +120,16 @@ app.whenReady().then(async () => {
     const configPath = path.join(startupPreflight.dataHome, "config.json");
     const readerProfile = createReaderProfileModule(startupPreflight.dataHome);
     const appearanceSettings = createAppearanceSettingsModule(startupPreflight.dataHome);
+    const ocr = createOcrModule(startupPreflight.dataHome, createWorkerOcrEngine({
+      command: path.join(applicationDirectory(), "resources", "ocr-runtime", process.platform === "win32" ? "python.exe" : "python"),
+      args: [path.join(applicationDirectory(), "resources", "ocr-worker", "rapidocr_worker.py")],
+      model: OCR_MODEL,
+      inputVersion: OCR_INPUT_VERSION,
+      engineVersion: OCR_ENGINE_VERSION,
+    }));
+    closeOcr = ocr.close;
+    // 会话检索读接口晚接（会话存储在检索模块之后创建），与 getEmbeddingProvider 同为懒取。
+    let searchConversationMessages: ((bookId: string, likePattern: string) => Array<{ id: string; body: string }>) | undefined;
     const bookIndex = createBookIndex(startupPreflight.dataHome, {
       onEmbeddingError: (error) => {
         const diagnostic = error instanceof Error
@@ -134,16 +145,15 @@ app.whenReady().then(async () => {
           embed: (inputs: readonly string[], signal?: AbortSignal) => embeddingConnection.embed(inputs, signal),
         };
       },
+      getBookSource: (bookId) => library.getBookSource(bookId),
+      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.lines,
+      getConversationSearch: () => searchConversationMessages,
     });
     closeBookIndex = bookIndex.close;
-    const ocr = createOcrModule(startupPreflight.dataHome, createWorkerOcrEngine({
-      command: path.join(applicationDirectory(), "resources", "ocr-runtime", process.platform === "win32" ? "python.exe" : "python"),
-      args: [path.join(applicationDirectory(), "resources", "ocr-worker", "rapidocr_worker.py")],
-      model: OCR_MODEL,
-      inputVersion: OCR_INPUT_VERSION,
-      engineVersion: OCR_ENGINE_VERSION,
-    }));
-    closeOcr = ocr.close;
+    const sessionStore = createSessionStore(startupPreflight.dataHome, {
+      deleteConversationEmbeddings: bookIndex.deleteConversationEmbeddings,
+    });
+    searchConversationMessages = sessionStore.searchMessages;
     const loadChatConnection = async (): Promise<ResolvedModelConnection | undefined> => {
       const config = await readAppConfig(configPath);
       return config.chat
@@ -156,6 +166,7 @@ app.whenReady().then(async () => {
         : undefined;
     };
     const bookOutline = createBookOutlineModule(startupPreflight.dataHome, {
+      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.lines,
       aiOutline: {
         renderPage: async (bookId, page, scale) => bookIndex.renderPageImage(bookId, page, scale),
         complete: buildAiOutlineCompleter({ loadConnection: loadChatConnection }),
@@ -229,6 +240,12 @@ app.whenReady().then(async () => {
       },
     }, (bookId) => broadcastBackgroundState({ kind: "jobs", bookId, jobs: backgroundJobs.list(bookId) }));
     closeBackgroundJobs = backgroundJobs.close;
+    // 每书数据所有权（ADR 0007）：各数据模块注册自己的清理钩子，Library 删除时按注册顺序遍历。
+    library.registerBookDataCleaner(bookIndex.deleteBookData);
+    library.registerBookDataCleaner(sessionStore.deleteBookData);
+    library.registerBookDataCleaner(bookOutline.deleteBookData);
+    library.registerBookDataCleaner(ocr.deleteBookData);
+    library.registerBookDataCleaner(backgroundJobs.deleteBookData);
     void readAppConfig(configPath)
       .then((config) => {
         if (!config.embedding?.baseUrl.trim() || !config.embedding.model.trim()) {
@@ -244,6 +261,7 @@ app.whenReady().then(async () => {
     const toolRegistry = createToolRegistry();
     const agentHost: AgentHost = createAgentHost({
       dataHome: startupPreflight.dataHome,
+      store: sessionStore,
       emit: broadcastAgentEvent,
       loadModelConnection: loadChatConnection,
       loadReaderProfile: async () => (await readerProfile.get()).content,

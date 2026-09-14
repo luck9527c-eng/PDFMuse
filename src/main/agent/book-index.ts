@@ -4,7 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
-import type { ReadingFocus } from "../../shared/contracts.js";
+import type { ReadingFocus, RecognizedTextLine } from "../../shared/contracts.js";
 import { chunkPageText } from "./semantic-chunker.js";
 
 /**
@@ -41,7 +41,6 @@ export type BookSearchHit = {
   score?: number;
   sourceId?: string;
 };
-
 export type BookSearchOutcome =
   | {
       status: "ok";
@@ -60,8 +59,6 @@ export type BookSearchOutcome =
     }
   | { status: "unavailable"; note: string };
 
-type BookRow = { current_path: string; page_count: number; saved_password: string | null };
-
 export type EmbeddingProvider = {
   model: string;
   embed(inputs: readonly string[], signal?: AbortSignal): Promise<readonly number[][]>;
@@ -72,6 +69,12 @@ export type BookIndexOptions = {
   getEmbeddingProvider?: () => EmbeddingProvider | undefined | Promise<EmbeddingProvider | undefined>;
   embeddingBatchSize?: number;
   onEmbeddingError?: (error: unknown) => void;
+  /** 书目元数据最小读接口（library_books 表属 Library）：索引、检索与原文件加载经此取源。 */
+  getBookSource?(bookId: string): { path: string; pageCount: number; savedPassword?: string } | undefined;
+  /** Recognized Text 行最小读接口（recognized_pages 表属 OCR）：原生文本不足时兜底取识别行。 */
+  readRecognizedLines?(bookId: string, page: number): ReadonlyArray<RecognizedTextLine> | undefined;
+  /** 会话检索最小读接口（会话表属会话存储）：懒取，组装根中会话存储晚于本模块创建。 */
+  getConversationSearch?(): ((bookId: string, likePattern: string) => Array<{ id: string; body: string }>) | undefined;
 };
 
 type EmbeddingRow = {
@@ -168,17 +171,6 @@ async function extractPageText(document: Awaited<ReturnType<typeof getDocument>[
   }
 }
 
-function readRecognizedText(database: DatabaseSync, bookId: string, page: number) {
-  try {
-    const row = database.prepare("SELECT lines_json FROM recognized_pages WHERE book_id = ? AND page = ?").get(bookId, page) as { lines_json: string } | undefined;
-    if (!row) return "";
-    const lines = JSON.parse(row.lines_json) as Array<{ text?: unknown }>;
-    return lines.filter((line) => typeof line.text === "string").map((line) => line.text as string).join("\n").replace(/[^\S\n]+/g, " ").trim();
-  } catch {
-    return "";
-  }
-}
-
 export function createBookIndex(dataHome: string, options: BookIndexOptions = {}) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
   database.exec(`
@@ -226,9 +218,6 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   );
   const allIndexedPagesStatement = database.prepare(
     "SELECT COUNT(*) AS count FROM book_pages WHERE book_id = ?",
-  );
-  const bookRowStatement = database.prepare(
-    "SELECT current_path, page_count, saved_password FROM library_books WHERE id = ?",
   );
   const insertPageStatement = database.prepare(`
     INSERT INTO book_pages (book_id, page, text, extraction_version) VALUES (?, ?, ?, ?)
@@ -289,6 +278,18 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
 
   async function embeddingProvider() {
     return options.embeddingProvider ?? options.getEmbeddingProvider?.();
+  }
+
+  /** 原生文本不足一页下限时，用 Recognized Text 行兜底（经 OCR 模块的读接口）。 */
+  function recognizedPageText(bookId: string, page: number) {
+    const lines = options.readRecognizedLines?.(bookId, page);
+    if (!lines) return "";
+    return lines
+      .map((line) => (line && typeof line.text === "string" ? line.text : ""))
+      .filter(Boolean)
+      .join("\n")
+      .replace(/[^\S\n]+/g, " ")
+      .trim();
   }
 
   function embeddingRows(bookId: string) {
@@ -406,7 +407,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     signal?: AbortSignal,
     onProgress?: (indexedPages: number, totalPages: number) => void,
   ): Promise<{ indexedPages: number; totalPages: number; note?: string }> {
-    const row = bookRowStatement.get(bookId) as BookRow | undefined;
+    const row = options.getBookSource?.(bookId);
     if (!row) return { indexedPages: 0, totalPages: 0, note: "书库中没有这本书的索引来源。" };
     const existing = indexedPagesBeforeStatement.get(bookId, TEXT_EXTRACTION_VERSION) as { max_page: number | null; count: number };
     const allExisting = allIndexedPagesStatement.get(bookId) as { count: number };
@@ -422,10 +423,10 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
         throw error;
       }
     }
-    if (existing.count >= row.page_count && existing.max_page === row.page_count) {
+    if (existing.count >= row.pageCount && existing.max_page === row.pageCount) {
       const provider = await embeddingProvider();
       if (provider) await ensureEmbeddings(bookId, signal);
-      return { indexedPages: existing.count, totalPages: row.page_count };
+      return { indexedPages: existing.count, totalPages: row.pageCount };
     }
     const source = await loadBook();
     const loadingTask = getDocument({
@@ -450,7 +451,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       for (let page = indexed + 1; page <= document.numPages; page += 1) {
         if (signal?.aborted) break;
         const nativeText = await extractPageText(document, page);
-        const text = nativeText.length >= 16 ? nativeText : (readRecognizedText(database, bookId, page) || nativeText);
+        const text = nativeText.length >= 16 ? nativeText : (recognizedPageText(bookId, page) || nativeText);
         database.exec("BEGIN");
         try {
           insertPageStatement.run(bookId, page, text, TEXT_EXTRACTION_VERSION);
@@ -469,10 +470,10 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     }
     const provider = await embeddingProvider();
     if (provider) await ensureEmbeddings(bookId, signal);
-    const partial = indexed < row.page_count
-      ? { note: `索引尚未完成（已索引 ${indexed}/${row.page_count} 页），当前只在已索引范围内检索。` }
+    const partial = indexed < row.pageCount
+      ? { note: `索引尚未完成（已索引 ${indexed}/${row.pageCount} 页），当前只在已索引范围内检索。` }
       : {};
-    return { indexedPages: indexed, totalPages: row.page_count, ...partial };
+    return { indexedPages: indexed, totalPages: row.pageCount, ...partial };
   }
 
   function indexRecognizedPage(bookId: string, page: number, lines: readonly { text: string }[]) {
@@ -510,9 +511,9 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   }
 
   async function loadBookBytesForIndex(bookId: string) {
-    const row = bookRowStatement.get(bookId) as BookRow | undefined;
+    const row = options.getBookSource?.(bookId);
     if (!row) throw new Error("书库中没有这本书。");
-    return loadBookBytes(row.current_path, row.saved_password ?? undefined);
+    return loadBookBytes(row.path, row.savedPassword);
   }
 
   function ensureIndexed(
@@ -563,7 +564,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     ): Promise<BookSearchOutcome> {
       const trimmed = query.trim();
       if (!trimmed) return { status: "unavailable", note: "检索词为空。" };
-      const row = bookRowStatement.get(bookId) as BookRow | undefined;
+      const row = options.getBookSource?.(bookId);
       if (!row) return { status: "unavailable", note: "书库中没有这本书。" };
 
       type Candidate = {
@@ -618,22 +619,12 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
         addCandidate({ source: "pdf", sourceId: `${page.page}:0`, page: page.page, text: page.text }, ftsPages.has(page.page) ? 0.8 : 1);
       }
 
-      // 早期对话同样是候选来源；表不存在时保持向后兼容（首次启动尚未创建会话表）。
-      try {
-        const conversationHits = database.prepare(`
-          SELECT m.id AS source_id, m.body AS text
-          FROM agent_messages m
-          JOIN agent_sessions s ON s.id = m.session_id
-          WHERE s.book_id = ? AND m.role IN ('reader', 'assistant')
-            AND m.status = 'complete' AND m.body LIKE ?
-          ORDER BY m.created_at DESC
-          LIMIT 20
-        `).all(bookId, likePattern(trimmed)) as Array<{ source_id: string; text: string }>;
-        for (const hit of conversationHits) {
-          addCandidate({ source: "conversation", sourceId: hit.source_id, text: hit.text }, 0.9);
+      // 早期对话同样是候选来源；经会话存储的读接口查询，未接线时只用 PDF 候选。
+      const conversationSearch = options.getConversationSearch?.();
+      if (conversationSearch) {
+        for (const hit of conversationSearch(bookId, likePattern(trimmed))) {
+          addCandidate({ source: "conversation", sourceId: hit.id, text: hit.body }, 0.9);
         }
-      } catch {
-        // 会话表由 Agent Host 懒创建；没有它时只使用 PDF 候选。
       }
 
       let retrievalMode: "hybrid" | "fts-only" = "fts-only";
@@ -710,14 +701,14 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       const base = {
         hits,
         indexedPages: indexedPages.count,
-        totalPages: row.page_count,
+        totalPages: row.pageCount,
         retrievalMode,
       };
-      if (indexedPages.count < row.page_count) {
+      if (indexedPages.count < row.pageCount) {
         return {
           status: "partial",
           ...base,
-          note: `索引尚未完成（${indexedPages.count}/${row.page_count} 页），结果只覆盖已索引页面。`,
+          note: `索引尚未完成（${indexedPages.count}/${row.pageCount} 页），结果只覆盖已索引页面。`,
         };
       }
       return { status: "ok", ...base };
@@ -735,9 +726,9 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
 
     /** 按书库记录读取原文件字节（含已记住的密码）；原文件只读，永不修改。 */
     async loadBookByBookId(bookId: string) {
-      const row = bookRowStatement.get(bookId) as BookRow | undefined;
+      const row = options.getBookSource?.(bookId);
       if (!row) throw new Error("书库中没有这本书。");
-      return loadBookBytes(row.current_path, row.saved_password ?? undefined);
+      return loadBookBytes(row.path, row.savedPassword);
     },
 
     /** 读取指定页码范围（含端点）的已索引整页文本；供 read_pages 工具整页阅读。 */
@@ -751,12 +742,26 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     },
 
     stats(bookId: string) {
-      const row = bookRowStatement.get(bookId) as BookRow | undefined;
+      const row = options.getBookSource?.(bookId);
       const indexed = indexedPagesStatement.get(bookId, TEXT_EXTRACTION_VERSION) as { count: number };
       return {
         indexedPages: indexed.count,
-        totalPages: row?.page_count ?? 0,
+        totalPages: row?.pageCount ?? 0,
       };
+    },
+
+    /** 每书数据清理钩子：在调用方提供的连接上删除本书页面、FTS 与全部语义向量。 */
+    deleteBookData(bookId: string, connection: DatabaseSync) {
+      connection.prepare("DELETE FROM book_pages WHERE book_id = ?").run(bookId);
+      connection.prepare("DELETE FROM book_pages_fts WHERE book_id = ?").run(bookId);
+      connection.prepare("DELETE FROM semantic_embeddings WHERE book_id = ?").run(bookId);
+    },
+
+    /** 清空会话时的向量清理钩子：在调用方事务内只删本书会话来源的向量。 */
+    deleteConversationEmbeddings(bookId: string, connection: DatabaseSync) {
+      connection.prepare(
+        "DELETE FROM semantic_embeddings WHERE book_id = ? AND source = 'conversation'",
+      ).run(bookId);
     },
 
     close() {

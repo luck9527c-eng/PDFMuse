@@ -19,7 +19,7 @@ describe("tool registry", () => {
   beforeEach(async () => {
     dataHome = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-tools-"));
     library = createLibraryModule(dataHome);
-    bookIndex = createBookIndex(dataHome);
+    bookIndex = createBookIndex(dataHome, { getBookSource: (id) => library.getBookSource(id) });
     const opened = await library.openPath(FIXTURE);
     expect(opened.ok).toBe(true);
     if (opened.ok) bookId = opened.book.id;

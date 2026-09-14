@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createBackgroundJobModule, type BackgroundJobModule, type JobExecutor } from "./background-jobs.js";
@@ -57,8 +58,7 @@ describe("background jobs", () => {
   it("stores an opaque initial checkpoint on the scheduled job", () => {
     module = createBackgroundJobModule(dataHome);
     const scheduled = module.schedule({ bookId: BOOK_A, kind: "ocr", checkpoint: "ocr-order:6:12" });
-    expect(scheduled).toMatchObject({ ok: true, job: { checkpoint: "ocr-order:6:12" } });
-  });
+    expect(scheduled).toMatchObject({ ok: true, job: { checkpoint: "ocr-order:6:12" } });  });
 
   it("notifies job changes per book for push delivery", async () => {
     const notified: string[] = [];
@@ -193,6 +193,19 @@ describe("background jobs", () => {
     if (!scheduled.ok) throw new Error("任务未创建。");
     await waitFor(() => module?.get(scheduled.job.id)?.status === "completed");
     expect(module.get(scheduled.job.id)).toMatchObject({ attempts: 3, maxAttempts: 3, inputVersion: "ocr-v1" });
+  });
+
+  it("deleteBookData 在给定连接上清掉本书任务且不影响他书", async () => {
+    module = createBackgroundJobModule(dataHome, { index: async () => undefined });
+    module.schedule({ bookId: BOOK_A, kind: "index" });
+    module.schedule({ bookId: BOOK_B, kind: "index" });
+
+    const connection = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    module.deleteBookData(BOOK_A, connection);
+    connection.close();
+
+    expect(module.list(BOOK_A)).toEqual([]);
+    expect(module.list(BOOK_B)).toHaveLength(1);
   });
 
 });

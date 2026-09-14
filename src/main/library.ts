@@ -105,6 +105,12 @@ function isReadingState(value: unknown): value is ReadingState {
     && typeof state.rightSidebarOpen === "boolean";
 }
 
+/**
+ * 每书数据清理钩子（ADR 0007）：各数据模块注册，删除书籍数据时在 Library 的
+ * 单一事务内以同一连接调用；钩子只清理自己模块私有的表。
+ */
+export type BookDataCleaner = (bookId: string, database: DatabaseSync) => void;
+
 async function inspectPdf(bytes: Uint8Array, fallbackTitle: string, password?: string) {
   const loadingTask = getDocument({ data: bytes.slice(), ...(password ? { password } : {}) });
   try {
@@ -222,9 +228,11 @@ export function createLibraryModule(dataHome: string) {
   const removeFromLibraryStatement = database.prepare(`
     UPDATE library_books SET in_library = 0, updated_at = ? WHERE id = ? AND in_library = 1
   `);
+  const deleteBookStatement = database.prepare("DELETE FROM library_books WHERE id = ?");
   const tableExistsStatement = database.prepare(`
     SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?
   `);
+  const bookDataCleaners: BookDataCleaner[] = [];
   type PendingOpen = {
     filePath: string;
     bytes: Uint8Array;
@@ -326,6 +334,15 @@ export function createLibraryModule(dataHome: string) {
       ...(effectivePassword ? { password: effectivePassword } : {}),
     };
     return { ok: true, book: opened };
+  }
+
+  // Book Memory 已移除（ADR 0006）：遗留表没有属主模块可注册钩子，由 Library 代管
+  // 随删除清理；真实数据全部清零后本函数可整体删除。
+  function deleteLegacyBookMemoryData(bookId: string) {
+    for (const table of ["memory_fts", "memory_audit", "memory_proposals", "book_memories"]) {
+      if (!tableExistsStatement.get(table)) continue;
+      database.prepare(`DELETE FROM ${table} WHERE book_id = ?`).run(bookId);
+    }
   }
 
   return {
@@ -456,37 +473,31 @@ export function createLibraryModule(dataHome: string) {
       }
     },
 
+    registerBookDataCleaner(cleaner: BookDataCleaner) {
+      bookDataCleaners.push(cleaner);
+    },
+
+    /** 书目元数据最小读接口：检索模块等经此读取原文件路径、页数与已存密码，不直查 library_books。 */
+    getBookSource(bookId: string) {
+      const row = findStatement.get(bookId) as BookRow | undefined;
+      if (!row) return undefined;
+      return {
+        path: row.current_path,
+        pageCount: row.page_count,
+        ...(row.saved_password ? { savedPassword: row.saved_password } : {}),
+      };
+    },
+
     deleteBookData(bookId: unknown): LibraryMutationResult {
       if (typeof bookId !== "string" || !BOOK_ID_PATTERN.test(bookId) || !findStatement.get(bookId)) {
         return mutationFailure("NOT_FOUND", "书库中没有找到这本 PDF 书籍。");
       }
-      const hasTable = (name: string) => Boolean(tableExistsStatement.get(name));
       try {
         database.exec("BEGIN IMMEDIATE");
-        if (hasTable("agent_messages") && hasTable("agent_sessions")) {
-          database.prepare(`
-            DELETE FROM agent_messages
-            WHERE session_id IN (SELECT id FROM agent_sessions WHERE book_id = ?)
-          `).run(bookId);
-        }
-        if (hasTable("agent_sessions")) database.prepare("DELETE FROM agent_sessions WHERE book_id = ?").run(bookId);
-        for (const table of [
-          "background_jobs",
-          "book_outline_pages",
-          "book_outlines",
-          "recognized_pages",
-          "semantic_embeddings",
-          "book_pages_fts",
-          "book_pages",
-          // Book Memory 已移除（ADR 0006）；遗留表在删除书籍数据时一并清理。
-          "memory_fts",
-          "memory_audit",
-          "memory_proposals",
-          "book_memories",
-        ]) {
-          if (hasTable(table)) database.prepare(`DELETE FROM ${table} WHERE book_id = ?`).run(bookId);
-        }
-        database.prepare("DELETE FROM library_books WHERE id = ?").run(bookId);
+        // 各数据模块的每书表由注册的清理钩子负责（ADR 0007）；Library 只遍历注册者。
+        for (const clean of bookDataCleaners) clean(bookId as string, database);
+        deleteBookStatement.run(bookId);
+        deleteLegacyBookMemoryData(bookId as string);
         database.exec("COMMIT");
         return { ok: true, bookId };
       } catch (error) {

@@ -80,7 +80,16 @@ function toConversationMessage(row: MessageRow): ConversationMessage {
   return message;
 }
 
-export function createSessionStore(dataHome: string) {
+export type SessionStoreOptions = {
+  /**
+   * 清空会话时清理会话语义向量（semantic_embeddings 表属检索模块）。
+   * 在 clearConversation 的单一事务内以当前连接调用，保持消息、摘要与向量同进退；
+   * 未注入时清空会话不触碰任何向量。
+   */
+  deleteConversationEmbeddings?: (bookId: string, database: DatabaseSync) => void;
+};
+
+export function createSessionStore(dataHome: string, options: SessionStoreOptions = {}) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
   database.exec(`
     PRAGMA journal_mode = WAL;
@@ -142,9 +151,6 @@ export function createSessionStore(dataHome: string) {
   const clearSummaryStatement = database.prepare(`
     UPDATE agent_sessions SET summary = NULL, summary_through_id = NULL, updated_at = ? WHERE id = ?
   `);
-  const tableExistsStatement = database.prepare(
-    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-  );
   const insertMessageStatement = database.prepare(`
     INSERT INTO agent_messages (
       id, session_id, run_id, role, body, status, error_message, focus_json, created_at, updated_at
@@ -168,6 +174,15 @@ export function createSessionStore(dataHome: string) {
     UPDATE agent_messages
     SET status = 'cancelled', error_message = ?, updated_at = ?
     WHERE status = 'streaming'
+  `);
+  const searchMessagesStatement = database.prepare(`
+    SELECT m.id, m.body
+    FROM agent_messages m
+    JOIN agent_sessions s ON s.id = m.session_id
+    WHERE s.book_id = ? AND m.role IN ('reader', 'assistant')
+      AND m.status = 'complete' AND m.body LIKE ?
+    ORDER BY m.created_at DESC
+    LIMIT 20
   `);
 
   function now() {
@@ -205,16 +220,25 @@ export function createSessionStore(dataHome: string) {
       try {
         clearMessagesStatement.run(session.id);
         clearSummaryStatement.run(now(), session.id);
-        if (tableExistsStatement.get("semantic_embeddings")) {
-          database.prepare(
-            "DELETE FROM semantic_embeddings WHERE book_id = ? AND source = 'conversation'",
-          ).run(bookId);
-        }
+        options.deleteConversationEmbeddings?.(bookId, database);
         database.exec("COMMIT");
       } catch (error) {
         database.exec("ROLLBACK");
         throw error;
       }
+    },
+
+    /** 会话检索最小读接口（ADR 0007）：检索模块的早期对话召回经此查询，不直读会话表。 */
+    searchMessages(bookId: string, likePattern: string): Array<{ id: string; body: string }> {
+      return searchMessagesStatement.all(bookId, likePattern) as Array<{ id: string; body: string }>;
+    },
+
+    /** 每书数据清理钩子：在调用方提供的连接上删除本书会话与消息（消息先删以满足外键）。 */
+    deleteBookData(bookId: string, connection: DatabaseSync) {
+      connection.prepare(
+        "DELETE FROM agent_messages WHERE session_id IN (SELECT id FROM agent_sessions WHERE book_id = ?)",
+      ).run(bookId);
+      connection.prepare("DELETE FROM agent_sessions WHERE book_id = ?").run(bookId);
     },
 
     appendMessage(input: {

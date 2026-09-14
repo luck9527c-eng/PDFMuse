@@ -331,6 +331,11 @@ export function createBackgroundJobModule(
       for (const bookId of failedBookIds) notify(bookId);
       return changes;
     },
+    /** 每书数据清理钩子：在调用方提供的连接上删除本书全部任务记录。 */
+    deleteBookData(bookId: string, connection: DatabaseSync) {
+      connection.prepare("DELETE FROM background_jobs WHERE book_id = ?").run(bookId);
+    },
+
     async cancelBook(bookId: string) {
       if (!BOOK_ID_PATTERN.test(bookId) || closed) return;
       const jobs = (database.prepare(`

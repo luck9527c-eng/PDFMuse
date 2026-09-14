@@ -1,11 +1,13 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createOcrModule, type OcrEngine } from "./ocr.js";
 
 const BOOK_ID = "b".repeat(64);
+const OTHER_BOOK_ID = "c".repeat(64);
 
 describe("OCR module", () => {
   let dataHome: string;
@@ -82,5 +84,26 @@ describe("OCR module", () => {
     expect(first).toEqual(second);
     await module.recognizePage(input);
     expect(calls).toBe(1);
+  });
+
+  it("deleteBookData 在给定连接上清掉本书识别页且不影响他书", async () => {
+    const engine: OcrEngine = {
+      name: "测试引擎",
+      model: "测试模型",
+      async recognize(input) {
+        return { width: input.width, height: input.height, orientation: 0, lines: [] };
+      },
+    };
+    const module = createOcrModule(dataHome, engine);
+    close = module.close;
+    await module.recognizePage({ bookId: BOOK_ID, page: 1, imageData: "aGVsbG8=", width: 10, height: 10 });
+    await module.recognizePage({ bookId: OTHER_BOOK_ID, page: 1, imageData: "aGVsbG8=", width: 10, height: 10 });
+
+    const connection = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    module.deleteBookData(BOOK_ID, connection);
+    connection.close();
+
+    expect(module.getPage(BOOK_ID, 1)).toBeUndefined();
+    expect(module.getPage(OTHER_BOOK_ID, 1)).toBeDefined();
   });
 });

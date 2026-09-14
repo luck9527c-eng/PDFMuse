@@ -9,7 +9,7 @@ import {
   type AiOutlineComplete,
   type AiOutlineEntry,
 } from "./agent/outline-ai.js";
-import type { BookOutlineNode, RecognizedTextLine } from "../shared/contracts.js";
+import type { BookOutlineNode, OcrPoint, RecognizedTextLine } from "../shared/contracts.js";
 
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
 const OUTLINE_VERSION = 3;
@@ -361,19 +361,14 @@ export function assembleOutline(
   return { nodes: buildTocNodes(tocRows, offset, pageCount, anchors), strategy: "toc" };
 }
 
-function recognizedLines(value: string): OutlineTextLine[] {
-  try {
-    const lines = JSON.parse(value) as RecognizedTextLine[];
-    if (!Array.isArray(lines)) return [];
-    return lines.flatMap((line) => {
-      if (!line || typeof line.text !== "string" || !Array.isArray(line.polygon)) return [];
-      const ys = line.polygon.map((point) => point?.y).filter((y): y is number => typeof y === "number" && Number.isFinite(y));
-      if (ys.length < 3) return [];
-      return [{ text: line.text, size: Math.max(...ys) - Math.min(...ys), y: Math.min(...ys) }];
-    });
-  } catch {
-    return [];
-  }
+function recognizedLines(lines: ReadonlyArray<RecognizedTextLine> | undefined): OutlineTextLine[] {
+  if (!lines || !Array.isArray(lines)) return [];
+  return lines.flatMap((line) => {
+    if (!line || typeof line.text !== "string" || !Array.isArray(line.polygon)) return [];
+    const ys = (line.polygon as OcrPoint[]).map((point) => point?.y).filter((y): y is number => typeof y === "number" && Number.isFinite(y));
+    if (ys.length < 3) return [];
+    return [{ text: line.text, size: Math.max(...ys) - Math.min(...ys), y: Math.min(...ys) }];
+  });
 }
 
 type PdfDocument = Awaited<ReturnType<typeof getDocument>["promise"]>;
@@ -486,6 +481,8 @@ export function createBookOutlineModule(
     openDocument?: OpenOutlineDocument;
     aiOutline?: BookOutlineAiDeps;
     onOutlineChange?: (bookId: string) => void;
+    /** Recognized Text 行最小读接口（recognized_pages 表属 OCR）：原生文本不足时取识别行。 */
+    readRecognizedLines?(bookId: string, page: number): ReadonlyArray<RecognizedTextLine> | undefined;
   } = {},
 ) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
@@ -620,7 +617,6 @@ export function createBookOutlineModule(
       const contiguous = coverage.count === (coverage.max_page ?? 0);
       let processedPages = contiguous ? coverage.count : 0;
       if (!contiguous) database.prepare("DELETE FROM book_outline_pages WHERE book_id = ?").run(bookId);
-      const recognized = database.prepare("SELECT lines_json FROM recognized_pages WHERE book_id = ? AND page = ?");
       const upsert = database.prepare(`
         INSERT INTO book_outline_pages (book_id, page, candidates_json, source, updated_at)
         VALUES (?, ?, ?, ?, ?)
@@ -632,8 +628,7 @@ export function createBookOutlineModule(
       for (let page = processedPages + 1; page <= document.pageCount; page += 1) {
         if (signal?.aborted) break;
         const native = await document.getNativeLines(page);
-        const ocrRow = recognized.get(bookId, page) as { lines_json: string } | undefined;
-        const ocr = ocrRow ? recognizedLines(ocrRow.lines_json) : [];
+        const ocr = recognizedLines(options.readRecognizedLines?.(bookId, page));
         const nativeTextLength = native
           .filter((line) => !/^(?:第?\s*\d+\s*页|page\s+\d+(?:\s+of\s+\d+)?|\d+)$/i.test(normalizeLabel(line.text)))
           .reduce((total, line) => total + normalizeLabel(line.text).length, 0);
@@ -678,6 +673,14 @@ export function createBookOutlineModule(
     get,
     invalidate,
     rebuild,
+
+    /** 每书数据清理钩子：在调用方提供的连接上删除本书生成目录、页候选与 AI 目录缓存。 */
+    deleteBookData(bookId: string, connection: DatabaseSync) {
+      connection.prepare("DELETE FROM book_outlines WHERE book_id = ?").run(bookId);
+      connection.prepare("DELETE FROM book_outline_pages WHERE book_id = ?").run(bookId);
+      connection.prepare("DELETE FROM book_outline_ai WHERE book_id = ?").run(bookId);
+    },
+
     close() { database.close(); },
   };
 }

@@ -37,6 +37,8 @@ import type { RunDiagnostics, RunDiagnosticsToolCall } from "../../shared/contra
 
 export type AgentHostOptions = {
   dataHome: string;
+  /** 注入组装根创建的会话存储（清理钩子与检索读接口在创建时接线）；缺省时自建。 */
+  store?: SessionStore;
   loadModelConnection(): Promise<ResolvedModelConnection | undefined>;
   /** Reader Profile 只读注入；没有 Profile 时返回空字符串。 */
   loadReaderProfile?(): Promise<string>;
@@ -145,7 +147,7 @@ type ActiveRun = {
 type AssistantFailure = { status: "error" | "cancelled"; message?: string };
 
 export function createAgentHost(options: AgentHostOptions) {
-  const store: SessionStore = createSessionStore(options.dataHome);
+  const store: SessionStore = options.store ?? createSessionStore(options.dataHome);
   const runTimeoutMs = options.runTimeoutMs ?? 120_000;
   const historyLimit = options.historyLimit ?? 12;
   const compactionContextWindow = options.compactionContextWindow ?? 64_000;

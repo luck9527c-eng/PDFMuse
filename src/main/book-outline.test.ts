@@ -162,6 +162,7 @@ describe("book outline", () => {
     const outline = createBookOutlineModule(dataHome, {
       openDocument: documentSource([[], [], []]),
       aiOutline: ai.deps,
+      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.lines,
     });
     closeOutline = outline.close;
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
@@ -385,6 +386,43 @@ describe("book outline", () => {
     ];
     const result = assembleOutline(headings, tocRows, 150);
     expect(result).toEqual({ nodes: [], strategy: "empty" });
+  });
+
+  it("deleteBookData 在给定连接上清掉本书目录三表且不影响他书", async () => {
+    const otherBookId = "b".repeat(64);
+    const ai = aiOutlineDeps([
+      { label: "第一章 清理", level: 1, printedPage: 1 },
+      { label: "1.1 小节", level: 2, printedPage: 2 },
+    ]);
+    const pages: OutlineTextLine[][] = [
+      [{ text: "第一章 清理", size: 24, y: 700 }, { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 }],
+      [{ text: "1.1 小节", size: 18, y: 700 }, { text: "小节正文内容，长度足够参与统计。", size: 12, y: 650 }],
+    ];
+    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages), aiOutline: ai.deps });
+    closeOutline = outline.close;
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    await outline.rebuild(otherBookId, async () => ({ bytes: new Uint8Array() }));
+    expect(outline.get(BOOK_ID)).toMatchObject([
+      { label: "第一章 清理", children: [{ label: "1.1 小节" }] },
+    ]);
+
+    const { DatabaseSync } = await import("node:sqlite");
+    const connection = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    outline.deleteBookData(BOOK_ID, connection);
+    connection.close();
+
+    const verified = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    const count = (sql: string, ...params: unknown[]) => (
+      (verified.prepare(sql).get(...params) as { count: number }).count
+    );
+    for (const table of ["book_outlines", "book_outline_pages", "book_outline_ai"]) {
+      expect(count(`SELECT COUNT(*) AS count FROM ${table} WHERE book_id = ?`, BOOK_ID)).toBe(0);
+      expect(count(`SELECT COUNT(*) AS count FROM ${table} WHERE book_id = ?`, otherBookId)).toBeGreaterThan(0);
+    }
+    verified.close();
+    expect(outline.get(otherBookId)).toMatchObject([
+      { label: "第一章 清理", children: [{ label: "1.1 小节" }] },
+    ]);
   });
 
   it("notifies outline changes for push delivery", async () => {

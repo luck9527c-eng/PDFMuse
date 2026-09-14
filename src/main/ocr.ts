@@ -212,6 +212,12 @@ export function createOcrModule(dataHome: string, engine: OcrEngine = createWork
         && (!expectedInputVersion || result.inputVersion === expectedInputVersion),
       );
     },
+
+    /** 每书数据清理钩子：在调用方提供的连接上删除本书识别页。 */
+    deleteBookData(bookId: string, connection: DatabaseSync) {
+      connection.prepare("DELETE FROM recognized_pages WHERE book_id = ?").run(bookId);
+    },
+
     close() {
       engine.close?.();
       database.close();

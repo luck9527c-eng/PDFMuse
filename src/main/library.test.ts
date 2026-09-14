@@ -259,7 +259,7 @@ describe("Library Module", () => {
     if (!opened.ok) throw new Error(opened.message);
     const bookId = opened.book.id;
     const sessionStore = createSessionStore(dataHome);
-    const bookIndex = createBookIndex(dataHome);
+    const bookIndex = createBookIndex(dataHome, { getBookSource: (id) => library.getBookSource(id) });
     const ocrEngine: OcrEngine = {
       name: "测试引擎",
       model: "测试模型",
@@ -272,6 +272,12 @@ describe("Library Module", () => {
       openDocument: async () => ({ pageCount: 1, hasValidEmbeddedOutline: false, getNativeLines: async () => [], close: async () => undefined }),
     });
     const jobs = createBackgroundJobModule(dataHome, { index: async () => undefined });
+    // 与 main 组装根一致的注册顺序：各模块清理自己的表，Library 只遍历注册者（ADR 0007）。
+    library.registerBookDataCleaner(bookIndex.deleteBookData);
+    library.registerBookDataCleaner(sessionStore.deleteBookData);
+    library.registerBookDataCleaner(outline.deleteBookData);
+    library.registerBookDataCleaner(ocr.deleteBookData);
+    library.registerBookDataCleaner(jobs.deleteBookData);
 
     const session = sessionStore.ensureSession(bookId);
     sessionStore.appendMessage({ sessionId: session.id, runId: "run-1", role: "reader", body: "保留到删除前", status: "complete" });
@@ -302,6 +308,66 @@ describe("Library Module", () => {
     ocr.close();
     bookIndex.close();
     sessionStore.close();
+    library.close();
+  });
+
+  it("按注册顺序遍历清理钩子并在同一事务连接上执行", async () => {
+    const { workspace, dataHome } = await createWorkspace();
+    const sourcePath = path.join(workspace, "注册清理.pdf");
+    await copyFile(fixturePath, sourcePath);
+    const library = createLibraryModule(dataHome);
+    const opened = await library.openPath(sourcePath);
+    if (!opened.ok) throw new Error(opened.message);
+    const calls: string[] = [];
+    const connections: DatabaseSync[] = [];
+    library.registerBookDataCleaner((bookId, database) => {
+      calls.push(`first:${bookId === opened.book.id}`);
+      connections.push(database);
+    });
+    library.registerBookDataCleaner(() => calls.push("second"));
+
+    expect(library.deleteBookData(opened.book.id)).toEqual({ ok: true, bookId: opened.book.id });
+    expect(calls).toEqual(["first:true", "second"]);
+    expect(connections).toHaveLength(1);
+    expect(library.list()).toEqual([]);
+    library.close();
+  });
+
+  it("清理钩子失败时回滚全部删除并返回写入失败", async () => {
+    const { workspace, dataHome } = await createWorkspace();
+    const sourcePath = path.join(workspace, "回滚清理.pdf");
+    await copyFile(fixturePath, sourcePath);
+    const library = createLibraryModule(dataHome);
+    const opened = await library.openPath(sourcePath);
+    if (!opened.ok) throw new Error(opened.message);
+    const probe = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    probe.exec("CREATE TABLE cleanup_probe (book_id TEXT NOT NULL)");
+    probe.close();
+    library.registerBookDataCleaner((bookId, database) => {
+      database.prepare("INSERT INTO cleanup_probe (book_id) VALUES (?)").run(bookId);
+    });
+    library.registerBookDataCleaner(() => {
+      throw new Error("模拟清理失败");
+    });
+
+    const result = library.deleteBookData(opened.book.id);
+
+    expect(result).toMatchObject({ ok: false, code: "WRITE_ERROR" });
+    expect(library.list()).toHaveLength(1);
+    const verified = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    expect((verified.prepare("SELECT COUNT(*) AS count FROM cleanup_probe").get() as { count: number }).count).toBe(0);
+    verified.close();
+    library.close();
+  });
+
+  it("未知书籍不触发任何清理钩子", async () => {
+    const { dataHome } = await createWorkspace();
+    const library = createLibraryModule(dataHome);
+    const calls: string[] = [];
+    library.registerBookDataCleaner(() => calls.push("cleaner"));
+
+    expect(library.deleteBookData("f".repeat(64))).toMatchObject({ ok: false, code: "NOT_FOUND" });
+    expect(calls).toEqual([]);
     library.close();
   });
 

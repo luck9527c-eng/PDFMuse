@@ -186,15 +186,19 @@ describe("agent host", () => {
       push({ type: "start", partial: assistantMessage("") });
       push({ type: "done", reason: "stop", message: assistantMessage("回答") });
     });
+    // 会话向量表属检索模块：清空会话经由注入的清理钩子保持单事务（与 main 组装根接线一致）。
+    const bookIndex = createBookIndex(dataHome);
     buildHost({
       createStreamFn: () => fake.streamFn,
       isKnownBook: () => true,
+      store: createSessionStore(dataHome, { deleteConversationEmbeddings: bookIndex.deleteConversationEmbeddings }),
     });
     await host.start({ bookId: BOOK_ID, question: "当前书问题" });
     await host.start({ bookId: otherBookId, question: "另一本书问题" });
     await waitFor(() => host.getConversation(BOOK_ID).length === 2 && host.getConversation(otherBookId).length === 2);
 
     const result = await host.clearConversation(BOOK_ID);
+    bookIndex.close();
 
     expect(result).toEqual({ ok: true });
     expect(host.getConversation(BOOK_ID)).toEqual([]);
@@ -216,7 +220,12 @@ describe("agent host", () => {
       push({ type: "start", partial: assistantMessage("") });
       push({ type: "done", reason: "stop", message: assistantMessage("回答") });
     });
-    buildHost({ createStreamFn: () => fake.streamFn, isKnownBook: () => true });
+    const bookIndex = createBookIndex(dataHome);
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      isKnownBook: () => true,
+      store: createSessionStore(dataHome, { deleteConversationEmbeddings: bookIndex.deleteConversationEmbeddings }),
+    });
     await startRun("不能丢失的问题");
     await waitFor(() => host.getConversation(BOOK_ID).length === 2);
     const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
@@ -231,6 +240,7 @@ describe("agent host", () => {
     database.close();
 
     const result = await host.clearConversation(BOOK_ID);
+    bookIndex.close();
 
     expect(result).toMatchObject({ ok: false, code: "WRITE_ERROR" });
     expect(host.getConversation(BOOK_ID)).toHaveLength(2);
@@ -361,7 +371,7 @@ describe("agent host", () => {
 
   it("captures run diagnostics for requests, tool calls and usage", async () => {
     const library = createLibraryModule(dataHome);
-    const bookIndex = createBookIndex(dataHome);
+    const bookIndex = createBookIndex(dataHome, { getBookSource: (bookId) => library.getBookSource(bookId) });
     const opened = await library.openPath(FIXTURE);
     expect(opened.ok).toBe(true);
     const fixtureBookId = opened.ok ? opened.book.id : "";
@@ -839,7 +849,7 @@ describe("agent host", () => {
   it("runs book_search tool turns and persists pdf evidence", async () => {
     // 真实 Library + 索引 + Registry，验证工具续轮闭环。
     const library = createLibraryModule(dataHome);
-    const bookIndex = createBookIndex(dataHome);
+    const bookIndex = createBookIndex(dataHome, { getBookSource: (bookId) => library.getBookSource(bookId) });
     const opened = await library.openPath(FIXTURE);
     expect(opened.ok).toBe(true);
     const fixtureBookId = opened.ok ? opened.book.id : "";
