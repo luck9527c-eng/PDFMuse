@@ -43,6 +43,9 @@ export type JobExecutorContext = {
 
 export type JobExecutor = (job: BackgroundJob, context: JobExecutorContext) => Promise<void>;
 
+/** 调度入参：断点是不透明字符串，格式由各任务的执行方定义，调度模块不理解其内容。 */
+export type ScheduleJobInput = Omit<ScheduleBackgroundJobInput, "startPage"> & { checkpoint?: string };
+
 function toJob(row: JobRow): BackgroundJob {
   return {
     id: row.id,
@@ -228,13 +231,13 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
   pump();
 
   return {
-    schedule(input: ScheduleBackgroundJobInput): BackgroundJobMutationResult {
+    schedule(input: ScheduleJobInput): BackgroundJobMutationResult {
       if (!BOOK_ID_PATTERN.test(input.bookId) || !KINDS.includes(input.kind)) return { ok: false, code: "VALIDATION_ERROR", message: "后台任务参数无效。" };
       const priority = Number.isSafeInteger(input.priority) ? Math.max(-100, Math.min(100, input.priority!)) : 0;
       const total = Number.isSafeInteger(input.total) && input.total! >= 0 ? input.total! : 0;
       const maxAttempts = Number.isSafeInteger(input.maxAttempts) ? Math.max(1, Math.min(5, input.maxAttempts!)) : 3;
       const inputVersion = typeof input.inputVersion === "string" && input.inputVersion.length <= 256 ? input.inputVersion : undefined;
-      const startPage = Number.isSafeInteger(input.startPage) && input.startPage! > 0 ? input.startPage! : undefined;
+      const checkpoint = typeof input.checkpoint === "string" && input.checkpoint.length > 0 && input.checkpoint.length <= 256 ? input.checkpoint : undefined;
       const existing = database.prepare(`
         SELECT id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, claim_id, error_message, created_at, updated_at
         FROM background_jobs WHERE book_id = ? AND kind = ? AND status IN ('queued', 'running', 'paused')
@@ -251,7 +254,7 @@ export function createBackgroundJobModule(dataHome: string, executors: Partial<R
       database.prepare(`
         INSERT INTO background_jobs (id, book_id, kind, priority, status, progress, total, checkpoint, attempts, max_attempts, input_version, created_at, updated_at)
         VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?)
-      `).run(id, input.bookId, input.kind, priority, 0, total, startPage ? `start:${startPage}` : null, maxAttempts, inputVersion ?? null, timestamp, timestamp);
+      `).run(id, input.bookId, input.kind, priority, 0, total, checkpoint ?? null, maxAttempts, inputVersion ?? null, timestamp, timestamp);
       // Reader-triggered OCR is interactive; it may pause a lower-priority batch job.
       if (input.kind === "ocr" && priority > 0) {
         for (const [activeId, state] of active) {

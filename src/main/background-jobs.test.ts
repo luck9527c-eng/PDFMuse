@@ -54,6 +54,12 @@ describe("background jobs", () => {
     expect(module.list(BOOK_A)).toHaveLength(1);
   });
 
+  it("stores an opaque initial checkpoint on the scheduled job", () => {
+    module = createBackgroundJobModule(dataHome);
+    const scheduled = module.schedule({ bookId: BOOK_A, kind: "ocr", checkpoint: "ocr-order:6:12" });
+    expect(scheduled).toMatchObject({ ok: true, job: { checkpoint: "ocr-order:6:12" } });
+  });
+
   it("persists checkpoint and resumes a paused job", async () => {
     let runs = 0;
     let resolvePause: (() => void) | undefined;
