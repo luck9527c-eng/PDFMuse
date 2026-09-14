@@ -19,6 +19,7 @@ import { createSessionStore } from "./agent/session-store.js";
 import { createToolRegistry } from "./agent/tool-registry.js";
 import { createWebSearchModule } from "./agent/web-search.js";
 import { createOcrModule, createWorkerOcrEngine } from "./ocr.js";
+import { createPageRenderer } from "./page-render.js";
 import { createBackgroundJobModule } from "./background-jobs.js";
 import { createRecognizedTextIngestion } from "./recognized-text-ingestion.js";
 import { createBookOutlineModule, findOutlineSectionPath } from "./book-outline.js";
@@ -39,7 +40,7 @@ import type {
   TestEmbeddingConnectionInput,
   TestModelConnectionInput,
 } from "../shared/contracts.js";
-import { OCR_ENGINE_VERSION, OCR_INPUT_VERSION, OCR_MODEL, OCR_RENDER_SCALE } from "../shared/ocr-config.js";
+import { OCR_ENGINE_VERSION, OCR_INPUT_VERSION, OCR_MODEL } from "../shared/ocr-config.js";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 let startupPreflight: StartupPreflight;
@@ -150,6 +151,8 @@ app.whenReady().then(async () => {
       getConversationSearch: () => searchConversationMessages,
     });
     closeBookIndex = bookIndex.close;
+    // 页面渲染独立模块（T34）：OCR 链路、视觉工具与目录 AI 共用，检索模块不再依赖 canvas。
+    const pageRenderer = createPageRenderer((bookId) => bookIndex.loadBookByBookId(bookId));
     const sessionStore = createSessionStore(startupPreflight.dataHome, {
       deleteConversationEmbeddings: bookIndex.deleteConversationEmbeddings,
     });
@@ -168,7 +171,7 @@ app.whenReady().then(async () => {
     const bookOutline = createBookOutlineModule(startupPreflight.dataHome, {
       readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.lines,
       aiOutline: {
-        renderPage: async (bookId, page, scale) => bookIndex.renderPageImage(bookId, page, scale),
+        renderPage: pageRenderer.renderPage,
         complete: buildAiOutlineCompleter({ loadConnection: loadChatConnection }),
       },
       onOutlineChange: (bookId) => broadcastBackgroundState({ kind: "outline", bookId, nodes: bookOutline.get(bookId) }),
@@ -219,7 +222,7 @@ app.whenReady().then(async () => {
           const page = pages[index]!;
           if (context.signal.aborted) throw new Error("OCR 任务已暂停或取消。");
           if (!ocr.isPageCompatible(job.bookId, page, OCR_ENGINE_VERSION, OCR_MODEL, OCR_INPUT_VERSION)) {
-            const image = await bookIndex.renderPageForOcr(job.bookId, page, OCR_RENDER_SCALE);
+            const image = await pageRenderer.renderPageForOcr(job.bookId, page);
             const result = await ocr.recognizePage({ bookId: job.bookId, page, ...image }, context.signal);
             if (!result.ok) throw new Error(result.message);
             await ingestion.ingestRecognizedPage(job.bookId, page, result.page.lines, "background");
@@ -273,6 +276,7 @@ app.whenReady().then(async () => {
         focus: context.focus,
         reportEvidence: context.reportEvidence,
         bookIndex,
+        renderPageImage: pageRenderer.renderPage,
         webSearch,
       })),
       indexConversationMessage: async (bookId, message) => {

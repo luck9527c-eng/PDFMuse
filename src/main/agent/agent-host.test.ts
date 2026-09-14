@@ -18,6 +18,7 @@ import {
 } from "./openclaw-core.js";
 import { createSessionStore } from "./session-store.js";
 import { createLibraryModule } from "../library.js";
+import { createPageRenderer } from "../page-render.js";
 import { createToolRegistry } from "./tool-registry.js";
 
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
@@ -372,6 +373,7 @@ describe("agent host", () => {
   it("captures run diagnostics for requests, tool calls and usage", async () => {
     const library = createLibraryModule(dataHome);
     const bookIndex = createBookIndex(dataHome, { getBookSource: (bookId) => library.getBookSource(bookId) });
+    const pageRenderer = createPageRenderer((id) => bookIndex.loadBookByBookId(id));
     const opened = await library.openPath(FIXTURE);
     expect(opened.ok).toBe(true);
     const fixtureBookId = opened.ok ? opened.book.id : "";
@@ -403,6 +405,7 @@ describe("agent host", () => {
         bookId: context.bookId,
         reportEvidence: context.reportEvidence,
         bookIndex,
+        renderPageImage: pageRenderer.renderPage,
       })),
     });
 
@@ -441,6 +444,7 @@ describe("agent host", () => {
   it("blocks book_search beyond the per-run cap and still answers", async () => {
     const library = createLibraryModule(dataHome);
     const bookIndex = createBookIndex(dataHome);
+    const pageRenderer = createPageRenderer((id) => bookIndex.loadBookByBookId(id));
     const opened = await library.openPath(FIXTURE);
     expect(opened.ok).toBe(true);
     const fixtureBookId = opened.ok ? opened.book.id : "";
@@ -474,6 +478,7 @@ describe("agent host", () => {
         bookId: context.bookId,
         reportEvidence: context.reportEvidence,
         bookIndex,
+        renderPageImage: pageRenderer.renderPage,
       })),
     });
 
@@ -850,6 +855,7 @@ describe("agent host", () => {
     // 真实 Library + 索引 + Registry，验证工具续轮闭环。
     const library = createLibraryModule(dataHome);
     const bookIndex = createBookIndex(dataHome, { getBookSource: (bookId) => library.getBookSource(bookId) });
+    const pageRenderer = createPageRenderer((id) => bookIndex.loadBookByBookId(id));
     const opened = await library.openPath(FIXTURE);
     expect(opened.ok).toBe(true);
     const fixtureBookId = opened.ok ? opened.book.id : "";
@@ -893,6 +899,7 @@ describe("agent host", () => {
         bookId: context.bookId,
         reportEvidence: context.reportEvidence,
         bookIndex,
+        renderPageImage: pageRenderer.renderPage,
       })),
     });
 

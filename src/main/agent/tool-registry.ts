@@ -1,6 +1,7 @@
 import { Type, type Static, type TSchema } from "typebox";
 
 import type { ReadingFocus } from "../../shared/contracts.js";
+import type { RenderedPageImage } from "../page-render.js";
 import type { BookIndex } from "./book-index.js";
 import type { AgentTool, AgentToolResult } from "./openclaw-core.js";
 import type { WebSearchModule } from "./web-search.js";
@@ -21,6 +22,8 @@ export type ToolExecutionContext = {
   signal?: AbortSignal;
   reportEvidence(evidence: PdfEvidence[]): void;
   bookIndex: BookIndex;
+  /** 页面渲染模块：视觉工具经此取页面原图，检索模块不再承担渲染。 */
+  renderPageImage(bookId: string, page: number, scale: number): Promise<RenderedPageImage>;
   webSearch?: WebSearchModule;
 };
 
@@ -235,7 +238,7 @@ function createReadPageImageTool(): RegisteredTool {
       const images: NonNullable<ToolExecutionOutcome["images"]> = [];
       for (const page of requested) {
         try {
-          const rendered = await ctx.bookIndex.renderPageImage(ctx.bookId, page, 2);
+          const rendered = await ctx.renderPageImage(ctx.bookId, page, 2);
           images.push({ page, mimeType: "image/png", data: rendered.imageData });
         } catch {
           // 单页渲染失败继续其余页，失败页在结果中说明。

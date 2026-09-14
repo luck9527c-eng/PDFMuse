@@ -493,29 +493,6 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     }
   }
 
-  async function renderPageForOcr(bookId: string, pageNumber: number, scale = 1.5) {
-    const { createCanvas } = await import("@napi-rs/canvas");
-    const source = await loadBookBytesForIndex(bookId);
-    const loadingTask = getDocument({ data: source.bytes.slice(), ...(source.password ? { password: source.password } : {}) });
-    try {
-      const document = await loadingTask.promise;
-      const page = await document.getPage(pageNumber);
-      const viewport = page.getViewport({ scale });
-      const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
-      const context = canvas.getContext("2d");
-      await page.render({ canvas: canvas as never, canvasContext: context as never, viewport }).promise;
-      return { imageData: canvas.toBuffer("image/png").toString("base64"), width: canvas.width, height: canvas.height };
-    } finally {
-      await loadingTask.destroy();
-    }
-  }
-
-  async function loadBookBytesForIndex(bookId: string) {
-    const row = options.getBookSource?.(bookId);
-    if (!row) throw new Error("书库中没有这本书。");
-    return loadBookBytes(row.path, row.savedPassword);
-  }
-
   function ensureIndexed(
     bookId: string,
     loadBook: () => Promise<{ bytes: Uint8Array; password?: string }>,
@@ -720,8 +697,6 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
 
     indexRecognizedPage,
 
-    renderPageForOcr,
-
     indexConversationMessage,
 
     /** 按书库记录读取原文件字节（含已记住的密码）；原文件只读，永不修改。 */
@@ -734,11 +709,6 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     /** 读取指定页码范围（含端点）的已索引整页文本；供 read_pages 工具整页阅读。 */
     readPages(bookId: string, fromPage: number, toPage: number): Array<{ page: number; text: string }> {
       return readPagesStatement.all(bookId, TEXT_EXTRACTION_VERSION, fromPage, toPage) as Array<{ page: number; text: string }>;
-    },
-
-    /** 渲染指定页为 PNG（base64）；供 read_page_image 工具给模型看公式与结构的原图。 */
-    async renderPageImage(bookId: string, page: number, scale = 2) {
-      return renderPageForOcr(bookId, page, scale);
     },
 
     stats(bookId: string) {
@@ -771,7 +741,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
 }
 
 /** 从原文件读取书籍字节用于索引；原文件永不修改。 */
-export async function loadBookBytes(currentPath: string, password?: string) {
+async function loadBookBytes(currentPath: string, password?: string) {
   const bytes = new Uint8Array(await readFile(currentPath));
   return { bytes, ...(password ? { password } : {}) };
 }

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createBookIndex } from "./book-index.js";
 import { createLibraryModule } from "../library.js";
+import { createPageRenderer } from "../page-render.js";
 import { createToolRegistry } from "./tool-registry.js";
 import { validateToolArguments } from "./openclaw-core.js";
 
@@ -14,12 +15,14 @@ describe("tool registry", () => {
   let dataHome: string;
   let library: ReturnType<typeof createLibraryModule>;
   let bookIndex: ReturnType<typeof createBookIndex>;
+  let pageRenderer: ReturnType<typeof createPageRenderer>;
   let bookId: string;
 
   beforeEach(async () => {
     dataHome = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-tools-"));
     library = createLibraryModule(dataHome);
     bookIndex = createBookIndex(dataHome, { getBookSource: (id) => library.getBookSource(id) });
+    pageRenderer = createPageRenderer((id) => bookIndex.loadBookByBookId(id));
     const opened = await library.openPath(FIXTURE);
     expect(opened.ok).toBe(true);
     if (opened.ok) bookId = opened.book.id;
@@ -35,6 +38,7 @@ describe("tool registry", () => {
     return {
       bookId,
       bookIndex,
+      renderPageImage: (id: string, page: number, scale: number) => pageRenderer.renderPage(id, page, scale),
       reportEvidence: reportEvidence as (evidence: never[]) => void,
     };
   }
