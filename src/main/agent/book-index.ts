@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { ReadingFocus, RecognizedTextLine } from "../../shared/contracts.js";
+import type { BookSource } from "../library.js";
 import { chunkPageText } from "./semantic-chunker.js";
 
 /**
@@ -70,7 +71,7 @@ export type BookIndexOptions = {
   embeddingBatchSize?: number;
   onEmbeddingError?: (error: unknown) => void;
   /** 书目元数据最小读接口（library_books 表属 Library）：索引、检索与原文件加载经此取源。 */
-  getBookSource?(bookId: string): { path: string; pageCount: number; savedPassword?: string } | undefined;
+  getBookSource?(bookId: string): BookSource | undefined;
   /** Recognized Text 行最小读接口（recognized_pages 表属 OCR）：原生文本不足时兜底取识别行。 */
   readRecognizedLines?(bookId: string, page: number): ReadonlyArray<RecognizedTextLine> | undefined;
   /** 会话检索最小读接口（会话表属会话存储）：懒取，组装根中会话存储晚于本模块创建。 */

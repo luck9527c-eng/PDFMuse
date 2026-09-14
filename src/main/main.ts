@@ -51,10 +51,15 @@ let closeOcr: (() => void) | undefined;
 let closeBackgroundJobs: (() => void) | undefined;
 let closeBookOutline: (() => void) | undefined;
 
-function broadcastAgentEvent(event: AgentStreamEvent) {
+// 组装根唯一的窗口广播：agent 事件与后台状态推送共用同一遍历（ADR-0008 泛化 agent broadcast）。
+function broadcastToWindows(channel: string, payload: unknown) {
   for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) window.webContents.send("agent:event", event);
+    if (!window.isDestroyed()) window.webContents.send(channel, payload);
   }
+}
+
+function broadcastAgentEvent(event: AgentStreamEvent) {
+  broadcastToWindows("agent:event", event);
 }
 
 // 后台状态推送（ADR-0008）：模块只发「某书变了」通知，这里组装完整状态分片 + 单调 revision 广播。
@@ -62,9 +67,7 @@ let backgroundStateRevision = 0;
 type BackgroundStateEventInput = BackgroundStateEvent extends infer Variant ? Variant extends BackgroundStateEvent ? Omit<Variant, "revision"> : never : never;
 function broadcastBackgroundState(event: BackgroundStateEventInput) {
   const payload: BackgroundStateEvent = { ...event, revision: (backgroundStateRevision += 1) };
-  for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) window.webContents.send("background:event", payload);
-  }
+  broadcastToWindows("background:event", payload);
 }
 
 function applicationDirectory() {
@@ -188,7 +191,7 @@ app.whenReady().then(async () => {
       indexRecognizedPage: (bookId, page, lines) => bookIndex.indexRecognizedPage(bookId, page, lines),
       scheduleEmbedding: scheduleOptionalEmbedding,
       invalidateOutline: (bookId, page) => bookOutline.invalidate(bookId, page),
-      loadPageCount: (bookId) => library.list().find((item) => item.id === bookId)?.pageCount ?? 0,
+      loadPageCount: (bookId) => library.getBookSource(bookId)?.pageCount ?? 0,
       listJobs: (bookId) => backgroundJobs.list(bookId),
       cancelJob: (id) => backgroundJobs.cancel(id),
       scheduleJob: (input) => backgroundJobs.schedule(input),

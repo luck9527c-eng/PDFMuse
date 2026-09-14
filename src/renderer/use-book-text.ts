@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import type { OpenedPdfBook, OcrPageResult, RecognizedPageText } from "../shared/contracts";
+import type { OpenedPdfBook, OcrPageResult, RecognizedPageText, StartupPreflight } from "../shared/contracts";
 import { OCR_INPUT_VERSION, OCR_RENDER_SCALE } from "../shared/ocr-config";
 import type { PdfViewerHandle } from "./pdf/PdfViewer";
 
 const PREFETCH_DELAY_MS = 250;
 const OCR_WARNING_MARK = "OCR";
+
+/** OCR 资源缺失 = 启动预检通过且警告含 OCR 项；开书调度门控与当前页识别共享同一判定。 */
+function ocrResourcesMissing(preflight: StartupPreflight) {
+  return preflight.ok && preflight.warnings.some((warning) => warning.includes(OCR_WARNING_MARK));
+}
 
 /**
  * Text Availability：拥有「让当前 PDF Book 的文本可选用」。
@@ -24,14 +29,20 @@ export function useBookText(options: {
   const [ocrNotice, setOcrNotice] = useState("");
   const requestsRef = useRef(new Map<string, Promise<OcrPageResult>>());
   const [ocrUnavailable, setOcrUnavailable] = useState(false);
+  // OCR 资源可用性是启动期静态事实：预检整个会话只取一次，两处消费共享同一 Promise。
+  const preflightRef = useRef<Promise<StartupPreflight | undefined> | undefined>(undefined);
+  const loadStartupPreflight = useCallback((): Promise<StartupPreflight | undefined> | undefined => {
+    preflightRef.current ??= window.pdfMuse?.getStartupPreflight();
+    return preflightRef.current;
+  }, []);
 
   useEffect(() => {
     let disposed = false;
-    void window.pdfMuse?.getStartupPreflight().then((preflight) => {
-      if (!disposed) setOcrUnavailable(preflight.ok && preflight.warnings.some((warning) => warning.includes(OCR_WARNING_MARK)));
+    void loadStartupPreflight()?.then((preflight) => {
+      if (preflight && !disposed) setOcrUnavailable(ocrResourcesMissing(preflight));
     });
     return () => { disposed = true; };
-  }, []);
+  }, [loadStartupPreflight]);
 
   // 开书任务调度门控：全文索引与目录总是排；OCR 视资源可用，语义索引视嵌入连接。
   useEffect(() => {
@@ -40,8 +51,8 @@ export function useBookText(options: {
     void (async () => {
       await api.scheduleBackgroundJob({ bookId: book.id, kind: "index", priority: 10, total: book.pageCount });
       await api.scheduleBackgroundJob({ bookId: book.id, kind: "outline", priority: 5, total: book.pageCount });
-      const preflight = await api.getStartupPreflight();
-      if (preflight.ok && !preflight.warnings.some((warning) => warning.includes(OCR_WARNING_MARK))) {
+      const preflight = await loadStartupPreflight();
+      if (preflight?.ok && !ocrResourcesMissing(preflight)) {
         await api.scheduleBackgroundJob({ bookId: book.id, kind: "ocr", priority: 20, total: book.pageCount, maxAttempts: 3, inputVersion: OCR_INPUT_VERSION, startPage: book.currentPage });
       }
       const embedding = await api.getEmbeddingConnection();
@@ -49,7 +60,7 @@ export function useBookText(options: {
         await api.scheduleBackgroundJob({ bookId: book.id, kind: "embedding", priority: 0, total: book.pageCount });
       }
     })().catch(() => undefined);
-  }, [book]);
+  }, [book, loadStartupPreflight]);
 
   const ensureRecognizedPage = useCallback((targetBook: OpenedPdfBook, targetPage: number) => {
     const key = `${targetBook.id}:${targetPage}`;

@@ -161,7 +161,7 @@ async function waitForStartup(webSocketUrl) {
       webSocketUrl,
       `({
         apiType: typeof window.pdfMuse,
-        text: document.body.innerText,
+        text: document.body?.innerText ?? "",
         ready: Boolean(document.querySelector('.library-view, .workspace')),
       })`,
     );
@@ -175,7 +175,7 @@ async function waitForText(webSocketUrl, expected, timeoutMs = 3_000) {
   const deadline = Date.now() + timeoutMs;
   let bodyText = "";
   while (Date.now() < deadline) {
-    bodyText = await evaluate(webSocketUrl, "document.body.innerText");
+    bodyText = await evaluate(webSocketUrl, "document.body?.innerText ?? ''");
     if (bodyText.includes(expected)) return bodyText;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }

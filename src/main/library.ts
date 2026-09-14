@@ -111,6 +111,13 @@ function isReadingState(value: unknown): value is ReadingState {
  */
 export type BookDataCleaner = (bookId: string, database: DatabaseSync) => void;
 
+/** 书目元数据最小读接口的返回形状：原文件路径、页数与已存密码。 */
+export type BookSource = {
+  path: string;
+  pageCount: number;
+  savedPassword?: string;
+};
+
 async function inspectPdf(bytes: Uint8Array, fallbackTitle: string, password?: string) {
   const loadingTask = getDocument({ data: bytes.slice(), ...(password ? { password } : {}) });
   try {
@@ -478,7 +485,7 @@ export function createLibraryModule(dataHome: string) {
     },
 
     /** 书目元数据最小读接口：检索模块等经此读取原文件路径、页数与已存密码，不直查 library_books。 */
-    getBookSource(bookId: string) {
+    getBookSource(bookId: string): BookSource | undefined {
       const row = findStatement.get(bookId) as BookRow | undefined;
       if (!row) return undefined;
       return {

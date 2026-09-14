@@ -41,7 +41,6 @@ import type {
   LibraryBook,
   OpenedPdfBook,
   OpenPdfBookResult,
-  ReadingState,
   SelectedPassage,
   StartupPreflight,
 } from "../shared/contracts";
@@ -59,7 +58,6 @@ import { PdfViewer, type OutlineNode, type PdfViewerHandle, type ViewerSelection
 import { applyAppearanceSettings } from "./appearance";
 import { findMissingApiMethods } from "./api-compat";
 import { getConversationReferencePages } from "./conversation-reference";
-import { createReadingStateWriter } from "./reading-state-persistence";
 import { useBookConversation } from "./use-book-conversation";
 import { useBookText } from "./use-book-text";
 import { useReadingStateTracker } from "./use-reading-state-tracker";
