@@ -9,7 +9,7 @@ import type {
   StartAgentRunInput,
   StartAgentRunResult,
 } from "../../shared/contracts.js";
-import { MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES, MAX_AGENT_IMAGE_TOTAL_BYTES } from "../../shared/contracts.js";
+import { CONVERSATION_EVIDENCE_MAX, MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES, MAX_AGENT_IMAGE_TOTAL_BYTES } from "../../shared/contracts.js";
 import { assistantText, buildSystemPrompt, historyMessagesToLlmMessages, historyToLlmMessages, toSessionEntries } from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, toLlmModel, type ResolvedModelConnection } from "./model-runtime.js";
 import {
@@ -335,8 +335,9 @@ export function createAgentHost(options: AgentHostOptions) {
       ...(chapterRange ? { chapterRange } : {}),
     } : undefined;
     // 上轮 Evidence 注入：只取最近一条完成回答（常数开销，不随会话累积），追问免重查一手原文。
-    const previousEvidence = [...fullHistory].reverse()
-      .find((message) => message.role === "assistant" && message.status === "complete")?.evidence;
+    const previousEvidence = fullHistory.findLast(
+      (message) => message.role === "assistant" && message.status === "complete",
+    )?.evidence;
     const llmMessages = historyToLlmMessages(
       history, question, focusWithContext, historyLimit, attachments, compacted.summary, previousEvidence,
     );
@@ -344,7 +345,6 @@ export function createAgentHost(options: AgentHostOptions) {
     if (!questionMessage) return;
 
     // 证据聚合：每页只保留相关度最高的一条，总量按分数截断，参考页不随搜索次数膨胀。
-    const EVIDENCE_MAX_ENTRIES = 8;
     const evidenceByPage = new Map<number, ConversationEvidence>();
     const reportEvidence = (evidence: ConversationEvidence[]) => {
       for (const item of evidence) {
@@ -354,7 +354,7 @@ export function createAgentHost(options: AgentHostOptions) {
     };
     const collectEvidence = () => [...evidenceByPage.values()]
       .sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
-      .slice(0, EVIDENCE_MAX_ENTRIES)
+      .slice(0, CONVERSATION_EVIDENCE_MAX)
       .sort((left, right) => left.page - right.page);
     const tools = options.buildTools?.({ bookId: input.bookId, focus: focusWithContext, reportEvidence }) ?? [];
 

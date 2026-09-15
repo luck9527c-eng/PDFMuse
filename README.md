@@ -2,7 +2,7 @@
 
 个人 PDF 深度阅读助手——在阅读流程内理解知识型 PDF 书籍：划选原文提问、获得扎根本书且页码可点击验证的 AI 回答，扫描页自动 OCR 变为可选中文字，阅读进度跨会话恢复。
 
-基于 Electron + React + TypeScript 构建，AI 编排复用 OpenClaw Agent Core，OCR 运行在独立 Python Worker。所有产品数据自包含在可执行文件旁的 `data/` 目录，便携版即拷即用，**PDF 原文件始终留在原地、永不修改**。
+基于 Electron + React + TypeScript 构建，AI 编排复用 OpenClaw Agent Core，OCR 运行在独立 Python Worker。所有产品数据自包含在程序所在目录的 `data/` 文件夹，**PDF 原文件始终留在原地、永不修改**。
 
 ## 核心特性
 

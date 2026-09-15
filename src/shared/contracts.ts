@@ -220,6 +220,9 @@ export type ConversationMessage = {
   createdAt: string;
 };
 
+/** 每条回答持久化与追问注入共用的证据上限：领域不变量（按页去重、按分截断）。 */
+export const CONVERSATION_EVIDENCE_MAX = 8;
+
 export type ReadingFocus = {
   currentPage: number;
   selectedPassage?: SelectedPassage;
