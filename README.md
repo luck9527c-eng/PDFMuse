@@ -43,12 +43,11 @@ npm run dev
 | 命令 | 说明 |
 | --- | --- |
 | `npm run dev` | 开发模式（vite + electron，需先跑过一次 `build`） |
-| `npm test` | 全量自动化测试（241 项，无需拉起 Electron） |
+| `npm test` | 全量自动化测试（247 项，无需拉起 Electron） |
 | `npm run typecheck` | 双 tsconfig 类型检查 |
 | `npm run build` | 生产构建（clean + typecheck + vite + 主进程 tsc） |
 | `npm run smoke:electron` | Electron 端到端冒烟测试 |
-| `npm run package:portable` | 打包 Windows 便携版单文件 exe |
-| `npm run package:installer` | 打包 NSIS 安装包 |
+| `npm run package:installer` | 打包 NSIS 安装包（正式发布形态） |
 | `npm run prepare:ocr` | 构建/校验 OCR 运行时资源 |
 | `npm run benchmark:ocr` | OCR 固定语料性能基准 |
 
@@ -75,14 +74,6 @@ scripts/         构建、打包、冒烟、基准脚本
 | vite 启动报错或语法错误 | Node 版本过低，升级到 ≥ 20.19 |
 | 应用能启动，扫描页提示「资源未安装」 | 缺 OCR 运行时，跑 `npm run prepare:ocr`（需联网）；不影响其他功能 |
 | 仓库里没有 docs/、PRD.md 等 | 本地开发文档不入库，属正常现象 |
-
-## 打包发布
-
-```bash
-npm run package:portable
-```
-
-产物在 `release/PDFMuse-<版本>-portable.exe`（约 210 MB，自带完整 OCR 运行时），最终用户无需安装 Python、无需联网下载模型，拷到任意 Windows 10/11 机器双击即用。
 
 ## 隐私与数据
 
