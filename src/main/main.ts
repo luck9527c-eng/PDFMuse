@@ -284,6 +284,7 @@ app.whenReady().then(async () => {
         bookId: context.bookId,
         focus: context.focus,
         reportEvidence: context.reportEvidence,
+        pageBudget: context.pageBudget,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
         webSearch,

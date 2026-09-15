@@ -34,11 +34,15 @@ describe("tool registry", () => {
     await rm(dataHome, { recursive: true, force: true });
   });
 
-  function context(reportEvidence: (evidence: unknown[]) => void = () => undefined) {
+  function context(
+    reportEvidence: (evidence: unknown[]) => void = () => undefined,
+    budget: { pagesDelivered: number; calls: number } = { pagesDelivered: 0, calls: 0 },
+  ) {
     return {
       bookId,
       bookIndex,
       renderPageImage: (id: string, page: number, scale: number) => pageRenderer.renderPage(id, page, scale),
+      pageBudget: budget,
       reportEvidence: reportEvidence as (evidence: never[]) => void,
     };
   }
@@ -69,6 +73,69 @@ describe("tool registry", () => {
     const details = result.details as { evidence?: Array<{ page: number; snippet: string }>; displaySummary?: string };
     expect(details.evidence?.map((item) => item.page)).toEqual([1, 2]);
     expect(details.displaySummary).toContain("第 1、2 页");
+  });
+
+  it("steers read_page_image to locate first and default one page", () => {
+    const registry = createToolRegistry();
+    const description = registry.buildAgentTools(context)
+      .find((item) => item.name === "read_page_image")!.description;
+    expect(description).toContain("默认只查看 1 页");
+    expect(description).toContain("定位");
+    expect(description).toContain("预算");
+    // 旧的「最多 4 页」数量邀请不得回流。
+    expect(description).not.toMatch(/最多\s*4\s*页/);
+  });
+
+  it("clamps read_page_image to a four-page per-question budget with echo", async () => {
+    const registry = createToolRegistry();
+    const budget = { pagesDelivered: 0, calls: 0 };
+    const tool = registry.buildAgentTools(() => context(undefined, budget))
+      .find((item) => item.name === "read_page_image")!;
+
+    const first = await tool.execute("call-budget-1", { pages: [1, 2, 3] });
+    const firstText = (first.content[0] as { text: string }).text;
+    expect(first.content.filter((block) => block.type === "image")).toHaveLength(3);
+    expect(firstText).toContain("本问图片预算：已用 3/4 页");
+
+    // 第二次请求 2 页，但预算只剩 1 页：钳制到页 2，页 3 不渲染、不进证据。
+    const second = await tool.execute("call-budget-2", { pages: [2, 3] });
+    const secondText = (second.content[0] as { text: string }).text;
+    const secondImages = second.content.filter((block) => block.type === "image");
+    expect(secondImages).toHaveLength(1);
+    expect(secondText).toContain("预算只剩 1 页");
+    expect(secondText).toContain("第 3 页未附上");
+    expect(secondText).toContain("本问图片预算：已用 4/4 页");
+    const details = second.details as { evidence?: Array<{ page: number }> };
+    expect(details.evidence?.map((item) => item.page)).toEqual([2]);
+  });
+
+  it("blocks the third read_page_image call of the same question", async () => {
+    const registry = createToolRegistry();
+    const budget = { pagesDelivered: 0, calls: 0 };
+    const tool = registry.buildAgentTools(() => context(undefined, budget))
+      .find((item) => item.name === "read_page_image")!;
+    await tool.execute("call-cap-a", { pages: [1] });
+    await tool.execute("call-cap-b", { pages: [2] });
+
+    const third = await tool.execute("call-cap-c", { pages: [3] });
+    expect(third.content.filter((block) => block.type === "image")).toHaveLength(0);
+    const text = (third.content[0] as { text: string }).text;
+    expect(text).toContain("上限");
+    expect(text).toContain("2 次");
+    expect((third.details as { evidence?: unknown }).evidence).toBeUndefined();
+  });
+
+  it("keeps image budgets separate across questions", async () => {
+    const registry = createToolRegistry();
+    const toolOf = (budget: { pagesDelivered: number; calls: number }) => registry.buildAgentTools(() => context(undefined, budget))
+      .find((item) => item.name === "read_page_image")!;
+    await toolOf({ pagesDelivered: 0, calls: 0 }).execute("call-q1", { pages: [1, 2] });
+
+    // 新的一问：预算与次数都重置。
+    const second = await toolOf({ pagesDelivered: 0, calls: 0 }).execute("call-q2", { pages: [3] });
+    const text = (second.content[0] as { text: string }).text;
+    expect(second.content.filter((block) => block.type === "image")).toHaveLength(1);
+    expect(text).toContain("本问图片预算：已用 1/4 页");
   });
 
   it("returns web results with provider notes via web_search", async () => {

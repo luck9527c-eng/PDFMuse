@@ -55,6 +55,8 @@ export type AgentHostOptions = {
     bookId: string;
     focus?: ReadingFocus;
     reportEvidence(evidence: ConversationEvidence[]): void;
+    /** 本问（一次运行）共享的原图页预算：页数与次数钳制在工具层执行。 */
+    pageBudget: { pagesDelivered: number; calls: number };
   }): AgentTool[];
   /** 将已完成的会话消息交给检索模块；失败不得阻断回答。 */
   indexConversationMessage?(bookId: string, message: {
@@ -356,7 +358,13 @@ export function createAgentHost(options: AgentHostOptions) {
       .sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
       .slice(0, CONVERSATION_EVIDENCE_MAX)
       .sort((left, right) => left.page - right.page);
-    const tools = options.buildTools?.({ bookId: input.bookId, focus: focusWithContext, reportEvidence }) ?? [];
+    const tools = options.buildTools?.({
+      bookId: input.bookId,
+      focus: focusWithContext,
+      reportEvidence,
+      // 每问新建：预算随运行生命周期，下一问自动重置。
+      pageBudget: { pagesDelivered: 0, calls: 0 },
+    }) ?? [];
 
     // 工具包装：捕获参数、结果与耗时进运行诊断；检索类工具设每轮上限防散射打捞。
     let bookSearchCalls = 0;
@@ -444,6 +452,8 @@ export function createAgentHost(options: AgentHostOptions) {
         tools: diagnosticsTools,
       },
       streamFn: agentStreamFn,
+      // 会话 id 透传给 provider 适配器（会话亲和头 / prompt_cache_key），支持缓存前缀复用。
+      sessionId,
     });
 
     const run: ActiveRun = { sessionId, agent, cancelledByUser: false, timedOut: false };

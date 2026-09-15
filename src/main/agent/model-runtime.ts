@@ -32,6 +32,8 @@ export function toLlmModel(connection: ResolvedModelConnection, supportsVision =
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 0,
     maxTokens: 0,
+    // 会话亲和：sessionId 非空时适配器随请求发亲和头，帮助 provider 侧命中前缀缓存；未知头被忽略，无副作用。
+    compat: { sendSessionAffinityHeaders: true },
   };
 }
 
@@ -41,7 +43,6 @@ export function createModelStreamFn(connection: ResolvedModelConnection): Stream
     const merged: SimpleStreamOptions = {
       ...options,
       apiKey: connection.apiKey,
-      sessionId: undefined,
     };
     return llmRuntime.streamSimple(model, context, merged);
   };
@@ -53,7 +54,6 @@ export function createModelCompleteFn(connection: ResolvedModelConnection): Comp
     const merged: SimpleStreamOptions = {
       ...options,
       apiKey: connection.apiKey,
-      sessionId: undefined,
     };
     return llmRuntime.completeSimple(model, context, merged);
   };

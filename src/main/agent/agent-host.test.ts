@@ -247,6 +247,26 @@ describe("agent host", () => {
     expect(host.getConversation(BOOK_ID)).toHaveLength(2);
   });
 
+  it("forwards the Book Conversation session id to the model stream options", async () => {
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "text_delta", contentIndex: 0, delta: "好" });
+      push({ type: "done", reason: "stop", message: assistantMessage("好") });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    const result = await startRun("透传会话 id");
+    expect(result.ok).toBe(true);
+    await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"));
+
+    const sessionStore = createSessionStore(dataHome);
+    const expectedSessionId = sessionStore.findSession(BOOK_ID)?.id;
+    sessionStore.close();
+    expect(expectedSessionId).toBeTruthy();
+    // 会话亲和头（prompt 缓存前缀复用）依赖 streamFn 收到非空的 sessionId。
+    expect(fake.requests[0]?.options?.sessionId).toBe(expectedSessionId);
+  });
+
   it("injects history, focus, reader profile and system prompt into the model context", async () => {
     const first = createFakeStreamFn(({ push }) => {
       push({ type: "start", partial: assistantMessage("") });
@@ -504,6 +524,7 @@ describe("agent host", () => {
       buildTools: (context) => registry.buildAgentTools(() => ({
         bookId: context.bookId,
         reportEvidence: context.reportEvidence,
+        pageBudget: context.pageBudget,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
       })),
@@ -577,6 +598,7 @@ describe("agent host", () => {
       buildTools: (context) => registry.buildAgentTools(() => ({
         bookId: context.bookId,
         reportEvidence: context.reportEvidence,
+        pageBudget: context.pageBudget,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
       })),
@@ -998,6 +1020,7 @@ describe("agent host", () => {
       buildTools: (context) => registry.buildAgentTools(() => ({
         bookId: context.bookId,
         reportEvidence: context.reportEvidence,
+        pageBudget: context.pageBudget,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
       })),

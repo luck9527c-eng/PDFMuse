@@ -16,6 +16,13 @@ export type PdfEvidence = {
   score?: number;
 };
 
+export type PageImageBudget = {
+  /** 本问内已成功交付的原图页数（渲染失败不扣）。 */
+  pagesDelivered: number;
+  /** 本问内 read_page_image 的调用次数（含被拒的尝试）。 */
+  calls: number;
+};
+
 export type ToolExecutionContext = {
   bookId: string;
   focus?: ReadingFocus;
@@ -24,6 +31,8 @@ export type ToolExecutionContext = {
   bookIndex: BookIndex;
   /** 页面渲染模块：视觉工具经此取页面原图，检索模块不再承担渲染。 */
   renderPageImage(bookId: string, page: number, scale: number): Promise<RenderedPageImage>;
+  /** 每问图片预算（agent-host 每问新建、跨调用共享）：页数与次数钳制在工具层执行。 */
+  pageBudget: PageImageBudget;
   webSearch?: WebSearchModule;
 };
 
@@ -220,34 +229,58 @@ const readPageImageSchema = Type.Object({
   pages: Type.Array(Type.Integer({ minimum: 1 }), {
     minItems: 1,
     maxItems: 4,
-    description: "要查看原图的 PDF 页码列表，最多 4 页",
+    description: "要查看原图的 PDF 页码列表；请只列先经检索定位、确需核对的页",
   }),
 });
 
-/** read_page_image：渲染页面原图发给模型，精确查看公式、表格与结构。 */
+/** 每问（run）图片预算：总页数与调用次数。成本天花板与旧「单请求 4 页」持平。 */
+export const MAX_PAGE_IMAGE_CALLS = 2;
+export const MAX_PAGE_IMAGE_PAGES = 4;
+
+/** read_page_image：渲染页面原图发给模型，精确查看公式、表格与结构。每问受页预算与次数钳制。 */
 function createReadPageImageTool(): RegisteredTool {
   return {
     name: "read_page_image",
     title: "查看页面原图",
     description:
-      "渲染指定页的原图并随结果直接发送，用于精确查看 OCR 文本无法保留的内容：数学公式（分数、根号、上下标）、表格结构、图表。当问题涉及公式、计算或推导，或 read_pages 返回的文本出现明显断裂缺失时，先用本工具核对原图再作答。",
+      "渲染指定页的原图并随结果直接发送，用于精确查看 OCR 文本无法保留的内容：数学公式（分数、根号、上下标）、表格结构、图表。"
+      + "先用 book_search、read_pages 或上一轮回答引用的原文把范围定位到具体页码后再调用本工具；默认只查看 1 页，确需相邻页对照或跨页内容时才增加。"
+      + `本问内图片查看受预算约束（共 ${MAX_PAGE_IMAGE_PAGES} 页、最多 ${MAX_PAGE_IMAGE_CALLS} 次），超出部分会被拒绝，请把预算花在最需要的页上。`,
     parameters: readPageImageSchema,
     async execute(input, ctx) {
       const { pages } = input as Static<typeof readPageImageSchema>;
-      const requested = [...new Set(pages)].sort((left, right) => left - right).slice(0, 4);
+      const budget = ctx.pageBudget;
+      budget.calls += 1;
+      if (budget.calls > MAX_PAGE_IMAGE_CALLS) {
+        return {
+          displaySummary: "图片查看次数已达上限",
+          contentText: `本问内查看原图的次数已达上限（${MAX_PAGE_IMAGE_CALLS} 次）。请基于已查看的页面作答；若确有关键页未核对，请向 Reader 说明。`,
+        };
+      }
+      const remaining = Math.max(0, MAX_PAGE_IMAGE_PAGES - budget.pagesDelivered);
+      const requested = [...new Set(pages)].sort((left, right) => left - right);
+      const allowed = requested.slice(0, remaining);
+      const overBudget = requested.slice(remaining);
       const images: NonNullable<ToolExecutionOutcome["images"]> = [];
-      for (const page of requested) {
+      const failed: number[] = [];
+      for (const page of allowed) {
         try {
           const rendered = await ctx.renderPageImage(ctx.bookId, page, 2);
           images.push({ page, mimeType: "image/png", data: rendered.imageData });
         } catch {
-          // 单页渲染失败继续其余页，失败页在结果中说明。
+          // 单页渲染失败继续其余页，失败页不扣预算、在结果中说明。
+          failed.push(page);
         }
       }
+      budget.pagesDelivered += images.length;
       if (images.length === 0) {
-        return { displaySummary: "原图渲染失败", contentText: "无法渲染所选页面，请检查页码是否在本书范围内。" };
+        return failed.length > 0
+          ? { displaySummary: "原图渲染失败", contentText: "无法渲染所选页面，请检查页码是否在本书范围内。" }
+          : {
+              displaySummary: "图片预算已用完",
+              contentText: `本问图片预算已用完（${MAX_PAGE_IMAGE_PAGES} 页）。请基于已查看的页面作答。`,
+            };
       }
-      const failed = requested.filter((page) => !images.some((image) => image.page === page));
       const label = images.map((image) => image.page).join("、");
       const evidence: PdfEvidence[] = images.map((image) => ({
         source: "pdf",
@@ -256,9 +289,13 @@ function createReadPageImageTool(): RegisteredTool {
         trust: "trusted",
         score: 1,
       }));
+      const budgetNote = overBudget.length > 0
+        ? `（本问预算只剩 ${remaining} 页：第 ${overBudget.join("、")} 页未附上。）`
+        : "";
+      const echo = `本问图片预算：已用 ${budget.pagesDelivered}/${MAX_PAGE_IMAGE_PAGES} 页。`;
       return {
-        displaySummary: `已附上第 ${label} 页原图`,
-        contentText: `以下是第 ${label} 页的原图，请以此为准阅读公式与结构。${failed.length > 0 ? `（第 ${failed.join("、")} 页渲染失败未附上。）` : ""}`,
+        displaySummary: `已附上第 ${label} 页原图${overBudget.length > 0 ? "（预算已满）" : ""}`,
+        contentText: `以下是第 ${label} 页的原图，请以此为准阅读公式与结构。${failed.length > 0 ? `（第 ${failed.join("、")} 页渲染失败未附上。）` : ""}${budgetNote}\n${echo}`,
         evidence,
         images,
       };
