@@ -7,6 +7,7 @@ import {
   assembleOutline,
   createBookOutlineModule,
   detectHeadingCandidates,
+  findOutlineChapterRange,
   findOutlineSectionPath,
   type BookOutlineAiDeps,
   type OpenOutlineDocument,
@@ -461,5 +462,18 @@ describe("book outline", () => {
     expect(findOutlineSectionPath(nodes, 143)).toBe("第5章 存储系统 › 5.2 主存储器");
     expect(findOutlineSectionPath(nodes, 210)).toBe("第6章 中央处理器");
     expect(findOutlineSectionPath([], 100)).toBeUndefined();
+  });
+
+  it("finds the top-level chapter page range for a reading page", () => {
+    const nodes: BookOutlineNode[] = [
+      { id: "1", label: "第1章", page: 3, children: [] },
+      { id: "2", label: "第2章", page: 40, children: [] },
+      { id: "3", label: "第3章", page: 120, children: [] },
+    ];
+    expect(findOutlineChapterRange(nodes, 50, 200)).toEqual({ from: 40, to: 119 });
+    expect(findOutlineChapterRange(nodes, 3, 200)).toEqual({ from: 3, to: 39 });
+    expect(findOutlineChapterRange(nodes, 200, 200)).toEqual({ from: 120, to: 200 });
+    expect(findOutlineChapterRange(nodes, 2, 200)).toBeUndefined();
+    expect(findOutlineChapterRange([], 5, 200)).toBeUndefined();
   });
 });

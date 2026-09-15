@@ -225,6 +225,8 @@ export type ReadingFocus = {
   selectedPassage?: SelectedPassage;
   /** 当前页所在章节（Main 侧由 Book Outline 解析注入，不信任 Renderer 自报）。 */
   sectionTitle?: string;
+  /** 当前页所在顶层章节的页码范围（Main 侧解析，仅供检索加权，不进入模型可见文字）。 */
+  chapterRange?: { from: number; to: number };
 };
 
 export type BookContext = {

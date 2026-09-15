@@ -22,7 +22,7 @@ import { createOcrModule, createWorkerOcrEngine } from "./ocr.js";
 import { createPageRenderer } from "./page-render.js";
 import { createBackgroundJobModule } from "./background-jobs.js";
 import { createRecognizedTextIngestion } from "./recognized-text-ingestion.js";
-import { createBookOutlineModule, findOutlineSectionPath } from "./book-outline.js";
+import { createBookOutlineModule, findOutlineChapterRange, findOutlineSectionPath } from "./book-outline.js";
 import { prioritizedPageOrder } from "./ocr-page-order.js";
 import { createReaderProfileModule } from "./reader-profile.js";
 import { createAppearanceSettingsModule } from "./appearance-settings.js";
@@ -273,6 +273,12 @@ app.whenReady().then(async () => {
       loadReaderProfile: async () => (await readerProfile.get()).content,
       loadBookTitle: (bookId) => getBookTitle(bookId) || undefined,
       resolveReadingSection: (bookId, page) => findOutlineSectionPath(bookOutline.get(bookId) ?? [], page),
+      // 顶层章节页码范围：只进检索加权，不进模型可见文字（同 T24 的 Reading Focus 原则）。
+      resolveChapterRange: (bookId, page) => {
+        const nodes = bookOutline.get(bookId);
+        const pageCount = library.getBookSource(bookId)?.pageCount ?? 0;
+        return nodes && pageCount > 0 ? findOutlineChapterRange(nodes, page, pageCount) : undefined;
+      },
       isKnownBook: isOwnedBook,
       buildTools: (context) => toolRegistry.buildAgentTools(() => ({
         bookId: context.bookId,

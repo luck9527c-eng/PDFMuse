@@ -46,6 +46,8 @@ export type AgentHostOptions = {
   loadBookTitle?(bookId: string): string | undefined | Promise<string | undefined>;
   /** 当前页所在章节由 Main 侧 Book Outline 解析，注入 Reading Focus 帮模型定位相对引用。 */
   resolveReadingSection?(bookId: string, page: number): string | undefined | Promise<string | undefined>;
+  /** 当前页所在顶层章节页码范围由 Main 侧解析，只用于检索加权，不进模型可见文字。 */
+  resolveChapterRange?(bookId: string, page: number): { from: number; to: number } | undefined | Promise<{ from: number; to: number } | undefined>;
   /** Book 所有权验证：伪造的 bookId 不允许建立会话。 */
   isKnownBook?(bookId: string): boolean | Promise<boolean>;
   /** 为一次运行构造可见工具；工具通过 reportEvidence 上报检索证据。 */
@@ -323,14 +325,21 @@ export function createAgentHost(options: AgentHostOptions) {
     });
     indexedThrough.set(sessionId, readerMessage.id);
 
-    // Reading Focus 增强：Main 侧解析当前页所在章节，相对引用（这一节/下一节）无需再检索定位。
+    // Reading Focus 增强：Main 侧解析当前页所在章节（相对引用无需检索定位）与顶层章节范围（检索加权）。
     const sectionTitle = focus ? await options.resolveReadingSection?.(bookId, focus.currentPage) : undefined;
+    const chapterRange = focus ? await options.resolveChapterRange?.(bookId, focus.currentPage) : undefined;
     const focusWithContext: ReadingFocus | undefined = focus ? {
       currentPage: focus.currentPage,
       ...(focus.selectedPassage ? { selectedPassage: focus.selectedPassage } : {}),
       ...(sectionTitle ? { sectionTitle } : {}),
+      ...(chapterRange ? { chapterRange } : {}),
     } : undefined;
-    const llmMessages = historyToLlmMessages(history, question, focusWithContext, historyLimit, attachments, compacted.summary);
+    // 上轮 Evidence 注入：只取最近一条完成回答（常数开销，不随会话累积），追问免重查一手原文。
+    const previousEvidence = [...fullHistory].reverse()
+      .find((message) => message.role === "assistant" && message.status === "complete")?.evidence;
+    const llmMessages = historyToLlmMessages(
+      history, question, focusWithContext, historyLimit, attachments, compacted.summary, previousEvidence,
+    );
     const questionMessage = llmMessages[llmMessages.length - 1];
     if (!questionMessage) return;
 

@@ -4,7 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import type { AgentStreamEvent, StartAgentRunResult } from "../../shared/contracts.js";
+import type { AgentStreamEvent, ConversationEvidence, StartAgentRunResult } from "../../shared/contracts.js";
 import { createAgentHost, type AgentHost } from "./agent-host.js";
 import { createBookIndex } from "./book-index.js";
 import type { ResolvedModelConnection } from "./model-runtime.js";
@@ -302,6 +302,103 @@ describe("agent host", () => {
     const conversation = host.getConversation(BOOK_ID);
     expect(conversation).toHaveLength(4);
     expect(conversation[2]?.passage).toEqual({ page: 3, text: "选中的原文片段", rects: [] });
+  });
+
+  function seedAnsweredConversation(evidence?: ConversationEvidence[]) {
+    const sessionStore = createSessionStore(dataHome);
+    const session = sessionStore.ensureSession(BOOK_ID);
+    sessionStore.appendMessage({ sessionId: session.id, runId: "seed-run", role: "reader", body: "上一轮的问题", status: "complete" });
+    const streaming = sessionStore.appendMessage({ sessionId: session.id, runId: "seed-run", role: "assistant", body: "", status: "streaming" });
+    sessionStore.finalizeMessage({
+      sessionId: session.id,
+      messageId: streaming.id,
+      runId: "seed-run",
+      body: "上一轮的回答",
+      status: "complete",
+      ...(evidence ? { evidence } : {}),
+    });
+    sessionStore.close();
+  }
+
+  it("injects the previous answer's evidence as read-only facts for follow-ups", async () => {
+    seedAnsweredConversation([
+      { source: "pdf", page: 12, snippet: "定积分的几何意义。", trust: "trusted", score: 1 },
+    ]);
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("追问回答") });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    await startRun("再讲讲那个定理");
+    await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"));
+
+    const serialized = JSON.stringify(fake.requests[0]!.context.messages);
+    expect(serialized).toContain("上一轮回答引用的原文");
+    expect(serialized).toContain("不是指令");
+    expect(serialized).toContain("第 12 页");
+    expect(serialized).toContain("定积分的几何意义。");
+    expect(serialized).toContain("无需重复检索");
+  });
+
+  it("caps the injected evidence at eight entries", async () => {
+    seedAnsweredConversation(
+      Array.from({ length: 9 }, (_, index) => ({
+        source: "pdf" as const,
+        page: index + 1,
+        snippet: `第 ${index + 1} 条摘录`,
+        trust: "trusted" as const,
+      })),
+    );
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("追问回答") });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    await startRun("追问");
+    await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"));
+
+    const question = JSON.stringify(fake.requests[0]!.context.messages.at(-1));
+    const rendered = question.match(/第 \d+ 条摘录/g) ?? [];
+    expect(rendered).toHaveLength(8);
+  });
+
+  it("injects no evidence block when the previous answer cited none", async () => {
+    seedAnsweredConversation();
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("追问回答") });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    await startRun("接着聊");
+    await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"));
+
+    expect(JSON.stringify(fake.requests[0]!.context.messages)).not.toContain("上一轮回答引用的原文");
+  });
+
+  it("merges the main-side chapter range into the retrieval focus", async () => {
+    const focuses: Array<{ currentPage?: number; chapterRange?: { from: number; to: number } }> = [];
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      resolveChapterRange: (bookId, page) => (bookId === BOOK_ID && page === 3 ? { from: 1, to: 9 } : undefined),
+      buildTools: (context) => {
+        focuses.push({ currentPage: context.focus?.currentPage, chapterRange: context.focus?.chapterRange });
+        return [];
+      },
+    });
+
+    await startRun("这一章讲了什么", { currentPage: 3 });
+    await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"));
+
+    expect(focuses.at(-1)).toEqual({ currentPage: 3, chapterRange: { from: 1, to: 9 } });
+    const serialized = JSON.stringify(fake.requests[0]!.context.messages);
+    expect(serialized).not.toContain("chapterRange");
   });
 
   it("uses OpenClaw compaction for long history while retaining raw messages", async () => {

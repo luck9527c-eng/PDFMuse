@@ -646,14 +646,18 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
 
       const selectedPage = focus?.selectedPassage?.page;
       const currentPage = focus?.currentPage;
+      const chapterRange = focus?.chapterRange;
       const scored = [...candidates.values()]
         .map((candidate) => {
-          // 阅读位置先验：选段页最强，当前页 ±1 窗口次之（复习/讲解的小节通常跨 2-3 页）。
+          // 阅读位置先验：选段页最强，当前页 ±1 窗口次之（复习/讲解的小节通常跨 2-3 页），所在章再补一档。
           const nearCurrentPage = currentPage !== undefined
             && candidate.page !== undefined
             && Math.abs(candidate.page - currentPage) <= 1;
+          const inChapter = chapterRange !== undefined
+            && candidate.page !== undefined
+            && candidate.page >= chapterRange.from && candidate.page <= chapterRange.to;
           const focusBoost = candidate.source === "pdf"
-            ? (candidate.page === selectedPage ? 0.3 : 0) + (nearCurrentPage ? 0.2 : 0)
+            ? (candidate.page === selectedPage ? 0.3 : 0) + (nearCurrentPage ? 0.2 : 0) + (inChapter ? 0.1 : 0)
             : 0;
           const base = retrievalMode === "hybrid"
             ? candidate.semantic * 0.65 + candidate.lexical * 0.35

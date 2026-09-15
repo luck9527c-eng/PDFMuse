@@ -387,4 +387,21 @@ describe("book index", () => {
     if (search.status !== "ok") return;
     expect(search.hits[0]).toMatchObject({ source: "pdf", page: 2 });
   });
+
+  it("boosts in-chapter pages when a chapter range is provided", async () => {
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+    expect(index.indexRecognizedPage(bookId, 1, [{ text: "同一术语分布在两页" }])).toBe(true);
+    expect(index.indexRecognizedPage(bookId, 3, [{ text: "同一术语分布在两页" }])).toBe(true);
+
+    // 两页都在当前页 ±1 窗口内（同享页距加权），章节加权是唯一区分信号。
+    const withoutRange = await index.search(bookId, "同一术语", 6, { currentPage: 2 });
+    const withRange = await index.search(bookId, "同一术语", 6, { currentPage: 2, chapterRange: { from: 3, to: 3 } });
+
+    expect(withoutRange.status).toBe("ok");
+    expect(withRange.status).toBe("ok");
+    if (withoutRange.status !== "ok" || withRange.status !== "ok") return;
+    // 同分基线下按页码升序；章节加权让命中章节的页面反超。
+    expect(withoutRange.hits[0]?.page).toBe(1);
+    expect(withRange.hits[0]?.page).toBe(3);
+  });
 });

@@ -168,6 +168,35 @@ export function findOutlineSectionPath(nodes: readonly BookOutlineNode[], page: 
   return best ? best.path.join(" › ") : undefined;
 }
 
+/**
+ * 查找某页所在的顶层章节页码范围，供检索做章节范围加权。
+ * 所在章 = 顶层节点中起点不晚于该页的最大起点；章尾取下一章起点前页，
+ * 末章到 totalPages 截断；首页之前没有起点返回 undefined。
+ */
+export function findOutlineChapterRange(
+  nodes: readonly BookOutlineNode[],
+  page: number,
+  totalPages: number,
+): { from: number; to: number } | undefined {
+  const starts: number[] = [];
+  for (const node of nodes) {
+    if (node.page === undefined || !Number.isSafeInteger(node.page) || node.page < 1) continue;
+    if (!starts.includes(node.page)) starts.push(node.page);
+  }
+  const sorted = starts.sort((left, right) => left - right);
+  let chapterStart: number | undefined;
+  let nextStart: number | undefined;
+  for (const start of sorted) {
+    if (start <= page) chapterStart = start;
+    else {
+      nextStart = start;
+      break;
+    }
+  }
+  if (chapterStart === undefined) return undefined;
+  return { from: chapterStart, to: Math.min(totalPages, (nextStart ?? totalPages + 1) - 1) };
+}
+
 /** 拼音注音括号（「窃(qiè)读记」）：教材课文标题的签名。test 用无 g 实例（避免 lastIndex 状态），replace 用全局实例。 */
 const PINYIN_ANNOTATION_SOURCE = "\\([a-zāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜü]{1,8}\\)";
 const PINYIN_ANNOTATION = new RegExp(PINYIN_ANNOTATION_SOURCE);
