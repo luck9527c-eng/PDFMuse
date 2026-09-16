@@ -51,6 +51,7 @@ describe("Model Connection Module", () => {
         baseUrl: "https://api.example.com/v1",
         model: "example-chat-model",
         hasApiKey: true,
+        contextWindow: 1_048_576,
       },
     });
 
@@ -60,7 +61,32 @@ describe("Model Connection Module", () => {
       baseUrl: "https://api.example.com/v1",
       model: "example-chat-model",
       hasApiKey: true,
+      contextWindow: 1_048_576,
     });
+  });
+
+  it("上下文窗口随连接保存读回，两档之外拒绝，缺省回落 1M", async () => {
+    const dataHome = await createDataHome();
+    const connection = createModelConnectionModule(dataHome);
+
+    await expect(connection.save({
+      protocol: "openai",
+      baseUrl: "https://api.example.com/v1",
+      model: "example-chat-model",
+      contextWindow: 262_144,
+    })).resolves.toMatchObject({ ok: true, connection: { contextWindow: 262_144 } });
+    await expect(createModelConnectionModule(dataHome).get()).resolves.toMatchObject({
+      contextWindow: 262_144,
+    });
+
+    await expect(connection.save({
+      protocol: "openai",
+      baseUrl: "https://api.example.com/v1",
+      model: "example-chat-model",
+      contextWindow: 100_000,
+    })).resolves.toMatchObject({ ok: false, code: "VALIDATION_ERROR" });
+    // 非法值被拒后原配置不变。
+    await expect(connection.get()).resolves.toMatchObject({ contextWindow: 262_144 });
   });
 
   it("只有 Reader 明确要求时才清除已保存的 API Key", async () => {
@@ -117,6 +143,7 @@ describe("Model Connection Module", () => {
       baseUrl: "https://api.example.com/v1",
       model: "working-model",
       hasApiKey: true,
+      contextWindow: 1_048_576,
     });
   });
 

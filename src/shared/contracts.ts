@@ -99,11 +99,23 @@ export function isModelProtocol(value: unknown): value is ModelProtocol {
   return value === "openai" || value === "anthropic";
 }
 
+/** 上下文窗口两档预设（token）；压缩阈值按其中 70% 计算，默认 1M。 */
+export const MODEL_CONTEXT_WINDOW_OPTIONS = [262_144, 1_048_576] as const;
+export const DEFAULT_MODEL_CONTEXT_WINDOW = 1_048_576;
+
+/** 存储的窗口值收敛到合法档位；缺省或损坏一律回落默认档（已保存连接无感迁移）。 */
+export function resolveModelContextWindow(value: unknown): number {
+  return (MODEL_CONTEXT_WINDOW_OPTIONS as readonly unknown[]).includes(value)
+    ? value as number
+    : DEFAULT_MODEL_CONTEXT_WINDOW;
+}
+
 export type ModelConnectionState = {
   protocol: ModelProtocol;
   baseUrl: string;
   model: string;
   hasApiKey: boolean;
+  contextWindow: number;
 };
 
 export type SaveModelConnectionInput = {
@@ -112,6 +124,7 @@ export type SaveModelConnectionInput = {
   model: string;
   apiKey?: string;
   clearApiKey?: boolean;
+  contextWindow?: number;
 };
 
 export type SaveModelConnectionResult =

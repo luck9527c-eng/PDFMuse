@@ -1,6 +1,39 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { normalizeModelError, toLlmModel } from "./model-runtime.js";
+// createLlmRuntime 在 model-runtime 模块加载期即被调用；这里用桩替身捕获
+// completeSimple 收到的合并入参，验证 apiKey 与 sessionId 透传（T35 验收）。
+const runtimeStub = vi.hoisted(() => {
+  const completeCalls: Array<{ options?: Record<string, unknown> }> = [];
+  return {
+    completeCalls,
+    createLlmRuntime: () => ({
+      registry: { register: () => undefined, registerApiProvider: () => undefined },
+      streamSimple: () => {
+        throw new Error("streamSimple is not expected in this test file.");
+      },
+      completeSimple: async (_model: unknown, _context: unknown, options?: unknown) => {
+        completeCalls.push({ options: options as Record<string, unknown> });
+        return {
+          role: "assistant",
+          content: [],
+          api: "openai-completions",
+          provider: "pdfmuse",
+          model: "test-model",
+          usage: {},
+          stopReason: "stop",
+          timestamp: 0,
+        };
+      },
+    }),
+  };
+});
+
+vi.mock("./openclaw-core.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./openclaw-core.js")>();
+  return { ...actual, createLlmRuntime: runtimeStub.createLlmRuntime };
+});
+
+import { createModelCompleteFn, normalizeModelError, toLlmModel } from "./model-runtime.js";
 
 describe("normalizeModelError", () => {
   it("maps authentication failures", () => {
@@ -54,5 +87,20 @@ describe("toLlmModel", () => {
   it("declares image input only for image requests", () => {
     expect(toLlmModel({ protocol: "openai", baseUrl: "http://x/v1", model: "gpt" }).input).toEqual(["text"]);
     expect(toLlmModel({ protocol: "openai", baseUrl: "http://x/v1", model: "gpt" }, true).input).toEqual(["text", "image"]);
+  });
+});
+
+describe("createModelCompleteFn", () => {
+  it("merges the api key and caller session id into the one-shot complete options", async () => {
+    const connection = { protocol: "openai" as const, baseUrl: "http://x/v1", model: "gpt", apiKey: "secret-key" };
+    const complete = createModelCompleteFn(connection);
+    const message = await complete(
+      toLlmModel(connection),
+      { systemPrompt: "系统提示", messages: [] },
+      { sessionId: "session-1" },
+    );
+    expect(message.role).toBe("assistant");
+    expect(runtimeStub.completeCalls).toHaveLength(1);
+    expect(runtimeStub.completeCalls[0]!.options).toMatchObject({ apiKey: "secret-key", sessionId: "session-1" });
   });
 });

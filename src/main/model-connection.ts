@@ -7,6 +7,8 @@ import {
 } from "./config-store.js";
 import {
   isModelProtocol,
+  MODEL_CONTEXT_WINDOW_OPTIONS,
+  resolveModelContextWindow,
   type ModelProtocol,
   type ModelConnectionState,
   type SaveModelConnectionInput,
@@ -25,6 +27,7 @@ function toState(config: StoredAppConfig): ModelConnectionState {
     baseUrl: config.chat?.baseUrl ?? "",
     model: config.chat?.model ?? "",
     hasApiKey: Boolean(config.chat?.apiKey),
+    contextWindow: resolveModelContextWindow(config.chat?.contextWindow),
   };
 }
 
@@ -103,7 +106,9 @@ export function createModelConnectionModule(
         || typeof input.baseUrl !== "string"
         || typeof input.model !== "string"
         || (input.apiKey !== undefined && typeof input.apiKey !== "string")
-        || (input.clearApiKey !== undefined && typeof input.clearApiKey !== "boolean")) {
+        || (input.clearApiKey !== undefined && typeof input.clearApiKey !== "boolean")
+        || (input.contextWindow !== undefined
+          && !(MODEL_CONTEXT_WINDOW_OPTIONS as readonly number[]).includes(input.contextWindow))) {
         return validationError();
       }
       const baseUrl = input.baseUrl.trim().replace(/\/+$/, "");
@@ -123,6 +128,11 @@ export function createModelConnectionModule(
             protocol: input.protocol,
             baseUrl,
             model,
+            ...(input.contextWindow !== undefined
+              ? { contextWindow: input.contextWindow }
+              : current.chat?.contextWindow !== undefined
+                ? { contextWindow: current.chat.contextWindow }
+                : {}),
             ...(savedApiKey ? { apiKey: savedApiKey } : {}),
           },
         };

@@ -247,6 +247,98 @@ describe("agent host", () => {
     expect(host.getConversation(BOOK_ID)).toHaveLength(2);
   });
 
+  it("sends the whole retained history with a byte-stable prefix after the window is gone", async () => {
+    const sessionStore = createSessionStore(dataHome);
+    const session = sessionStore.ensureSession(BOOK_ID);
+    for (let index = 0; index < 9; index += 1) {
+      sessionStore.appendMessage({ sessionId: session.id, runId: `old-${index}`, role: "reader", body: `旧问题 ${index}`, status: "complete" });
+      sessionStore.appendMessage({ sessionId: session.id, runId: `old-${index}`, role: "assistant", body: `旧回答 ${index}`, status: "complete" });
+    }
+    sessionStore.close();
+
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("第一回答") });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    await startRun("第十个问题");
+    await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"));
+
+    const firstMessages = fake.requests[0]!.context.messages;
+    // 18 条旧消息全部在场（含最旧一条）——滑窗淘汰已不存在。
+    expect(firstMessages).toHaveLength(19);
+    expect(JSON.stringify(firstMessages)).toContain("旧问题 0");
+    expect(JSON.stringify(firstMessages)).toContain("旧回答 8");
+
+    events = [];
+    host.close();
+    const second = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("第二回答") });
+    });
+    buildHost({ createStreamFn: () => second.streamFn });
+    await startRun("第十一个问题");
+    await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"));
+
+    const secondMessages = second.requests[0]!.context.messages;
+    // 追加式前缀（T36）：上一轮请求除尾部当轮注入的问题消息外，全部原样保留在新请求头部；
+    // systemPrompt 逐字节相等。分歧只随轮次追加在尾部，历史头部永不重写（缓存前缀稳定）。
+    expect(second.requests[0]!.context.systemPrompt).toBe(fake.requests[0]!.context.systemPrompt);
+    expect(secondMessages.length).toBeGreaterThan(firstMessages.length);
+    expect(secondMessages.slice(0, firstMessages.length - 1)).toEqual(firstMessages.slice(0, -1));
+    expect(JSON.stringify(secondMessages)).toContain("第一回答");
+  });
+
+  function seedLongHistory() {
+    const sessionStore = createSessionStore(dataHome);
+    const session = sessionStore.ensureSession(BOOK_ID);
+    for (let index = 0; index < 4; index += 1) {
+      sessionStore.appendMessage({ sessionId: session.id, runId: `old-${index}`, role: "reader", body: `历史问题 ${index} ${"内容".repeat(60)}`, status: "complete" });
+      sessionStore.appendMessage({ sessionId: session.id, runId: `old-${index}`, role: "assistant", body: `历史回答 ${index} ${"回答".repeat(60)}`, status: "complete" });
+    }
+    sessionStore.close();
+  }
+
+  it("triggers compaction when history exceeds 70% of the connection context window", async () => {
+    seedLongHistory();
+    // 窗口 300 → 阈值 210，历史已超：先摘要再回答（>1 次模型调用）。
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage(calls === 1 ? "摘要内容" : "小窗口回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 300 }),
+      // 仅覆盖保留预算（让 300 token 的小历史可切）；reserve 故意不注入，验证其按连接推导。
+      compactionSettings: { keepRecentTokens: 16 },
+    });
+    await startRun("小窗口问题");
+    await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"), 5_000);
+    expect(calls).toBeGreaterThan(1);
+  });
+
+  it("skips compaction under the connection-derived threshold and keeps old messages", async () => {
+    seedLongHistory();
+    // 窗口 262144 → 阈值 ≈ 183k：同一历史远未触发压缩，旧消息原样在场。
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("大窗口回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 262_144 }),
+    });
+    await startRun("大窗口问题");
+    await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"), 5_000);
+    expect(calls).toBe(1);
+    expect(JSON.stringify(fake.requests[0]!.context.messages)).toContain("历史问题 0");
+  });
+
   it("forwards the Book Conversation session id to the model stream options", async () => {
     const fake = createFakeStreamFn(({ push }) => {
       push({ type: "start", partial: assistantMessage("") });

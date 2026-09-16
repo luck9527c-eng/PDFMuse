@@ -14,6 +14,7 @@ import {
 import { useEffect, useState } from "react";
 
 import type { AppearanceSettings, ModelConnectionState } from "../../shared/contracts";
+import { DEFAULT_MODEL_CONTEXT_WINDOW, MODEL_CONTEXT_WINDOW_OPTIONS } from "../../shared/contracts";
 import { AppearanceSection } from "./AppearanceSection";
 import { EmbeddingConnectionSection } from "./EmbeddingConnectionSection";
 import { IconButton } from "./IconButton";
@@ -38,6 +39,13 @@ const EMPTY_CONNECTION: ModelConnectionState = {
   baseUrl: "",
   model: "",
   hasApiKey: false,
+  contextWindow: DEFAULT_MODEL_CONTEXT_WINDOW,
+};
+
+/** 档位显示文案与值一一对应；新增档位时在此补一行，避免兜底分支错标。 */
+const CONTEXT_WINDOW_LABELS: Record<number, string> = {
+  262_144: "256K tokens",
+  1_048_576: "1M tokens",
 };
 
 export function SettingsDialog({
@@ -93,6 +101,7 @@ export function SettingsDialog({
     protocol: connection.protocol,
     baseUrl: connection.baseUrl,
     model: connection.model,
+    contextWindow: connection.contextWindow,
     ...(apiKey ? { apiKey } : {}),
     ...(clearApiKey ? { clearApiKey: true } : {}),
   });
@@ -227,6 +236,23 @@ export function SettingsDialog({
                       placeholder="模型名称"
                       disabled={busy}
                     />
+                  </label>
+                  <label>
+                    上下文窗口
+                    <select
+                      value={connection.contextWindow}
+                      onChange={(event) => setConnection((current) => ({
+                        ...current,
+                        contextWindow: Number(event.target.value),
+                      }))}
+                      disabled={busy}
+                    >
+                      {MODEL_CONTEXT_WINDOW_OPTIONS.map((tokens) => (
+                        <option key={tokens} value={tokens}>
+                          {CONTEXT_WINDOW_LABELS[tokens] ?? `${tokens} tokens`}
+                        </option>
+                      ))}
+                    </select>
                   </label>
                   <label>
                     API 密钥（可选）

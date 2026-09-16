@@ -40,6 +40,7 @@ import type {
   TestEmbeddingConnectionInput,
   TestModelConnectionInput,
 } from "../shared/contracts.js";
+import { resolveModelContextWindow } from "../shared/contracts.js";
 import { OCR_ENGINE_VERSION, OCR_INPUT_VERSION, OCR_MODEL } from "../shared/ocr-config.js";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -168,6 +169,7 @@ app.whenReady().then(async () => {
           baseUrl: config.chat.baseUrl,
           model: config.chat.model,
           ...(config.chat.apiKey ? { apiKey: config.chat.apiKey } : {}),
+          contextWindow: resolveModelContextWindow(config.chat.contextWindow),
         }
         : undefined;
     };

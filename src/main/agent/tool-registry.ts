@@ -295,7 +295,7 @@ function createReadPageImageTool(): RegisteredTool {
       const echo = `本问图片预算：已用 ${budget.pagesDelivered}/${MAX_PAGE_IMAGE_PAGES} 页。`;
       return {
         displaySummary: `已附上第 ${label} 页原图${overBudget.length > 0 ? "（预算已满）" : ""}`,
-        contentText: `以下是第 ${label} 页的原图，请以此为准阅读公式与结构。${failed.length > 0 ? `（第 ${failed.join("、")} 页渲染失败未附上。）` : ""}${budgetNote}\n${echo}`,
+        contentText: `${echo}\n以下是第 ${label} 页的原图，请以此为准阅读公式与结构。${failed.length > 0 ? `（第 ${failed.join("、")} 页渲染失败未附上。）` : ""}${budgetNote}`,
         evidence,
         images,
       };

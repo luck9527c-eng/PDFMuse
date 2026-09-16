@@ -11,6 +11,7 @@ export type StoredAppConfig = {
     baseUrl: string;
     model: string;
     apiKey?: string;
+    contextWindow?: number;
   };
   embedding?: {
     baseUrl: string;

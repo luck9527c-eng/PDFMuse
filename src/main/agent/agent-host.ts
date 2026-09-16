@@ -9,9 +9,10 @@ import type {
   StartAgentRunInput,
   StartAgentRunResult,
 } from "../../shared/contracts.js";
-import { CONVERSATION_EVIDENCE_MAX, MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES, MAX_AGENT_IMAGE_TOTAL_BYTES } from "../../shared/contracts.js";
+import { CONVERSATION_EVIDENCE_MAX, DEFAULT_MODEL_CONTEXT_WINDOW, MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES, MAX_AGENT_IMAGE_TOTAL_BYTES } from "../../shared/contracts.js";
 import { assistantText, buildSystemPrompt, historyMessagesToLlmMessages, historyToLlmMessages, toSessionEntries } from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, toLlmModel, type ResolvedModelConnection } from "./model-runtime.js";
+import type { PageImageBudget } from "./tool-registry.js";
 import {
   Agent,
   compact,
@@ -56,7 +57,7 @@ export type AgentHostOptions = {
     focus?: ReadingFocus;
     reportEvidence(evidence: ConversationEvidence[]): void;
     /** 本问（一次运行）共享的原图页预算：页数与次数钳制在工具层执行。 */
-    pageBudget: { pagesDelivered: number; calls: number };
+    pageBudget: PageImageBudget;
   }): AgentTool[];
   /** 将已完成的会话消息交给检索模块；失败不得阻断回答。 */
   indexConversationMessage?(bookId: string, message: {
@@ -67,7 +68,6 @@ export type AgentHostOptions = {
   }): Promise<void> | void;
   emit(event: AgentStreamEvent): void;
   runTimeoutMs?: number;
-  historyLimit?: number;
   /** OpenClaw compaction trigger and retention can be lowered in tests or constrained deployments. */
   compactionContextWindow?: number;
   compactionSettings?: Partial<CompactionSettings>;
@@ -153,8 +153,8 @@ type AssistantFailure = { status: "error" | "cancelled"; message?: string };
 export function createAgentHost(options: AgentHostOptions) {
   const store: SessionStore = options.store ?? createSessionStore(options.dataHome);
   const runTimeoutMs = options.runTimeoutMs ?? 120_000;
-  const historyLimit = options.historyLimit ?? 12;
-  const compactionContextWindow = options.compactionContextWindow ?? 64_000;
+  // 压缩阈值基准：显式注入优先（测试），否则每轮按模型连接的 contextWindow 现算（T36）。
+  const injectedContextWindow = options.compactionContextWindow;
   const compactionSettings: CompactionSettings = {
     ...DEFAULT_COMPACTION_SETTINGS,
     ...options.compactionSettings,
@@ -204,7 +204,15 @@ export function createAgentHost(options: AgentHostOptions) {
     const unchanged = (): { history: ConversationMessage[]; summary?: string } => (
       { history: workingHistory, ...(previous?.summary ? { summary: previous.summary } : {}) }
     );
-    if (!shouldCompact(contextTokens, compactionContextWindow, compactionSettings)) {
+    // 阈值来源（T36）：注入基准优先（测试/受限部署），否则跟随模型连接的上下文窗口，
+    // reserve = 30%W 即约 70% 时压缩；显式注入的 reserve/keep 一律原样尊重。
+    const contextWindow = injectedContextWindow ?? connection.contextWindow ?? DEFAULT_MODEL_CONTEXT_WINDOW;
+    const effectiveSettings: CompactionSettings = {
+      ...compactionSettings,
+      reserveTokens: options.compactionSettings?.reserveTokens
+        ?? (injectedContextWindow ? compactionSettings.reserveTokens : Math.round(contextWindow * 0.3)),
+    };
+    if (!shouldCompact(contextTokens, contextWindow, effectiveSettings)) {
       return unchanged();
     }
 
@@ -228,7 +236,7 @@ export function createAgentHost(options: AgentHostOptions) {
           ...messageEntries.slice(boundaryIndex + 1),
         ]
       : messageEntries;
-    const prepared = prepareCompaction(pathEntries, compactionSettings);
+    const prepared = prepareCompaction(pathEntries, effectiveSettings);
     if (!prepared.ok || !prepared.value) {
       return unchanged();
     }
@@ -340,9 +348,13 @@ export function createAgentHost(options: AgentHostOptions) {
     const previousEvidence = fullHistory.findLast(
       (message) => message.role === "assistant" && message.status === "complete",
     )?.evidence;
-    const llmMessages = historyToLlmMessages(
-      history, question, focusWithContext, historyLimit, attachments, compacted.summary, previousEvidence,
-    );
+    const llmMessages = historyToLlmMessages(history, {
+      question,
+      focus: focusWithContext,
+      attachments,
+      summary: compacted.summary,
+      previousEvidence,
+    });
     const questionMessage = llmMessages[llmMessages.length - 1];
     if (!questionMessage) return;
 

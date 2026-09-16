@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createBookIndex } from "./book-index.js";
 import { createLibraryModule } from "../library.js";
 import { createPageRenderer } from "../page-render.js";
-import { createToolRegistry } from "./tool-registry.js";
+import { createToolRegistry, type PageImageBudget } from "./tool-registry.js";
 import { validateToolArguments } from "./openclaw-core.js";
 
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
@@ -36,7 +36,7 @@ describe("tool registry", () => {
 
   function context(
     reportEvidence: (evidence: unknown[]) => void = () => undefined,
-    budget: { pagesDelivered: number; calls: number } = { pagesDelivered: 0, calls: 0 },
+    budget: PageImageBudget = { pagesDelivered: 0, calls: 0 },
   ) {
     return {
       bookId,
@@ -95,7 +95,8 @@ describe("tool registry", () => {
     const first = await tool.execute("call-budget-1", { pages: [1, 2, 3] });
     const firstText = (first.content[0] as { text: string }).text;
     expect(first.content.filter((block) => block.type === "image")).toHaveLength(3);
-    expect(firstText).toContain("本问图片预算：已用 3/4 页");
+    // 票面要求回显在结果头部：模型第一眼即见预算。
+    expect(firstText.startsWith("本问图片预算：已用 3/4 页")).toBe(true);
 
     // 第二次请求 2 页，但预算只剩 1 页：钳制到页 2，页 3 不渲染、不进证据。
     const second = await tool.execute("call-budget-2", { pages: [2, 3] });
@@ -127,7 +128,7 @@ describe("tool registry", () => {
 
   it("keeps image budgets separate across questions", async () => {
     const registry = createToolRegistry();
-    const toolOf = (budget: { pagesDelivered: number; calls: number }) => registry.buildAgentTools(() => context(undefined, budget))
+    const toolOf = (budget: PageImageBudget) => registry.buildAgentTools(() => context(undefined, budget))
       .find((item) => item.name === "read_page_image")!;
     await toolOf({ pagesDelivered: 0, calls: 0 }).execute("call-q1", { pages: [1, 2] });
 

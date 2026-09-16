@@ -663,6 +663,7 @@ try {
   assert.equal(typeof modelConnection.baseUrl, "string", "model base URL is unavailable");
   assert.equal(typeof modelConnection.model, "string", "model name is unavailable");
   assert.equal(modelConnection.protocol, "openai", "default model protocol is unavailable");
+  assert.equal(modelConnection.contextWindow, 1048576, "context window does not fall back to the default tier");
   assert.equal(typeof modelConnection.hasApiKey, "boolean", "API key state is unavailable");
   assert.equal("apiKey" in modelConnection, false, "preload exposed the saved API key");
   const savedConnection = await evaluate(
@@ -750,6 +751,7 @@ try {
   const settingsText = await waitForText(page.webSocketDebuggerUrl, "保存配置");
   assert.match(settingsText, /测试连接/, "model connection test command is unavailable");
   assert.match(settingsText, /接口协议/, "model protocol selector is unavailable");
+  assert.match(settingsText, /上下文窗口/, "context window selector is unavailable");
   assert.match(settingsText, /API 密钥/, "API key editor is unavailable");
   assert.match(settingsText, /测试嵌入连接/, "embedding connection test command is unavailable");
   assert.match(settingsText, /保存嵌入配置/, "embedding connection save command is unavailable");
@@ -758,7 +760,11 @@ try {
     page.webSocketDebuggerUrl,
     `Array.from(document.querySelectorAll('select option')).map((option) => option.textContent)`,
   );
-  assert.deepEqual(protocolOptions, ["OpenAI", "Anthropic"], "model protocol options are incomplete");
+  assert.deepEqual(
+    protocolOptions,
+    ["OpenAI", "Anthropic", "256K tokens", "1M tokens"],
+    "model protocol and context window options are incomplete",
+  );
   const visibleTooltipsWithoutHover = await evaluate(
     page.webSocketDebuggerUrl,
     `new Promise((resolve) => setTimeout(() => resolve(

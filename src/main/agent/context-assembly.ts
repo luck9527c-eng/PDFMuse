@@ -134,20 +134,25 @@ export function toSessionEntries(
   }));
 }
 
+/** 当轮问题与注入块的打包入参：注入块只在尾部问题消息出现、不落库（T36 追加式上下文）。 */
+export type CurrentTurnInput = {
+  question: string;
+  focus?: ReadingFocus;
+  attachments?: readonly AgentImageAttachment[];
+  summary?: string;
+  previousEvidence?: readonly ConversationEvidence[];
+};
+
 /**
  * 把已持久化的会话消息转换为下一轮模型上下文。
- * 错误或被取消的回答不进入模型上下文，但在 Reader 侧保留展示。
+ * 全量发送、不做条数滑窗（T36：滑动窗口每轮从头部改写请求、破前缀缓存；
+ * 唯一的重写点交给 compaction）。错误或被取消的回答不进入模型上下文，但在 Reader 侧保留展示。
  */
 export function historyToLlmMessages(
   history: ReadonlyArray<{ role: "reader" | "assistant"; body: string; status: string }>,
-  question: string,
-  focus: ReadingFocus | undefined,
-  limit = 12,
-  attachments: readonly AgentImageAttachment[] = [],
-  summary?: string,
-  previousEvidence?: readonly ConversationEvidence[],
+  { question, focus, attachments = [], summary, previousEvidence }: CurrentTurnInput,
 ): Message[] {
-  const recent = historyMessagesToLlmMessages(history).slice(-limit);
+  const recent = historyMessagesToLlmMessages(history);
   const messages: Message[] = [];
   if (summary?.trim()) {
     messages.push({ role: "user", content: `【Conversation Summary】\n${summary.trim()}`, timestamp: 0 });

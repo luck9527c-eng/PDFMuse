@@ -13,6 +13,8 @@ export type ResolvedModelConnection = {
   baseUrl: string;
   model: string;
   apiKey?: string;
+  /** 模型上下文窗口（token）；压缩阈值按它 70% 计算，缺省回落默认档。 */
+  contextWindow?: number;
 };
 
 const llmRuntime = createLlmRuntime();
@@ -30,7 +32,8 @@ export function toLlmModel(connection: ResolvedModelConnection, supportsVision =
     reasoning: false,
     input: supportsVision ? ["text", "image"] : ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 0,
+    // 真实窗口随连接传入（vendored 分支摘要等消费者读此字段）；未配置时保持 0（其内部自有兜底）。
+    contextWindow: connection.contextWindow ?? 0,
     maxTokens: 0,
     // 会话亲和：sessionId 非空时适配器随请求发亲和头，帮助 provider 侧命中前缀缓存；未知头被忽略，无副作用。
     compat: { sendSessionAffinityHeaders: true },
