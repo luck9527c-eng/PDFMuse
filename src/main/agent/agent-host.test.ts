@@ -24,6 +24,7 @@ import { createToolRegistry } from "./tool-registry.js";
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
 
 const BOOK_ID = "a".repeat(64);
+const OTHER_BOOK_ID = "b".repeat(64);
 const CONNECTION: ResolvedModelConnection = {
   protocol: "openai",
   baseUrl: "http://127.0.0.1:1/v1",
@@ -35,6 +36,7 @@ function assistantMessage(
   content: string,
   stopReason: AssistantMessage["stopReason"] = "stop",
   errorMessage?: string,
+  inputTokens = 1,
 ): AssistantMessage {
   return {
     role: "assistant",
@@ -43,11 +45,11 @@ function assistantMessage(
     provider: "pdfmuse",
     model: "test-model",
     usage: {
-      input: 1,
+      input: inputTokens,
       output: 1,
       cacheRead: 0,
       cacheWrite: 0,
-      totalTokens: 2,
+      totalTokens: inputTokens + 1,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
     stopReason,
@@ -337,6 +339,210 @@ describe("agent host", () => {
     await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"), 5_000);
     expect(calls).toBe(1);
     expect(JSON.stringify(fake.requests[0]!.context.messages)).toContain("历史问题 0");
+  });
+
+  it("saves the provider-reported input anchor after a complete run", async () => {
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("锚点回答", "stop", undefined, 1234) });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    const result = await startRun("锚点问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    const persisted = createSessionStore(dataHome);
+    expect(persisted.getSessionAnchor(result.sessionId)).toEqual({
+      inputTokens: 1234,
+      model: "test-model",
+      throughMessageId: host.getConversation(BOOK_ID).at(-1)!.id,
+    });
+    persisted.close();
+  });
+
+  it("does not save an anchor when the run errors", async () => {
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "error", reason: "error", error: assistantMessage("", "error", "boom", 999) });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    const result = await startRun("会失败的问题");
+    await waitFor(() => lifecyclePhase(events).includes("error"));
+
+    const persisted = createSessionStore(dataHome);
+    expect(persisted.getSessionAnchor(result.sessionId)).toBeUndefined();
+    persisted.close();
+  });
+
+  function seedAnchorHistory(repeat: number) {
+    const sessionStore = createSessionStore(dataHome);
+    const session = sessionStore.ensureSession(BOOK_ID);
+    const sessionId = session.id;
+    let throughId = "";
+    for (let index = 0; index < 2; index += 1) {
+      sessionStore.appendMessage({ sessionId, runId: `old-${index}`, role: "reader", body: `旧问题 ${index} ${"内容".repeat(repeat)}`, status: "complete" });
+      throughId = sessionStore.appendMessage({ sessionId, runId: `old-${index}`, role: "assistant", body: `旧回答 ${index} ${"回答".repeat(repeat)}`, status: "complete" }).id;
+    }
+    sessionStore.close();
+    return { sessionId, throughId };
+  }
+
+  function saveAnchor(sessionId: string, inputTokens: number, model: string, throughMessageId: string) {
+    const store = createSessionStore(dataHome);
+    store.saveSessionAnchor(sessionId, inputTokens, model, throughMessageId);
+    store.close();
+  }
+
+  it("anchors the compaction threshold on the saved anchor plus the new-turn delta", async () => {
+    // 历史 ~590 估算 + system prompt ≈ 845，超 700 阈值；锚点模式下判断值改走锚点。
+    const { sessionId, throughId } = seedAnchorHistory(80);
+    saveAnchor(sessionId, 20, "test-model", throughId);
+
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage(calls === 2 ? "摘要内容" : "锚点回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 1_000 }),
+      compactionSettings: { keepRecentTokens: 16 },
+    });
+
+    // 锚点 20：判断值 ≈ 20 + system prompt + 问题 < 700，不压缩（估算口径反而会超）。
+    await startRun("锚点问题一");
+    await waitFor(() => events.filter((event) => event.stream === "lifecycle" && event.phase === "end").length === 1);
+    expect(calls).toBe(1);
+
+    // 锚点 1000：判断值越过阈值 → 压缩触发（调用 2 摘要 + 调用 3 回答）。
+    saveAnchor(sessionId, 1_000, "test-model", throughId);
+    await startRun("锚点问题二");
+    await waitFor(() => events.filter((event) => event.stream === "lifecycle" && event.phase === "end").length === 2);
+    expect(calls).toBeGreaterThan(1);
+  });
+
+  it("falls back to the estimate when the anchor belongs to another model", async () => {
+    const { sessionId } = seedAnchorHistory(80);
+    saveAnchor(sessionId, 20, "other-model", "");
+
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("换模型回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 1_000 }),
+      compactionSettings: { keepRecentTokens: 16 },
+    });
+
+    // 锚点模型与连接不一致 → 视为无锚点，估算口径（~845 > 700）触发压缩。
+    await startRun("换模型问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+    expect(calls).toBeGreaterThan(1);
+  });
+
+  it("counts the system prompt in the fallback threshold estimate", async () => {
+    // 历史估算 ~590 低于 700 阈值（旧口径不会触发）；加上 system prompt 与问题后越线。
+    seedAnchorHistory(80);
+
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage(calls === 1 ? "摘要内容" : "口径回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 1_000 }),
+      compactionSettings: { keepRecentTokens: 16 },
+    });
+
+    await startRun("口径问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+    expect(calls).toBeGreaterThan(1);
+  });
+
+  it("recovers from an over-window error by adopting the reported window and re-answering once", async () => {
+    seedAnchorHistory(80);
+
+    let calls = 0;
+    const fake = createFakeStreamFn(({ request, push }) => {
+      calls += 1;
+      push({ type: "start", partial: assistantMessage("") });
+      if (calls === 1) {
+        push({ type: "error", reason: "error", error: assistantMessage("", "error", "This model's maximum context length is 8000 tokens. However, you requested 9000 tokens.", 1) });
+        return;
+      }
+      // 摘要调用与回答调用按 system prompt 性质区分（vendored 摘要提示词含 summarization）。
+      const isSummary = /summarization/i.test(request.context.systemPrompt ?? "");
+      push({ type: "done", reason: "stop", message: assistantMessage(isSummary ? "摘要内容" : "自愈回答", "stop", undefined, isSummary ? 1 : 500) });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn, compactionSettings: { keepRecentTokens: 16 } });
+
+    await startRun("超窗问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    // 第一次调用超窗 → 采纳 8000 → 强制压缩（摘要调用，可能含分轮前缀摘要）→ 当轮重答成功。
+    expect(calls).toBeGreaterThanOrEqual(3);
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation.at(-1)?.body).toBe("自愈回答");
+    expect(conversation.at(-1)?.status).toBe("complete");
+    // 锚点落的是重答（最后一次）调用的 input，而非失败调用。
+    const persisted = createSessionStore(dataHome);
+    expect(persisted.getSessionAnchor(persisted.findSession(BOOK_ID)!.id)).toMatchObject({ inputTokens: 500 });
+    persisted.close();
+
+    // 生效窗口修正进程级全局：另一本书的历史（估算 ~6000）超过 8000×70%=5600 → 直接压缩。
+    // （两条消息：单条历史没有「保留尾部之前的头」，prepareCompaction 无摘要可做。）
+    const other = createSessionStore(dataHome);
+    const otherSession = other.ensureSession(OTHER_BOOK_ID);
+    other.appendMessage({ sessionId: otherSession.id, runId: "o-1", role: "reader", body: `远超窗口 ${"内容".repeat(1500)}`, status: "complete" });
+    other.appendMessage({ sessionId: otherSession.id, runId: "o-1", role: "assistant", body: `远超回答 ${"回答".repeat(1500)}`, status: "complete" });
+    other.close();
+
+    const callsBeforeOtherBook = calls;
+    await host.start({ bookId: OTHER_BOOK_ID, question: "另一本书的问题" });
+    await waitFor(() => events.filter((event) => event.stream === "lifecycle" && event.phase === "end").length === 2);
+    expect(calls).toBeGreaterThan(callsBeforeOtherBook + 1);
+    const reopened = createSessionStore(dataHome);
+    expect(reopened.getSummary(reopened.findSession(OTHER_BOOK_ID)!.id)?.summary).toBeTruthy();
+    reopened.close();
+  });
+
+  it("enters cooldown when compaction cannot get below the threshold", async () => {
+    const sessionStore = createSessionStore(dataHome);
+    const session = sessionStore.ensureSession(BOOK_ID);
+    for (let index = 0; index < 5; index += 1) {
+      sessionStore.appendMessage({ sessionId: session.id, runId: `old-${index}`, role: "reader", body: `旧问题 ${index} ${"内容".repeat(300)}`, status: "complete" });
+      sessionStore.appendMessage({ sessionId: session.id, runId: `old-${index}`, role: "assistant", body: `旧回答 ${index} ${"回答".repeat(300)}`, status: "complete" });
+    }
+    sessionStore.close();
+
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage(calls === 1 ? "摘要内容" : "冷却回答", "stop", undefined, 10_000) });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 300 }),
+      compactionSettings: { keepRecentTokens: 5_000 },
+    });
+
+    await startRun("冷却问题一");
+    await waitFor(() => events.filter((event) => event.stream === "lifecycle" && event.phase === "end").length === 1);
+    // 压缩执行（调用 1 摘要 + 调用 2 回答）；kept 5000 仍远超 210 阈值 → 冷却生效。
+    expect(calls).toBe(2);
+
+    await startRun("冷却问题二");
+    await waitFor(() => events.filter((event) => event.stream === "lifecycle" && event.phase === "end").length === 2);
+    // 锚点 10000 本身足以再次触发压缩，但冷却期内不压缩：第二问只有一次回答调用。
+    expect(calls).toBe(3);
   });
 
   it("forwards the Book Conversation session id to the model stream options", async () => {

@@ -33,7 +33,7 @@ vi.mock("./openclaw-core.js", async (importOriginal) => {
   return { ...actual, createLlmRuntime: runtimeStub.createLlmRuntime };
 });
 
-import { createModelCompleteFn, normalizeModelError, toLlmModel } from "./model-runtime.js";
+import { createModelCompleteFn, normalizeModelError, parseContextWindowError, toLlmModel } from "./model-runtime.js";
 
 describe("normalizeModelError", () => {
   it("maps authentication failures", () => {
@@ -102,5 +102,26 @@ describe("createModelCompleteFn", () => {
     expect(message.role).toBe("assistant");
     expect(runtimeStub.completeCalls).toHaveLength(1);
     expect(runtimeStub.completeCalls[0]!.options).toMatchObject({ apiKey: "secret-key", sessionId: "session-1" });
+  });
+});
+
+describe("parseContextWindowError", () => {
+  it("extracts the reported window from openai-style over-window errors", () => {
+    expect(parseContextWindowError(
+      "This model's maximum context length is 8192 tokens. However, you requested 10000 tokens (2345 of these are for the system message).",
+    )).toEqual({ reportedWindow: 8192 });
+  });
+
+  it("extracts the maximum side from anthropic-style comparisons", () => {
+    expect(parseContextWindowError("prompt is too long: 204 tokens > 180 tokens maximum")).toEqual({ reportedWindow: 180 });
+  });
+
+  it("ignores errors that are not about the context window", () => {
+    expect(parseContextWindowError("rate limit exceeded, retry after 30s")).toBeUndefined();
+    expect(parseContextWindowError(undefined)).toBeUndefined();
+  });
+
+  it("flags over-window errors without an extractable window number", () => {
+    expect(parseContextWindowError("context length exceeded")).toEqual({});
   });
 });

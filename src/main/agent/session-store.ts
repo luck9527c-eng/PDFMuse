@@ -100,7 +100,10 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       summary TEXT,
-      summary_through_id TEXT
+      summary_through_id TEXT,
+      last_input_tokens INTEGER,
+      anchor_model TEXT,
+      anchor_through_id TEXT
     );
     CREATE TABLE IF NOT EXISTS agent_messages (
       id TEXT PRIMARY KEY,
@@ -124,6 +127,10 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
   );
   if (!sessionColumns.has("summary")) database.exec("ALTER TABLE agent_sessions ADD COLUMN summary TEXT");
   if (!sessionColumns.has("summary_through_id")) database.exec("ALTER TABLE agent_sessions ADD COLUMN summary_through_id TEXT");
+  // 旧库迁移：T37 压缩锚点三列（ADR 0010）。
+  if (!sessionColumns.has("last_input_tokens")) database.exec("ALTER TABLE agent_sessions ADD COLUMN last_input_tokens INTEGER");
+  if (!sessionColumns.has("anchor_model")) database.exec("ALTER TABLE agent_sessions ADD COLUMN anchor_model TEXT");
+  if (!sessionColumns.has("anchor_through_id")) database.exec("ALTER TABLE agent_sessions ADD COLUMN anchor_through_id TEXT");
   // 旧库迁移：T08 之前的 agent_messages 没有 evidence_json。
   const messageColumns = new Set(
     (database.prepare("PRAGMA table_info(agent_messages)").all() as { name: string }[])
@@ -148,8 +155,10 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
     UPDATE agent_sessions SET summary = ?, summary_through_id = ?, updated_at = ? WHERE id = ?
   `);
   const clearMessagesStatement = database.prepare("DELETE FROM agent_messages WHERE session_id = ?");
-  const clearSummaryStatement = database.prepare(`
-    UPDATE agent_sessions SET summary = NULL, summary_through_id = NULL, updated_at = ? WHERE id = ?
+  const resetSessionStateStatement = database.prepare(`
+    UPDATE agent_sessions
+    SET summary = NULL, summary_through_id = NULL, last_input_tokens = NULL, anchor_model = NULL, anchor_through_id = NULL, updated_at = ?
+    WHERE id = ?
   `);
   const insertMessageStatement = database.prepare(`
     INSERT INTO agent_messages (
@@ -213,13 +222,35 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
       updateSummaryStatement.run(summary, throughMessageId, now(), sessionId);
     },
 
+    /**
+     * 压缩锚点（ADR 0010）：最近一次 complete 运行的 provider 真实 input。
+     * throughMessageId 是落锚点时的会话末条消息，锚点之后的增量据此估算。
+     */
+    saveSessionAnchor(sessionId: string, inputTokens: number, model: string, throughMessageId: string) {
+      database.prepare(`
+        UPDATE agent_sessions
+        SET last_input_tokens = ?, anchor_model = ?, anchor_through_id = ?, updated_at = ?
+        WHERE id = ?
+      `).run(inputTokens, model, throughMessageId, now(), sessionId);
+    },
+
+    getSessionAnchor(sessionId: string): { inputTokens: number; model: string; throughMessageId: string } | undefined {
+      const row = database.prepare(
+        "SELECT last_input_tokens, anchor_model, anchor_through_id FROM agent_sessions WHERE id = ?",
+      ).get(sessionId) as
+        | { last_input_tokens: number | null; anchor_model: string | null; anchor_through_id: string | null }
+        | undefined;
+      if (!row?.last_input_tokens || !row.anchor_model || !row.anchor_through_id) return undefined;
+      return { inputTokens: row.last_input_tokens, model: row.anchor_model, throughMessageId: row.anchor_through_id };
+    },
+
     clearConversation(bookId: string) {
       const session = findSessionStatement.get(bookId) as SessionRow | undefined;
       if (!session) return;
       database.exec("BEGIN IMMEDIATE");
       try {
         clearMessagesStatement.run(session.id);
-        clearSummaryStatement.run(now(), session.id);
+        resetSessionStateStatement.run(now(), session.id);
         options.deleteConversationEmbeddings?.(bookId, database);
         database.exec("COMMIT");
       } catch (error) {

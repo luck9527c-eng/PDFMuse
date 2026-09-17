@@ -112,4 +112,45 @@ describe("session store", () => {
     expect(() => store.clearConversation(BOOK_ID)).not.toThrow();
     expect(store.listMessages(session.id)).toEqual([]);
   });
+
+  it("压缩锚点随会话保存读回，清空会话时一并失效（T37/ADR 0010）", () => {
+    store = createSessionStore(dataHome);
+    const { session, append } = seedConversation(BOOK_ID);
+    const lastMessage = append("旧问题");
+    expect(store.getSessionAnchor(session.id)).toBeUndefined();
+
+    store.saveSessionAnchor(session.id, 4321, "test-model", lastMessage.id);
+    expect(store.getSessionAnchor(session.id)).toEqual({
+      inputTokens: 4321,
+      model: "test-model",
+      throughMessageId: lastMessage.id,
+    });
+
+    store.clearConversation(BOOK_ID);
+    expect(store.getSessionAnchor(session.id)).toBeUndefined();
+  });
+
+  it("旧库缺锚点列时自动迁移并可写入（T37）", async () => {
+    store = createSessionStore(dataHome);
+    const { session } = seedConversation(BOOK_ID);
+    store.close();
+    // 模拟 T37 之前的库：agent_sessions 没有锚点三列。
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    database.exec(`
+      ALTER TABLE agent_sessions DROP COLUMN last_input_tokens;
+      ALTER TABLE agent_sessions DROP COLUMN anchor_model;
+      ALTER TABLE agent_sessions DROP COLUMN anchor_through_id;
+    `);
+    database.close();
+
+    const reopened = createSessionStore(dataHome);
+    reopened.saveSessionAnchor(session.id, 77, "m", "msg-1");
+    expect(reopened.getSessionAnchor(session.id)).toEqual({
+      inputTokens: 77,
+      model: "m",
+      throughMessageId: "msg-1",
+    });
+    reopened.close();
+    store = undefined as unknown as ReturnType<typeof createSessionStore>;
+  });
 });

@@ -67,6 +67,30 @@ export type NormalizedModelError = {
   message: string;
 };
 
+/** 超窗错误解析结果；reportedWindow 缺省表示确认超窗但文案里没有可提取的窗口数。 */
+export type ContextWindowError = { reportedWindow?: number };
+
+// 超窗判定：各家文案族（OpenAI context_length_exceeded / "maximum context length"、
+// Anthropic "prompt is too long"、通用 "context window" 表述）。
+const CONTEXT_WINDOW_ERROR_RE = /context[_ ]length[^.]{0,40}exceeded|maximum context length|prompt is too long|context window.{0,40}(?:exceed|too (?:long|large|many))|too many tokens|reduce the length/i;
+// 窗口数提取：优先明确的最大值表述；Anthropic 形如 "204 tokens > 180 tokens maximum" 取比较右侧。
+const WINDOW_NUMBER_PATTERNS = [
+  /maximum context length is (\d+)/i,
+  /(?:tokens?\s*)?\d+\s*tokens?\s*>\s*(\d+)(?:\s*tokens?)?\s*maximum/i,
+  /(\d+)\s*(?:tokens?)?\s*maximum/i,
+];
+
+/** 判定模型错误是否超窗，并尽量提取 provider 报告的真实窗口尺寸（ADR 0010）。 */
+export function parseContextWindowError(errorMessage: string | undefined): ContextWindowError | undefined {
+  if (!errorMessage || !CONTEXT_WINDOW_ERROR_RE.test(errorMessage)) return undefined;
+  for (const pattern of WINDOW_NUMBER_PATTERNS) {
+    const match = errorMessage.match(pattern);
+    const reported = match ? Number(match[1]) : NaN;
+    if (Number.isSafeInteger(reported) && reported > 0) return { reportedWindow: reported };
+  }
+  return {};
+}
+
 /** 把 Provider 流内编码的失败映射为 Reader 可理解的中文错误。 */
 export function normalizeModelError(failure: {
   stopReason: string;

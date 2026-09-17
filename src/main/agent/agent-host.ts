@@ -10,19 +10,22 @@ import type {
   StartAgentRunResult,
 } from "../../shared/contracts.js";
 import { CONVERSATION_EVIDENCE_MAX, DEFAULT_MODEL_CONTEXT_WINDOW, MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES, MAX_AGENT_IMAGE_TOTAL_BYTES } from "../../shared/contracts.js";
-import { assistantText, buildSystemPrompt, historyMessagesToLlmMessages, historyToLlmMessages, toSessionEntries } from "./context-assembly.js";
-import { createModelStreamFn, normalizeModelError, toLlmModel, type ResolvedModelConnection } from "./model-runtime.js";
+import { assistantText, buildQuestionContent, buildSystemPrompt, historyMessagesToLlmMessages, historyToLlmMessages, toSessionEntries } from "./context-assembly.js";
+import { createModelStreamFn, normalizeModelError, parseContextWindowError, toLlmModel, type ContextWindowError, type ResolvedModelConnection } from "./model-runtime.js";
 import type { PageImageBudget } from "./tool-registry.js";
 import {
   Agent,
   compact,
   DEFAULT_COMPACTION_SETTINGS,
+  estimateStringChars,
   estimateTokens,
+  estimateTokensFromChars,
   prepareCompaction,
   shouldCompact,
   type AgentEvent,
   type AgentTool,
   type CompactionSettings,
+  type Message,
   type SessionTreeEntry,
   type StreamFn,
 } from "./openclaw-core.js";
@@ -81,6 +84,8 @@ const PASSAGE_MAX_LENGTH = 20_000;
 const MAX_BOOK_SEARCH_CALLS = 3;
 /** 每轮运行的 web_search 调用上限：事实型问题通常一次足够。 */
 const MAX_WEB_SEARCH_CALLS = 2;
+/** 压缩冷却递增档（ADR 0010）：压缩后仍接近阈值时按会话进入冷却，防止每问白打一次摘要调用。 */
+const COMPACTION_COOLDOWN_STEPS_MS = [60_000, 300_000, 900_000];
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -150,6 +155,13 @@ type ActiveRun = {
 
 type AssistantFailure = { status: "error" | "cancelled"; message?: string };
 
+/** 错误/取消的回答不进入模型上下文，与 context-assembly 的可用性过滤保持同一规则。 */
+function usableLlmMessages(history: ConversationMessage[]) {
+  return historyMessagesToLlmMessages(
+    history.filter((message) => message.role === "reader" || message.status === "complete"),
+  );
+}
+
 export function createAgentHost(options: AgentHostOptions) {
   const store: SessionStore = options.store ?? createSessionStore(options.dataHome);
   const runTimeoutMs = options.runTimeoutMs ?? 120_000;
@@ -169,6 +181,10 @@ export function createAgentHost(options: AgentHostOptions) {
   const indexedThrough = new Map<string, string>();
   // 运行诊断的内存环形缓冲：常开捕获，按书保留最近若干次运行。
   const diagnosticsStore = createDiagnosticsStore();
+  // 撞窗自愈修正的生效窗口（ADR 0010）：provider 报告的真实上限，进程级全局生效，不写回用户配置。
+  let effectiveWindowOverride: number | undefined;
+  // 压缩冷却：per session 内存态，重启归零；压缩后仍接近阈值时进入，防止每问白打一次摘要调用。
+  const compactionCooldowns = new Map<string, { level: number; until: number }>();
 
   store.abandonInterruptedMessages("程序中断，回答未完成。");
 
@@ -188,31 +204,53 @@ export function createAgentHost(options: AgentHostOptions) {
     history: ConversationMessage[],
     connection: ResolvedModelConnection,
     streamFn?: StreamFn,
+    overrides: { force?: boolean; systemPrompt?: string; questionContent?: string } = {},
   ): Promise<{ history: ConversationMessage[]; summary?: string }> {
     const previous = store.getSummary(sessionId);
     const previousIndex = previous ? history.findIndex((message) => message.id === previous.throughMessageId) : -1;
     const workingHistory = previousIndex >= 0 ? history.slice(previousIndex + 1) : history;
-    const usableHistory = workingHistory.filter(
-      (message) => message.role === "reader" || message.status === "complete",
-    );
-    const historyMessages = historyMessagesToLlmMessages(usableHistory);
+    const historyMessages = usableLlmMessages(workingHistory);
     const summaryMessage = previous?.summary
       ? [{ role: "user" as const, content: `【Conversation Summary】\n${previous.summary}`, timestamp: 0 }]
       : [];
-    const contextTokens = [...summaryMessage, ...historyMessages]
-      .reduce((total, message) => total + estimateTokens(message), 0);
-    const unchanged = (): { history: ConversationMessage[]; summary?: string } => (
-      { history: workingHistory, ...(previous?.summary ? { summary: previous.summary } : {}) }
-    );
-    // 阈值来源（T36）：注入基准优先（测试/受限部署），否则跟随模型连接的上下文窗口，
-    // reserve = 30%W 即约 70% 时压缩；显式注入的 reserve/keep 一律原样尊重。
-    const contextWindow = injectedContextWindow ?? connection.contextWindow ?? DEFAULT_MODEL_CONTEXT_WINDOW;
+    // 阈值基准（T36/T37）：注入优先（测试/受限部署），其次撞窗自愈修正的真实窗口，再次连接配置，最后默认档。
+    const contextWindow = injectedContextWindow
+      ?? effectiveWindowOverride
+      ?? connection.contextWindow
+      ?? DEFAULT_MODEL_CONTEXT_WINDOW;
     const effectiveSettings: CompactionSettings = {
       ...compactionSettings,
       reserveTokens: options.compactionSettings?.reserveTokens
         ?? (injectedContextWindow ? compactionSettings.reserveTokens : Math.round(contextWindow * 0.3)),
     };
-    if (!shouldCompact(contextTokens, contextWindow, effectiveSettings)) {
+    // 判断值（ADR 0010）：真实 usage 锚点 + 落锚点后增量（锚点已含 system prompt，不重复计）；
+    // 无锚点降级为字符估算，口径计入 system prompt 与当轮问题内容，与锚点口径对齐。
+    const systemEstimate = estimateTokensFromChars(estimateStringChars(overrides.systemPrompt ?? ""));
+    const questionEstimate = estimateTokensFromChars(estimateStringChars(overrides.questionContent ?? ""));
+    const anchor = store.getSessionAnchor(sessionId);
+    const anchorIndex = anchor ? history.findIndex((message) => message.id === anchor.throughMessageId) : -1;
+    const anchored = Boolean(anchor) && anchor!.model === connection.model && anchorIndex >= 0;
+    let contextTokens: number;
+    if (anchored && anchor) {
+      const anchorDelta = usableLlmMessages(history.slice(anchorIndex + 1));
+      contextTokens = anchor.inputTokens
+        + anchorDelta.reduce((total, message) => total + estimateTokens(message), 0)
+        + questionEstimate;
+    } else {
+      contextTokens = [...summaryMessage, ...historyMessages]
+        .reduce((total, message) => total + estimateTokens(message), 0)
+        + systemEstimate
+        + questionEstimate;
+    }
+    const unchanged = (): { history: ConversationMessage[]; summary?: string } => (
+      { history: workingHistory, ...(previous?.summary ? { summary: previous.summary } : {}) }
+    );
+    // 冷却（ADR 0010）：冷却期内不压缩、照常回答；强制路径（撞窗自愈）绕过。
+    const cooldown = compactionCooldowns.get(sessionId);
+    if (!overrides.force && cooldown && Date.now() < cooldown.until) {
+      return unchanged();
+    }
+    if (!overrides.force && !shouldCompact(contextTokens, contextWindow, effectiveSettings)) {
       return unchanged();
     }
 
@@ -262,6 +300,20 @@ export function createAgentHost(options: AgentHostOptions) {
     }
     store.saveSummary(sessionId, compacted.value.summary, throughEntry.id);
     const nextHistory = history.slice(history.findIndex((message) => message.id === throughEntry.id) + 1);
+    // 压缩后仍接近阈值 → 会话进入冷却递增档；降到阈值以下 → 归零。
+    // 判断值用纯估算（锚点描述的是压缩前的请求形状，头部重写后已过期），口径含 system prompt 与当轮问题。
+    const afterMessages = usableLlmMessages(nextHistory);
+    const afterTokens = estimateTokens({ role: "user", content: `【Conversation Summary】\n${compacted.value.summary}`, timestamp: 0 })
+      + afterMessages.reduce((total, message) => total + estimateTokens(message), 0)
+      + systemEstimate
+      + questionEstimate;
+    if (afterTokens >= contextWindow - effectiveSettings.reserveTokens) {
+      const level = (cooldown?.level ?? 0) + 1;
+      const delayIndex = Math.min(level - 1, COMPACTION_COOLDOWN_STEPS_MS.length - 1);
+      compactionCooldowns.set(sessionId, { level, until: Date.now() + COMPACTION_COOLDOWN_STEPS_MS[delayIndex]! });
+    } else {
+      compactionCooldowns.delete(sessionId);
+    }
     return { history: nextHistory, summary: compacted.value.summary };
   }
 
@@ -293,12 +345,28 @@ export function createAgentHost(options: AgentHostOptions) {
     const fullHistory = store.listMessages(sessionId);
     let activeCallStartedAt = 0;
     const startCallClock = () => { activeCallStartedAt = Date.now(); };
+    // Reading Focus 增强与上轮 Evidence 前移到压缩之前：压缩判断值需要当轮问题内容与 system prompt 的估算。
+    const sectionTitle = focus ? await options.resolveReadingSection?.(bookId, focus.currentPage) : undefined;
+    const chapterRange = focus ? await options.resolveChapterRange?.(bookId, focus.currentPage) : undefined;
+    const focusWithContext: ReadingFocus | undefined = focus ? {
+      currentPage: focus.currentPage,
+      ...(focus.selectedPassage ? { selectedPassage: focus.selectedPassage } : {}),
+      ...(sectionTitle ? { sectionTitle } : {}),
+      ...(chapterRange ? { chapterRange } : {}),
+    } : undefined;
+    // 上轮 Evidence 注入：只取最近一条完成回答（常数开销，不随会话累积），追问免重查一手原文。
+    const previousEvidence = fullHistory.findLast(
+      (message) => message.role === "assistant" && message.status === "complete",
+    )?.evidence;
+    const questionContent = buildQuestionContent(question, focusWithContext, previousEvidence);
+    const systemPrompt = buildSystemPrompt(profile, bookTitle ? { title: bookTitle } : undefined);
     const compactionStartedAt = Date.now();
     const compacted = await compactHistory(
       sessionId,
       fullHistory,
       connection,
       wrapStreamFnWithDiagnostics(() => makeStreamFn(connection), () => "compaction", collector, options.emit, startCallClock),
+      { systemPrompt, questionContent },
     );
     const compactionRequest = collector.run.requests.filter((item) => item.role === "compaction").at(-1);
     if (compactionRequest && compactionRequest.durationMs === undefined) {
@@ -335,19 +403,6 @@ export function createAgentHost(options: AgentHostOptions) {
     });
     indexedThrough.set(sessionId, readerMessage.id);
 
-    // Reading Focus 增强：Main 侧解析当前页所在章节（相对引用无需检索定位）与顶层章节范围（检索加权）。
-    const sectionTitle = focus ? await options.resolveReadingSection?.(bookId, focus.currentPage) : undefined;
-    const chapterRange = focus ? await options.resolveChapterRange?.(bookId, focus.currentPage) : undefined;
-    const focusWithContext: ReadingFocus | undefined = focus ? {
-      currentPage: focus.currentPage,
-      ...(focus.selectedPassage ? { selectedPassage: focus.selectedPassage } : {}),
-      ...(sectionTitle ? { sectionTitle } : {}),
-      ...(chapterRange ? { chapterRange } : {}),
-    } : undefined;
-    // 上轮 Evidence 注入：只取最近一条完成回答（常数开销，不随会话累积），追问免重查一手原文。
-    const previousEvidence = fullHistory.findLast(
-      (message) => message.role === "assistant" && message.status === "complete",
-    )?.evidence;
     const llmMessages = historyToLlmMessages(history, {
       question,
       focus: focusWithContext,
@@ -452,125 +507,168 @@ export function createAgentHost(options: AgentHostOptions) {
       startCallClock,
     );
 
-    const agent = new Agent({
-      initialState: {
-        systemPrompt: buildSystemPrompt(profile, bookTitle ? {
-          title: bookTitle,
-        } : undefined),
-        // 常开图像输入：截图附件与 read_page_image 的工具结果图都可能在运行中出现，
-        // 纯文本轮次不携带图块，声明能力本身无副作用。
-        model: toLlmModel(connection, true),
-        messages: llmMessages.slice(0, -1),
-        tools: diagnosticsTools,
-      },
-      streamFn: agentStreamFn,
-      // 会话 id 透传给 provider 适配器（会话亲和头 / prompt_cache_key），支持缓存前缀复用。
-      sessionId,
-    });
-
-    const run: ActiveRun = { sessionId, agent, cancelledByUser: false, timedOut: false };
-    activeRuns.set(runId, run);
-
     let assistantMessageId: string | undefined;
     let assistantBody = "";
     // 当前 assistant 消息在累积体中的起点：工具轮会产生多段 assistant 消息，
     // message_end 用整条文本替换时只覆盖本消息的区段，前段回答不得丢失。
     let assistantBodyStart = 0;
     let assistantFailure: AssistantFailure | undefined;
+    // 压缩锚点（ADR 0010）：本运行回答路径最后一次模型调用的 provider input；complete 收尾才落库。
+    let lastAnswerInput = 0;
+    // 撞窗自愈：本轮是否发生了可识别的超窗错误及其携带的真实窗口数。
+    let overWindow: ContextWindowError | undefined;
 
-    const timeout = setTimeout(() => {
-      if (!activeRuns.has(runId)) return;
-      run.timedOut = true;
-      agent.abort("timeout");
-    }, runTimeoutMs);
+    async function runTurn(turnMessages: Message[]) {
+      const agent = new Agent({
+        initialState: {
+          systemPrompt,
+          // 常开图像输入：截图附件与 read_page_image 的工具结果图都可能在运行中出现，
+          // 纯文本轮次不携带图块，声明能力本身无副作用。
+          model: toLlmModel(connection, true),
+          messages: turnMessages.slice(0, -1),
+          tools: diagnosticsTools,
+        },
+        streamFn: agentStreamFn,
+        // 会话 id 透传给 provider 适配器（会话亲和头 / prompt_cache_key），支持缓存前缀复用。
+        sessionId,
+      });
 
-    agent.subscribe((event: AgentEvent) => {
-      switch (event.type) {
-        case "message_start":
-          if (event.message.role === "assistant") {
-            if (!assistantMessageId) {
-              assistantMessageId = store.appendMessage({
-                sessionId,
-                runId,
-                role: "assistant",
-                body: "",
-                status: "streaming",
-              }).id;
-            }
-            assistantBodyStart = assistantBody.length;
-          }
-          break;
-        case "message_update": {
-          const streamEvent = event.assistantMessageEvent;
-          if (streamEvent.type === "text_delta" && streamEvent.delta) {
-            assistantBody += streamEvent.delta;
-            options.emit({ stream: "assistant", runId, sessionId, delta: streamEvent.delta });
-          }
-          break;
-        }
-        case "message_end":
-          if (event.message.role === "assistant") {
-            const content = assistantText(event.message);
-            if (content) assistantBody = assistantBody.slice(0, assistantBodyStart) + content;
-            // 该轮模型调用完成：回填耗时与 token 用量。
-            if (activeCallStartedAt) {
-              const lastRequest = collector.run.requests.at(-1);
-              if (lastRequest) {
-                const durationMs = Date.now() - activeCallStartedAt;
-                const usage = toDiagnosticsUsage(event.message.usage);
-                collector.completeRequest(lastRequest.callIndex, durationMs, usage);
-                options.emit({
-                  stream: "diagnostics",
-                  kind: "request-complete",
-                  runId,
+      const run: ActiveRun = { sessionId, agent, cancelledByUser: false, timedOut: false };
+      activeRuns.set(runId, run);
+
+      const timeout = setTimeout(() => {
+        if (!activeRuns.has(runId)) return;
+        run.timedOut = true;
+        agent.abort("timeout");
+      }, runTimeoutMs);
+
+      agent.subscribe((event: AgentEvent) => {
+        switch (event.type) {
+          case "message_start":
+            if (event.message.role === "assistant") {
+              if (!assistantMessageId) {
+                assistantMessageId = store.appendMessage({
                   sessionId,
-                  callIndex: lastRequest.callIndex,
-                  durationMs,
-                  ...(usage ? { usage } : {}),
-                });
-                diagnosticsStore.record(bookId, collector.run);
+                  runId,
+                  role: "assistant",
+                  body: "",
+                  status: "streaming",
+                }).id;
+              }
+              assistantBodyStart = assistantBody.length;
+            }
+            break;
+          case "message_update": {
+            const streamEvent = event.assistantMessageEvent;
+            if (streamEvent.type === "text_delta" && streamEvent.delta) {
+              assistantBody += streamEvent.delta;
+              options.emit({ stream: "assistant", runId, sessionId, delta: streamEvent.delta });
+            }
+            break;
+          }
+          case "message_end":
+            if (event.message.role === "assistant") {
+              // 回答路径最后一次调用的 input 就是锚点（append-only 下最后一次必然最大）。
+              if (typeof event.message.usage?.input === "number" && event.message.usage.input > 0) {
+                lastAnswerInput = event.message.usage.input;
+              }
+              const content = assistantText(event.message);
+              if (content) assistantBody = assistantBody.slice(0, assistantBodyStart) + content;
+              // 该轮模型调用完成：回填耗时与 token 用量。
+              if (activeCallStartedAt) {
+                const lastRequest = collector.run.requests.at(-1);
+                if (lastRequest) {
+                  const durationMs = Date.now() - activeCallStartedAt;
+                  const usage = toDiagnosticsUsage(event.message.usage);
+                  collector.completeRequest(lastRequest.callIndex, durationMs, usage);
+                  options.emit({
+                    stream: "diagnostics",
+                    kind: "request-complete",
+                    runId,
+                    sessionId,
+                    callIndex: lastRequest.callIndex,
+                    durationMs,
+                    ...(usage ? { usage } : {}),
+                  });
+                  diagnosticsStore.record(bookId, collector.run);
+                }
+              }
+              if (event.message.stopReason === "error") {
+                overWindow = parseContextWindowError(event.message.errorMessage);
+                const normalized = normalizeModelError(event.message);
+                assistantFailure = { status: "error", message: normalized?.message ?? event.message.errorMessage };
+              } else if (event.message.stopReason === "aborted") {
+                assistantFailure = run.timedOut
+                  ? { status: "error", message: "模型响应超时，请稍后重试。" }
+                  : run.cancelledByUser
+                    ? { status: "cancelled" }
+                    : { status: "error", message: "回答已中断。" };
               }
             }
-            if (event.message.stopReason === "error") {
-              const normalized = normalizeModelError(event.message);
-              assistantFailure = { status: "error", message: normalized?.message ?? event.message.errorMessage };
-            } else if (event.message.stopReason === "aborted") {
-              assistantFailure = run.timedOut
-                ? { status: "error", message: "模型响应超时，请稍后重试。" }
-                : run.cancelledByUser
-                  ? { status: "cancelled" }
-                  : { status: "error", message: "回答已中断。" };
-            }
-          }
-          break;
-        case "tool_execution_start":
-          options.emit({ stream: "tool", phase: "start", runId, callId: event.toolCallId, name: event.toolName });
-          break;
-        case "tool_execution_update":
-          options.emit({ stream: "tool", phase: "update", runId, callId: event.toolCallId, name: event.toolName });
-          break;
-        case "tool_execution_end":
-          options.emit({ stream: "tool", phase: "end", runId, callId: event.toolCallId, name: event.toolName });
-          break;
-        default:
-          break;
+            break;
+          case "tool_execution_start":
+            options.emit({ stream: "tool", phase: "start", runId, callId: event.toolCallId, name: event.toolName });
+            break;
+          case "tool_execution_update":
+            options.emit({ stream: "tool", phase: "update", runId, callId: event.toolCallId, name: event.toolName });
+            break;
+          case "tool_execution_end":
+            options.emit({ stream: "tool", phase: "end", runId, callId: event.toolCallId, name: event.toolName });
+            break;
+          default:
+            break;
+        }
+      });
+
+      try {
+        await agent.prompt(turnMessages[turnMessages.length - 1]!);
+      } catch (error) {
+        const thrownMessage = error instanceof Error ? error.message : String(error);
+        overWindow = parseContextWindowError(thrownMessage);
+        const normalized = normalizeModelError({ stopReason: "error", errorMessage: thrownMessage });
+        assistantFailure = {
+          status: "error",
+          message: normalized?.message ?? "回答生成失败，请重试。",
+        };
+      } finally {
+        clearTimeout(timeout);
+        activeRuns.delete(runId);
       }
-    });
+    }
 
     options.emit({ stream: "lifecycle", phase: "start", runId, sessionId });
+    await runTurn(llmMessages);
 
-    try {
-      await agent.prompt(questionMessage);
-    } catch (error) {
-      const thrownMessage = error instanceof Error ? error.message : String(error);
-      const normalized = normalizeModelError({ stopReason: "error", errorMessage: thrownMessage });
-      assistantFailure = {
-        status: "error",
-        message: normalized?.message ?? "回答生成失败，请重试。",
-      };
-    } finally {
-      clearTimeout(timeout);
-      activeRuns.delete(runId);
+    // 撞窗自愈（ADR 0010）：采纳 provider 报告的真实窗口（进程级全局生效，不写回用户配置），
+    // 强制压缩（绕过阈值与冷却）后当轮重答一次；再失败按普通错误收尾。
+    // 两轮之间不在 activeRuns 中，取消意图落在 cancelledBeforeStart，重答前后各消费一次。
+    if (assistantFailure?.status === "error" && overWindow) {
+      if (overWindow.reportedWindow) effectiveWindowOverride = overWindow.reportedWindow;
+      firstAgentCall = true;
+      assistantFailure = undefined;
+      overWindow = undefined;
+      assistantBodyStart = assistantBody.length;
+      const healed = await compactHistory(
+        sessionId,
+        fullHistory,
+        connection,
+        wrapStreamFnWithDiagnostics(() => makeStreamFn(connection), () => "compaction", collector, options.emit, startCallClock),
+        { force: true, systemPrompt, questionContent },
+      );
+      if (!cancelledBeforeStart.delete(runId)) {
+        const healedMessages = historyToLlmMessages(healed.history, {
+          question,
+          focus: focusWithContext,
+          attachments,
+          summary: healed.summary,
+          previousEvidence,
+        });
+        if (healedMessages[healedMessages.length - 1]) {
+          await runTurn(healedMessages);
+        }
+      } else {
+        assistantFailure = { status: "cancelled" };
+      }
     }
 
     if (assistantMessageId) {
@@ -584,6 +682,9 @@ export function createAgentHost(options: AgentHostOptions) {
         evidence: collectEvidence(),
       });
       if (finalized) {
+        if (!assistantFailure && lastAnswerInput > 0) {
+          store.saveSessionAnchor(sessionId, lastAnswerInput, connection.model, assistantMessageId);
+        }
         if (assistantFailure?.status !== "cancelled" && assistantBody) {
           await options.indexConversationMessage?.(bookId, {
             id: assistantMessageId,

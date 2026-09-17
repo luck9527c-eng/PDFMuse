@@ -43,7 +43,7 @@ npm run dev
 | 命令 | 说明 |
 | --- | --- |
 | `npm run dev` | 开发模式（vite + electron，需先跑过一次 `build`） |
-| `npm test` | 全量自动化测试（256 项，无需拉起 Electron） |
+| `npm test` | 全量自动化测试（270 项，无需拉起 Electron） |
 | `npm run typecheck` | 双 tsconfig 类型检查 |
 | `npm run build` | 生产构建（clean + typecheck + vite + 主进程 tsc） |
 | `npm run smoke:electron` | Electron 端到端冒烟测试 |
