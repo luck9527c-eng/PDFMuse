@@ -14,11 +14,8 @@
     "smoke:electron": "node scripts/smoke-electron.mjs",
     "prepare:mineru": "node scripts/prepare-mineru-runtime.mjs",
     "ab:mineru": "node scripts/ab-mineru.mjs",
-    "prepare:ocr": "node scripts/prepare-ocr-runtime.mjs",
-    "benchmark:ocr": "node scripts/benchmark-ocr.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
     "build": "npm run clean && npm run typecheck && vite build && tsc -p tsconfig.electron.json",
-    "package:portable": "npm run prepare:ocr && npm run build && electron-builder --win portable",
     "package:installer": "npm run prepare:mineru && npm run build && electron-builder --win nsis"
   },
   "dependencies": {
