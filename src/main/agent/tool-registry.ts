@@ -221,9 +221,9 @@ function createWebSearchTool(): RegisteredTool {
   };
 }
 
-/** read_pages 文本的模态声明：OCR/抽取无法保留二维结构，任何页都为真，无需检测公式。 */
+/** read_pages 文本的模态声明：MinerU 块级解析已按阅读顺序重建结构，但图片内容不可见。 */
 const OCR_MODALITY_NOTE =
-  "\n\n⚠ 本文本由 OCR/文本抽取生成：分数、根号、上下标等二维结构必然失真（如 ½ 会变成「1 2」），表格与图片内容常有缺失。凡需要精确复述、推导或计算公式，或发现文本明显断裂、缺失（如表格只剩零散数字），必须先用 read_page_image 查看原图。";
+  "\n\n⚠ 本文本由版面解析生成：正文与标题已按阅读顺序重建；扫描页的公式为 LaTeX 记法（如 \\frac{a}{b} 表示分式）、表格可能为 HTML 片段；插图内容不可见（仅保留占位）。凡需要核对图片、照片或原版式细节，先用 read_page_image 查看原图。";
 
 const readPageImageSchema = Type.Object({
   pages: Type.Array(Type.Integer({ minimum: 1 }), {

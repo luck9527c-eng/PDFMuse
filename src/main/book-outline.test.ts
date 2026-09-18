@@ -16,7 +16,8 @@ import {
   type TocRow,
 } from "./book-outline.js";
 import type { BookOutlineNode } from "../shared/contracts.js";
-import { createOcrModule, type OcrEngine } from "./ocr.js";
+import { createOcrModule } from "./ocr.js";
+import type { MineruEngine } from "./mineru.js";
 
 const BOOK_ID = "a".repeat(64);
 const NAVIGATION_FIXTURE = path.resolve(import.meta.dirname, "fixtures/navigation.pdf");
@@ -135,26 +136,26 @@ describe("book outline", () => {
   it("assembles the outline from ai entries and body anchors", async () => {
     closeOcr?.();
     // p.1 是印刷目录页（同名列出章节），p.2/p.3 是正文真标题页。
-    const engine: OcrEngine = {
+    const engine: MineruEngine = {
       name: "测试 OCR",
       model: "测试模型",
-      async recognize(input) {
+      async recognizePage(input) {
         const heading = input.page === 1 ? "第一章 扫描内容" : input.page === 2 ? "第一章 扫描内容" : "1.1 识别小节";
         return {
-          width: input.width,
-          height: input.height,
-          orientation: 0,
-          lines: [
-            { text: heading, confidence: 0.98, polygon: [{ x: 10, y: 10 }, { x: 300, y: 10 }, { x: 300, y: 50 }, { x: 10, y: 50 }] },
-            { text: "这是扫描页正文。", confidence: 0.96, polygon: [{ x: 10, y: 100 }, { x: 300, y: 100 }, { x: 300, y: 118 }, { x: 10, y: 118 }] },
+          blocks: [
+            { type: "text", text: heading, bbox: [0.01, 0.01, 0.5, 0.05] },
+            { type: "text", text: "这是扫描页正文。", bbox: [0.01, 0.1, 0.5, 0.118] },
           ],
+          markdown: heading,
         };
       },
     };
-    const ocr = createOcrModule(dataHome, engine);
+    const ocr = createOcrModule(dataHome, engine, {
+      resolvePdfPath: (bookId) => (bookId === BOOK_ID ? { path: "C:/book.pdf", encrypted: false } : undefined),
+    });
     closeOcr = ocr.close;
     for (const page of [1, 2, 3]) {
-      await ocr.recognizePage({ bookId: BOOK_ID, page, imageData: "a", width: 600, height: 800 });
+      await ocr.recognizePage({ bookId: BOOK_ID, page });
     }
     const ai = aiOutlineDeps([
       { label: "第一章 扫描内容", level: 1, printedPage: 1 },
@@ -163,7 +164,7 @@ describe("book outline", () => {
     const outline = createBookOutlineModule(dataHome, {
       openDocument: documentSource([[], [], []]),
       aiOutline: ai.deps,
-      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.lines,
+      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
     });
     closeOutline = outline.close;
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));

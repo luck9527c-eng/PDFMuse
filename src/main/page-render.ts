@@ -1,7 +1,5 @@
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 
-import { OCR_RENDER_SCALE } from "../shared/ocr-config.js";
-
 /** 页面渲染产物：PNG base64 与像素尺寸。 */
 export type RenderedPageImage = { imageData: string; width: number; height: number };
 
@@ -36,11 +34,6 @@ export function createPageRenderer(loadBook: PageBookSource) {
   return {
     /** 渲染指定页为 PNG（base64）；视觉工具与目录 AI 按需传倍率。 */
     renderPage,
-
-    /** OCR 渲染：倍率固定为 OCR_RENDER_SCALE，与 OCR_INPUT_VERSION 的输入指纹同源；渲染端取图必须使用同一倍率。 */
-    async renderPageForOcr(bookId: string, pageNumber: number): Promise<RenderedPageImage> {
-      return renderPage(bookId, pageNumber, OCR_RENDER_SCALE);
-    },
   };
 }
 

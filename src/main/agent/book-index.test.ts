@@ -299,7 +299,7 @@ describe("book index", () => {
       getBookSource: (bookId) => library.getBookSource(bookId),
       readRecognizedLines: (bookId, page) => (
         bookId === opened.book.id && page === 1
-          ? [{ text: "扫描页独有的识别文本", confidence: 1, polygon: [] }]
+          ? [{ type: "text", text: "扫描页独有的识别文本", bbox: [0, 0, 1, 1] }]
           : undefined
       ),
     });

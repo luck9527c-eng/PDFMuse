@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useBookText } from "./use-book-text";
 import type { OpenedPdfBook, PDFMuseApi, RecognizedPageText } from "../shared/contracts";
-import { OCR_INPUT_VERSION } from "../shared/ocr-config";
+import { MINERU_INPUT_VERSION } from "../shared/mineru-config";
 import type { PdfViewerHandle } from "./pdf/PdfViewer";
 
 const BOOK: OpenedPdfBook = {
@@ -22,14 +22,11 @@ function recognized(page: number): RecognizedPageText {
   return {
     bookId: BOOK.id,
     page,
-    width: 100,
-    height: 100,
-    orientation: 0,
-    lines: [{ text: `第${page}页文字`, confidence: 0.9, polygon: [] }],
+    blocks: [{ type: "text", text: `第${page}页文字`, bbox: [0.1, 0.1, 0.9, 0.2] }],
     engine: "e",
     model: "m",
     inputHash: "h",
-    inputVersion: OCR_INPUT_VERSION,
+    inputVersion: MINERU_INPUT_VERSION,
     engineVersion: "1",
     createdAt: "2026-09-14T00:00:00.000Z",
   };
@@ -51,7 +48,6 @@ function Probe(props: ProbeProps) {
 function makeViewer(hasNativeText: (page: number) => Promise<boolean>): PdfViewerHandle {
   return {
     hasNativeText,
-    getPageImage: async () => ({ data: "aW1n", width: 10, height: 10 }),
   } as unknown as PdfViewerHandle;
 }
 
@@ -180,6 +176,6 @@ describe("useBookText", () => {
       ["embedding", 0],
     ]);
     const ocrJob = env.scheduled.find((job) => job.kind === "ocr");
-    expect(ocrJob).toMatchObject({ startPage: BOOK.currentPage, maxAttempts: 3, inputVersion: OCR_INPUT_VERSION });
+    expect(ocrJob).toMatchObject({ startPage: BOOK.currentPage, maxAttempts: 3, inputVersion: MINERU_INPUT_VERSION });
   });
 });

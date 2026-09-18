@@ -10,7 +10,8 @@ import { createSessionStore } from "./agent/session-store.js";
 import { createBackgroundJobModule } from "./background-jobs.js";
 import { createBookOutlineModule } from "./book-outline.js";
 import { createLibraryModule } from "./library.js";
-import { createOcrModule, type OcrEngine } from "./ocr.js";
+import { createOcrModule } from "./ocr.js";
+import type { MineruEngine } from "./mineru.js";
 
 const workspaces: string[] = [];
 const fixturePath = path.resolve("data", "qa-sample.pdf");
@@ -260,14 +261,16 @@ describe("Library Module", () => {
     const bookId = opened.book.id;
     const sessionStore = createSessionStore(dataHome);
     const bookIndex = createBookIndex(dataHome, { getBookSource: (id) => library.getBookSource(id) });
-    const ocrEngine: OcrEngine = {
+    const ocrEngine: MineruEngine = {
       name: "测试引擎",
       model: "测试模型",
-      async recognize(input) {
-        return { width: input.width, height: input.height, orientation: 0, lines: [] };
+      async recognizePage() {
+        return { blocks: [], markdown: "" };
       },
     };
-    const ocr = createOcrModule(dataHome, ocrEngine);
+    const ocr = createOcrModule(dataHome, ocrEngine, {
+      resolvePdfPath: (id) => (id === bookId ? { path: sourcePath, encrypted: false } : undefined),
+    });
     const outline = createBookOutlineModule(dataHome, {
       openDocument: async () => ({ pageCount: 1, hasValidEmbeddedOutline: false, getNativeLines: async () => [], close: async () => undefined }),
     });

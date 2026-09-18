@@ -9,7 +9,7 @@ import {
   type AiOutlineComplete,
   type AiOutlineEntry,
 } from "./agent/outline-ai.js";
-import type { BookOutlineNode, OcrPoint, RecognizedTextLine } from "../shared/contracts.js";
+import type { BookOutlineNode, MineruBlock } from "../shared/contracts.js";
 
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
 const OUTLINE_VERSION = 3;
@@ -390,13 +390,14 @@ export function assembleOutline(
   return { nodes: buildTocNodes(tocRows, offset, pageCount, anchors), strategy: "toc" };
 }
 
-function recognizedLines(lines: ReadonlyArray<RecognizedTextLine> | undefined): OutlineTextLine[] {
-  if (!lines || !Array.isArray(lines)) return [];
-  return lines.flatMap((line) => {
-    if (!line || typeof line.text !== "string" || !Array.isArray(line.polygon)) return [];
-    const ys = (line.polygon as OcrPoint[]).map((point) => point?.y).filter((y): y is number => typeof y === "number" && Number.isFinite(y));
-    if (ys.length < 3) return [];
-    return [{ text: line.text, size: Math.max(...ys) - Math.min(...ys), y: Math.min(...ys) }];
+function recognizedLines(blocks: ReadonlyArray<MineruBlock> | undefined): OutlineTextLine[] {
+  if (!blocks || !Array.isArray(blocks)) return [];
+  // 块级 bbox 为 0-1 归一化坐标；size/y 只在块间作相对比较，同页共享同一坐标系即可。
+  return blocks.flatMap((block) => {
+    if (!block || typeof block.text !== "string" || !Array.isArray(block.bbox) || block.bbox.length !== 4) return [];
+    const [x0, y0, x1, y1] = block.bbox;
+    if (![x0, y0, x1, y1].every((value) => typeof value === "number" && Number.isFinite(value))) return [];
+    return [{ text: block.text, size: y1 - y0, y: y0 }];
   });
 }
 
@@ -510,8 +511,8 @@ export function createBookOutlineModule(
     openDocument?: OpenOutlineDocument;
     aiOutline?: BookOutlineAiDeps;
     onOutlineChange?: (bookId: string) => void;
-    /** Recognized Text 行最小读接口（recognized_pages 表属 OCR）：原生文本不足时取识别行。 */
-    readRecognizedLines?(bookId: string, page: number): ReadonlyArray<RecognizedTextLine> | undefined;
+    /** Recognized Text 块最小读接口（recognized_pages 表属 OCR 模块）：原生文本不足时取识别块。 */
+    readRecognizedLines?(bookId: string, page: number): ReadonlyArray<MineruBlock> | undefined;
   } = {},
 ) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));

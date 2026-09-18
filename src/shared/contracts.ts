@@ -249,19 +249,11 @@ export type BookContext = {
   title: string;
 };
 
-export type OcrPoint = { x: number; y: number };
-export type RecognizedTextLine = {
-  text: string;
-  confidence: number;
-  polygon: OcrPoint[];
-};
 export type RecognizedPageText = {
   bookId: string;
   page: number;
-  width: number;
-  height: number;
-  orientation: number;
-  lines: RecognizedTextLine[];
+  /** 块级识别结果：文本/标题块的 text 为纯文本，公式块为无定界符 LaTeX，图片块可为空。 */
+  blocks: MineruBlock[];
   engine: string;
   model: string;
   inputHash: string;
@@ -272,9 +264,6 @@ export type RecognizedPageText = {
 export type OcrPageRequest = {
   bookId: string;
   page: number;
-  imageData: string;
-  width: number;
-  height: number;
 };
 export type OcrPageResult =
   | { ok: true; page: RecognizedPageText }

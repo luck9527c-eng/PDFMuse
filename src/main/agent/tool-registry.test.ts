@@ -58,7 +58,7 @@ describe("tool registry", () => {
     const result = await tool.execute("call-note-1", { pages: [1] });
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain("read_page_image");
-    expect(text).toContain("二维结构必然失真");
+    expect(text).toContain("版面解析生成");
   });
 
   it("returns rendered page images as image content blocks via read_page_image", async () => {

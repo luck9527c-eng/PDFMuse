@@ -7,16 +7,12 @@ import { mountRecognizedTextLayer } from "./ocr-text-layer";
 const recognizedPage: RecognizedPageText = {
   bookId: "a".repeat(64),
   page: 2,
-  width: 1000,
-  height: 1500,
-  orientation: 0,
-  lines: [{
-    text: "可选择文字",
-    confidence: 0.98,
-    polygon: [{ x: 100, y: 200 }, { x: 500, y: 200 }, { x: 500, y: 260 }, { x: 100, y: 260 }],
-  }],
+  blocks: [
+    { type: "text", text: "可选择文字", bbox: [0.1, 0.2, 0.5, 0.26] },
+    { type: "equation", text: "y = x", bbox: [0.35, 0.3, 0.54, 0.35] },
+  ],
   engine: "测试引擎",
-  model: "测试模型",
+  model: "basic",
   inputHash: "b".repeat(64),
   engineVersion: "1",
   createdAt: new Date(0).toISOString(),
@@ -33,7 +29,11 @@ describe("OCR text layer", () => {
     viewer.appendChild(page);
 
     expect(mountRecognizedTextLayer(viewer, recognizedPage)).toBe(true);
-    expect(page.querySelector(".ocr-text-layer span")?.textContent).toBe("可选择文字");
+    const spans = page.querySelectorAll(".ocr-text-layer span");
+    expect(spans).toHaveLength(2);
+    expect(spans[0]?.textContent).toBe("可选择文字");
+    expect((spans[0] as HTMLElement).style.left).toBe("10%");
+    expect((spans[0] as HTMLElement).style.top).toBe("20%");
     expect(mountRecognizedTextLayer(viewer, recognizedPage)).toBe(true);
     expect(page.querySelectorAll(".ocr-text-layer")).toHaveLength(1);
   });

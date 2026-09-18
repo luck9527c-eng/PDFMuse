@@ -18,7 +18,8 @@ import { buildAiOutlineCompleter } from "./agent/outline-ai.js";
 import { createSessionStore } from "./agent/session-store.js";
 import { createToolRegistry } from "./agent/tool-registry.js";
 import { createWebSearchModule } from "./agent/web-search.js";
-import { createOcrModule, createWorkerOcrEngine } from "./ocr.js";
+import { createOcrModule } from "./ocr.js";
+import { createWorkerMineruEngine } from "./mineru.js";
 import { createPageRenderer } from "./page-render.js";
 import { createBackgroundJobModule } from "./background-jobs.js";
 import { createRecognizedTextIngestion } from "./recognized-text-ingestion.js";
@@ -41,7 +42,7 @@ import type {
   TestModelConnectionInput,
 } from "../shared/contracts.js";
 import { resolveModelContextWindow } from "../shared/contracts.js";
-import { OCR_ENGINE_VERSION, OCR_INPUT_VERSION, OCR_MODEL } from "../shared/ocr-config.js";
+import { MINERU_ENGINE_VERSION, MINERU_INPUT_VERSION, MINERU_MODEL } from "../shared/mineru-config.js";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 let startupPreflight: StartupPreflight;
@@ -125,13 +126,19 @@ app.whenReady().then(async () => {
     const configPath = path.join(startupPreflight.dataHome, "config.json");
     const readerProfile = createReaderProfileModule(startupPreflight.dataHome);
     const appearanceSettings = createAppearanceSettingsModule(startupPreflight.dataHome);
-    const ocr = createOcrModule(startupPreflight.dataHome, createWorkerOcrEngine({
-      command: path.join(applicationDirectory(), "resources", "ocr-runtime", process.platform === "win32" ? "python.exe" : "python"),
-      args: [path.join(applicationDirectory(), "resources", "ocr-worker", "rapidocr_worker.py")],
-      model: OCR_MODEL,
-      inputVersion: OCR_INPUT_VERSION,
-      engineVersion: OCR_ENGINE_VERSION,
-    }));
+    const ocr = createOcrModule(startupPreflight.dataHome, createWorkerMineruEngine({
+      command: path.join(applicationDirectory(), "resources", "mineru-runtime", process.platform === "win32" ? "python.exe" : "python"),
+      args: [path.join(applicationDirectory(), "resources", "mineru-worker", "mineru_worker.py")],
+      mineruHome: path.join(applicationDirectory(), "resources", "mineru-runtime", "home"),
+      model: MINERU_MODEL,
+      inputVersion: MINERU_INPUT_VERSION,
+      engineVersion: MINERU_ENGINE_VERSION,
+    }), {
+      resolvePdfPath: (bookId) => {
+        const source = library.getBookSource(bookId);
+        return source ? { path: source.path, encrypted: Boolean(source.savedPassword) } : undefined;
+      },
+    });
     closeOcr = ocr.close;
     // 会话检索读接口晚接（会话存储在检索模块之后创建），与 getEmbeddingProvider 同为懒取。
     let searchConversationMessages: ((bookId: string, likePattern: string) => Array<{ id: string; body: string }>) | undefined;
@@ -151,7 +158,7 @@ app.whenReady().then(async () => {
         };
       },
       getBookSource: (bookId) => library.getBookSource(bookId),
-      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.lines,
+      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
       getConversationSearch: () => searchConversationMessages,
     });
     closeBookIndex = bookIndex.close;
@@ -174,7 +181,7 @@ app.whenReady().then(async () => {
         : undefined;
     };
     const bookOutline = createBookOutlineModule(startupPreflight.dataHome, {
-      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.lines,
+      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
       aiOutline: {
         renderPage: pageRenderer.renderPage,
         complete: buildAiOutlineCompleter({ loadConnection: loadChatConnection }),
@@ -226,11 +233,10 @@ app.whenReady().then(async () => {
         for (let index = completed; index < pages.length; index += 1) {
           const page = pages[index]!;
           if (context.signal.aborted) throw new Error("OCR 任务已暂停或取消。");
-          if (!ocr.isPageCompatible(job.bookId, page, OCR_ENGINE_VERSION, OCR_MODEL, OCR_INPUT_VERSION)) {
-            const image = await pageRenderer.renderPageForOcr(job.bookId, page);
-            const result = await ocr.recognizePage({ bookId: job.bookId, page, ...image }, context.signal);
+          if (!ocr.isPageCompatible(job.bookId, page, MINERU_ENGINE_VERSION, MINERU_MODEL, MINERU_INPUT_VERSION)) {
+            const result = await ocr.recognizePage({ bookId: job.bookId, page }, context.signal);
             if (!result.ok) throw new Error(result.message);
-            await ingestion.ingestRecognizedPage(job.bookId, page, result.page.lines, "background");
+            await ingestion.ingestRecognizedPage(job.bookId, page, result.page.blocks, "background");
           }
           context.checkpoint(ingestion.encodeOcrCheckpoint(focusPage, index + 1), index + 1, book.pageCount);
         }
@@ -430,7 +436,7 @@ app.whenReady().then(async () => {
       if (!isOwnedBook(value.bookId)) return { ok: false, code: "VALIDATION_ERROR", message: "当前 PDF 书籍不可用。" };
       const result = await ocr.recognizePage(input as Parameters<typeof ocr.recognizePage>[0]);
       if (result.ok) {
-        await ingestion.ingestRecognizedPage(result.page.bookId, result.page.page, result.page.lines, "interactive");
+        await ingestion.ingestRecognizedPage(result.page.bookId, result.page.page, result.page.blocks, "interactive");
       }
       return result;
     });

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { OpenedPdfBook, OcrPageResult, RecognizedPageText, StartupPreflight } from "../shared/contracts";
-import { OCR_INPUT_VERSION, OCR_RENDER_SCALE } from "../shared/ocr-config";
+import { MINERU_INPUT_VERSION } from "../shared/mineru-config";
 import type { PdfViewerHandle } from "./pdf/PdfViewer";
 
 const PREFETCH_DELAY_MS = 250;
@@ -53,7 +53,7 @@ export function useBookText(options: {
       await api.scheduleBackgroundJob({ bookId: book.id, kind: "outline", priority: 5, total: book.pageCount });
       const preflight = await loadStartupPreflight();
       if (preflight?.ok && !ocrResourcesMissing(preflight)) {
-        await api.scheduleBackgroundJob({ bookId: book.id, kind: "ocr", priority: 20, total: book.pageCount, maxAttempts: 3, inputVersion: OCR_INPUT_VERSION, startPage: book.currentPage });
+        await api.scheduleBackgroundJob({ bookId: book.id, kind: "ocr", priority: 20, total: book.pageCount, maxAttempts: 3, inputVersion: MINERU_INPUT_VERSION, startPage: book.currentPage });
       }
       const embedding = await api.getEmbeddingConnection();
       if (embedding.baseUrl && embedding.model) {
@@ -69,20 +69,13 @@ export function useBookText(options: {
     const request = (async (): Promise<OcrPageResult> => {
       if (!window.pdfMuse) return { ok: false, code: "UNAVAILABLE", message: "文字识别功能不可用。" };
       const cached = await window.pdfMuse.getRecognizedPage(targetBook.id, targetPage);
-      if (cached?.inputVersion === OCR_INPUT_VERSION) return { ok: true, page: cached };
-      const image = await viewer.current?.getPageImage(targetPage, OCR_RENDER_SCALE);
-      if (!image) return { ok: false, code: "FAILED", message: "当前页面尚未准备好，请稍后重试。" };
-      return window.pdfMuse.recognizePage({
-        bookId: targetBook.id,
-        page: targetPage,
-        imageData: image.data,
-        width: image.width,
-        height: image.height,
-      });
+      if (cached?.inputVersion === MINERU_INPUT_VERSION) return { ok: true, page: cached };
+      // MinerU 按页直读 PDF 原文件，渲染端不再需要先送页面图像。
+      return window.pdfMuse.recognizePage({ bookId: targetBook.id, page: targetPage });
     })().finally(() => requestsRef.current.delete(key));
     requestsRef.current.set(key, request);
     return request;
-  }, [viewer]);
+  }, []);
 
   // 当前页静默确保：无原生文本才识别；完成后空闲预取相邻页。
   // renderRevision 来自 ViewerState（pdfjs 重渲染的单一事实源），页面重绘后复查恢复文字层。

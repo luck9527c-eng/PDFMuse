@@ -20,11 +20,11 @@ import {
 } from "./config-store.js";
 import type { StartupPreflight } from "../shared/contracts.js";
 import {
-  OCR_ENGINE,
-  OCR_ENGINE_VERSION,
-  OCR_MODEL,
-  OCR_REQUIRED_RESOURCE_PATHS,
-} from "../shared/ocr-config.js";
+  MINERU_ENGINE,
+  MINERU_ENGINE_VERSION,
+  MINERU_MODEL,
+  MINERU_REQUIRED_RESOURCE_PATHS,
+} from "../shared/mineru-config.js";
 
 const MINIMUM_FREE_BYTES = 256 * 1024 * 1024;
 const DATA_DIRECTORIES = ["logs", "cache", "books"];
@@ -81,9 +81,9 @@ export async function hashOcrResource(target: string) {
 }
 
 export async function hasOcrResources(applicationDirectory: string) {
-  const worker = path.join(applicationDirectory, "resources", "ocr-worker", "rapidocr_worker.py");
-  const runtime = path.join(applicationDirectory, "resources", "ocr-runtime", process.platform === "win32" ? "python.exe" : "python");
-  const manifestPath = path.join(applicationDirectory, "resources", "ocr-manifest.json");
+  const worker = path.join(applicationDirectory, "resources", "mineru-worker", "mineru_worker.py");
+  const runtime = path.join(applicationDirectory, "resources", "mineru-runtime", process.platform === "win32" ? "python.exe" : "python");
+  const manifestPath = path.join(applicationDirectory, "resources", "mineru-manifest.json");
 
   try {
     await Promise.all([access(worker, constants.R_OK), access(runtime, constants.X_OK)]);
@@ -96,16 +96,16 @@ export async function hasOcrResources(applicationDirectory: string) {
     };
     if (
       manifest.schemaVersion !== 1
-      || manifest.engine !== OCR_ENGINE
-      || manifest.engineVersion !== OCR_ENGINE_VERSION
-      || manifest.model !== OCR_MODEL
+      || manifest.engine !== MINERU_ENGINE
+      || manifest.engineVersion !== MINERU_ENGINE_VERSION
+      || manifest.model !== MINERU_MODEL
       || !Array.isArray(manifest.files)
-      || manifest.files.length !== OCR_REQUIRED_RESOURCE_PATHS.length
+      || manifest.files.length !== MINERU_REQUIRED_RESOURCE_PATHS.length
     ) return false;
     const entries = new Map(manifest.files.map((entry) => [entry.path, entry]));
-    if (entries.size !== OCR_REQUIRED_RESOURCE_PATHS.length) return false;
+    if (entries.size !== MINERU_REQUIRED_RESOURCE_PATHS.length) return false;
     const resourcesRoot = path.resolve(applicationDirectory, "resources");
-    for (const resourcePath of OCR_REQUIRED_RESOURCE_PATHS) {
+    for (const resourcePath of MINERU_REQUIRED_RESOURCE_PATHS) {
       const entry = entries.get(resourcePath);
       if (!entry) return false;
       if (!entry.path || !entry.sha256) return false;
