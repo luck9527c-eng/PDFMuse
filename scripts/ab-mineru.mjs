@@ -68,6 +68,8 @@ const totalMs = Date.now() - t0;
 child.stdin.end();
 
 const ocrMs = pages.map((p) => p.ms);
+// markdown 里的公式/插图兜底图是内联 base64，对肉眼对比是纯噪声，压成占位符。
+const stripDataUriImages = (markdown) => markdown.replace(/!\[[^\]]*\]\(data:image\/[^)]+\)/g, "![插图/公式兜底图（省略）]()");
 const md = [
   `# MinerU basic 整书识别：extracted.pdf`,
   ``,
@@ -79,7 +81,7 @@ const md = [
   `- 说明：每页文本为 MinerU 官方 markdown 渲染输出（公式为 $...$/$$...$$ LaTeX、表格为 HTML/MD）`,
   ``,
   `---`,
-  ...pages.flatMap((p) => [``, `## 第 ${p.page} 页（${p.blocks.length} 块 · ${(p.ms / 1000).toFixed(1)}s）`, ``, p.markdown.trim()]),
+  ...pages.flatMap((p) => [``, `## 第 ${p.page} 页（${p.blocks.length} 块 · ${(p.ms / 1000).toFixed(1)}s）`, ``, stripDataUriImages(p.markdown).trim()]),
 ].join("\n");
 
 const mdPath = path.join(OUT_DIR, "extracted-baseline-mineru.md");
