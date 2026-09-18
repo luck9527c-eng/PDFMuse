@@ -61,7 +61,7 @@ if (parentPort) {
 
   port.on("message", (message: MineruWorkerRequest) => {
     if ("warmup" in message) {
-      try { startBridge(); } catch { /* Startup preflight reports unavailable resources. */ }
+      try { startBridge(); } catch { /* 启动预检会报告资源未安装。 */ }
       return;
     }
     if ("cancel" in message) {

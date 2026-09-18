@@ -73,7 +73,7 @@ export type BookIndexOptions = {
   /** 书目元数据最小读接口（library_books 表属 Library）：索引、检索与原文件加载经此取源。 */
   getBookSource?(bookId: string): BookSource | undefined;
   /** Recognized Text 行最小读接口（recognized_pages 表属 OCR）：原生文本不足时兜底取识别行。 */
-  readRecognizedLines?(bookId: string, page: number): ReadonlyArray<MineruBlock> | undefined;
+  readRecognizedBlocks?(bookId: string, page: number): ReadonlyArray<MineruBlock> | undefined;
   /** 会话检索最小读接口（会话表属会话存储）：懒取，组装根中会话存储晚于本模块创建。 */
   getConversationSearch?(): ((bookId: string, likePattern: string) => Array<{ id: string; body: string }>) | undefined;
 };
@@ -281,11 +281,11 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     return options.embeddingProvider ?? options.getEmbeddingProvider?.();
   }
 
-  /** 原生文本不足一页下限时，用 Recognized Text 行兜底（经 OCR 模块的读接口）。 */
+  /** 原生文本不足一页下限时，用 Recognized Text 块兜底（经 OCR 模块的读接口）。 */
   function recognizedPageText(bookId: string, page: number) {
-    const lines = options.readRecognizedLines?.(bookId, page);
-    if (!lines) return "";
-    return lines
+    const blocks = options.readRecognizedBlocks?.(bookId, page);
+    if (!blocks) return "";
+    return blocks
       .map((line) => (line && typeof line.text === "string" ? line.text : ""))
       .filter(Boolean)
       .join("\n")

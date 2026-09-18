@@ -512,7 +512,7 @@ export function createBookOutlineModule(
     aiOutline?: BookOutlineAiDeps;
     onOutlineChange?: (bookId: string) => void;
     /** Recognized Text 块最小读接口（recognized_pages 表属 OCR 模块）：原生文本不足时取识别块。 */
-    readRecognizedLines?(bookId: string, page: number): ReadonlyArray<MineruBlock> | undefined;
+    readRecognizedBlocks?(bookId: string, page: number): ReadonlyArray<MineruBlock> | undefined;
   } = {},
 ) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
@@ -658,7 +658,7 @@ export function createBookOutlineModule(
       for (let page = processedPages + 1; page <= document.pageCount; page += 1) {
         if (signal?.aborted) break;
         const native = await document.getNativeLines(page);
-        const ocr = recognizedLines(options.readRecognizedLines?.(bookId, page));
+        const ocr = recognizedLines(options.readRecognizedBlocks?.(bookId, page));
         const nativeTextLength = native
           .filter((line) => !/^(?:第?\s*\d+\s*页|page\s+\d+(?:\s+of\s+\d+)?|\d+)$/i.test(normalizeLabel(line.text)))
           .reduce((total, line) => total + normalizeLabel(line.text).length, 0);

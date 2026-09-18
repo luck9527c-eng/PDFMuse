@@ -124,11 +124,11 @@ describe("OCR module", () => {
   });
 
   it("deleteBookData 在给定连接上清掉本书识别页且不影响他书", async () => {
-    // 路径断言放宽为本测试的两个书源，第二本书走独立依赖。
+    // 两本书以 pdfPath 区分（请求已不含 bookId，引擎只认路径与页码）。
     const lenientEngine = fakeEngine({
       async recognizePage(input) {
-        expect([BOOK_ID, OTHER_BOOK_ID]).toContain(input.bookId);
-        return { blocks: [{ type: "text", text: input.bookId === BOOK_ID ? "本书" : "他书", bbox: [0, 0, 1, 1] }], markdown: "" };
+        expect(["C:/book.pdf", "C:/other.pdf"]).toContain(input.pdfPath);
+        return { blocks: [{ type: "text", text: input.pdfPath === "C:/book.pdf" ? "本书" : "他书", bbox: [0, 0, 1, 1] }], markdown: "" };
       },
     });
     const module = createOcrModule(dataHome, lenientEngine, fakeDeps());

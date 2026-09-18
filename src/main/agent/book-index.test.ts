@@ -297,7 +297,7 @@ describe("book index", () => {
     index.close();
     index = createBookIndex(dataHome, {
       getBookSource: (bookId) => library.getBookSource(bookId),
-      readRecognizedLines: (bookId, page) => (
+      readRecognizedBlocks: (bookId, page) => (
         bookId === opened.book.id && page === 1
           ? [{ type: "text", text: "扫描页独有的识别文本", bbox: [0, 0, 1, 1] }]
           : undefined

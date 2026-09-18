@@ -164,7 +164,7 @@ describe("book outline", () => {
     const outline = createBookOutlineModule(dataHome, {
       openDocument: documentSource([[], [], []]),
       aiOutline: ai.deps,
-      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
     });
     closeOutline = outline.close;
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));

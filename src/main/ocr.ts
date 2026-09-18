@@ -94,7 +94,7 @@ export function createOcrModule(
           && cached.inputVersion === (engine.inputVersion ?? "unknown")
         ) return { ok: true, page: cached };
         try {
-          const recognized = await engine.recognizePage({ bookId: input.bookId, page: input.page, pdfPath: source.path }, signal);
+          const recognized = await engine.recognizePage({ page: input.page, pdfPath: source.path }, signal);
           if (signal?.aborted) return { ok: false, code: "CANCELLED", message: "OCR 已取消。" };
           const page: RecognizedPageText = {
             bookId: input.bookId,

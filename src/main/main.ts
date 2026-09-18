@@ -158,7 +158,7 @@ app.whenReady().then(async () => {
         };
       },
       getBookSource: (bookId) => library.getBookSource(bookId),
-      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
       getConversationSearch: () => searchConversationMessages,
     });
     closeBookIndex = bookIndex.close;
@@ -181,7 +181,7 @@ app.whenReady().then(async () => {
         : undefined;
     };
     const bookOutline = createBookOutlineModule(startupPreflight.dataHome, {
-      readRecognizedLines: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
       aiOutline: {
         renderPage: pageRenderer.renderPage,
         complete: buildAiOutlineCompleter({ loadConnection: loadChatConnection }),
