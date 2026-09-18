@@ -280,6 +280,13 @@ export type OcrPageResult =
   | { ok: true; page: RecognizedPageText }
   | { ok: false; code: "VALIDATION_ERROR" | "UNAVAILABLE" | "FAILED" | "CANCELLED"; message: string };
 
+export type MineruBlock = { type: string; text: string; bbox: [number, number, number, number] };
+export type MineruPageRequest = { bookId: string; page: number; pdfPath: string };
+export type MineruPageData = { blocks: MineruBlock[]; markdown: string };
+export type MineruWorkerResponse =
+  | { id: string; ok: true; result: MineruPageData }
+  | { id: string; ok: false; message: string };
+
 export type BookOutlineNode = {
   id: string;
   label: string;

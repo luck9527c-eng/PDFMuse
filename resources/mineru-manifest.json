@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "engine": "MinerU",
+  "engineVersion": "4.0.2",
+  "runtime": "Python 3.11.9 + ONNX Runtime (MinerU basic)",
+  "model": "basic",
+  "files": [
+    {
+      "path": "mineru-runtime",
+      "sha256": "cea18056c08610086919e9e0c04d891f0bde04b2137dba269021b9caae14c7e3"
+    },
+    {
+      "path": "mineru-worker/mineru_worker.py",
+      "sha256": "76587143486a5bae27f0d532be6a6d1ae86eb900ef2174550eb8a19fa87c9d17"
+    }
+  ]
+}
