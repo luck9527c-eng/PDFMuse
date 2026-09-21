@@ -53,4 +53,6 @@ export { validateToolArguments, validateToolCall } from "../../../vendor/opencla
 export {
   estimateStringChars,
   estimateTokensFromChars,
+  CHARS_PER_TOKEN_ESTIMATE,
 } from "../../../vendor/openclaw-agent-core/packages/normalization-core/src/cjk-chars.js";
+export { IMAGE_BLOCK_TOKENS } from "../../../vendor/openclaw-agent-core/packages/agent-core/src/index.js";

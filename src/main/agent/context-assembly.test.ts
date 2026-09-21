@@ -114,4 +114,55 @@ describe("context assembly replay", () => {
     const toolResult = messages[2] as ToolResultMessage;
     expect(toolResult.content.filter((block) => block.type === "image")).toHaveLength(1);
   });
+
+  it("applies the elision projection deterministically (T47)", async () => {
+    const history = [
+      message("reader", "r1", "第一问"),
+      message("assistant", "r1", "第一答"),
+      message("reader", "r2", "第二问"),
+      message("assistant", "r2", "第二答"),
+    ];
+    const toolCalls: PersistedToolCall[] = [
+      // 尾内（r2 保留）超大行：即便在保留尾内也投影占位（优先于末轮强制完整）。
+      row({ runId: "r2", callId: "c-big", resultText: "长文本".repeat(700), title: "读取页面" }),
+      // 尾外普通行：原文超 200 字符 → 占位。
+      row({ runId: "r1", callId: "c-old", resultText: "旧检索".repeat(100), title: "检索本书" }),
+    ];
+    const elision = {
+      retainedRunIds: new Set(["r2"]),
+      oversizedRowTokenThreshold: 2_000,
+    };
+
+    const first = await buildReplayMessages({ history, toolCalls, loadImage: async () => "aW1n", elision });
+    const second = await buildReplayMessages({ history, toolCalls, loadImage: async () => "aW1n", elision });
+    // 投影纯函数：同库状态同字节。
+    expect(JSON.stringify(first)).toBe(JSON.stringify(second));
+
+    const roles = first.map((item) => item.role);
+    expect(roles).toEqual(["user", "assistant", "toolResult", "assistant", "user", "assistant", "toolResult", "assistant"]);
+
+    // 尾外普通行被占位。
+    const elided = first[2] as ToolResultMessage;
+    expect(elided.isError).toBe(false);
+    expect(elided.content).toEqual([{ type: "text", text: "此前 检索本书 结果约 300 字符，已省略" }]);
+    // 尾内超大行：占位且带重取指引语义的模板不适用（文本类）。
+    const oversized = first[6] as ToolResultMessage;
+    expect(oversized.content).toEqual([{ type: "text", text: `此前 读取页面 结果约 ${"长文本".repeat(700).length} 字符，已省略` }]);
+  });
+
+  it("keeps small tail-external rows verbatim under elision (T47)", async () => {
+    const history = [message("reader", "r1", "第一问"), message("assistant", "r1", "第一答")];
+    const toolCalls: PersistedToolCall[] = [
+      row({ runId: "r1", callId: "c1", resultText: "短结果", title: "检索本书" }),
+    ];
+    const messages = await buildReplayMessages({
+      history,
+      toolCalls,
+      loadImage: async () => "aW1n",
+      elision: { retainedRunIds: new Set<string>(), oversizedRowTokenThreshold: 2_000 },
+    });
+    // ≤200 字符的尾外行：占位比原文长，没有收益 → 原文保留。
+    const toolResult = messages[2] as ToolResultMessage;
+    expect(toolResult.content).toEqual([{ type: "text", text: "短结果" }]);
+  });
 });

@@ -1,4 +1,11 @@
 import type { AgentImageAttachment, BookContext, ConversationMessage, ReadingFocus } from "../../shared/contracts.js";
+import {
+  estimateStringChars,
+  estimateTokens,
+  estimateTokensFromChars,
+  CHARS_PER_TOKEN_ESTIMATE,
+  IMAGE_BLOCK_TOKENS,
+} from "./openclaw-core.js";
 import type { AssistantMessage, ImageContent, Message, SessionTreeEntry, TextContent, ToolResultMessage, UserMessage } from "./openclaw-core.js";
 import type { PersistedToolCall } from "./session-store.js";
 
@@ -20,6 +27,114 @@ const PROFILE_BUDGET = 2_000;
 export type ReplayImageLoader = (relativePath: string) => Promise<string | null>;
 
 export const estimatingImageLoader: ReplayImageLoader = async () => "estimate";
+
+/** elision 投影参数（T47）：保留尾 run 集合 + 尾内超大行阈值（token）。 */
+export type ElisionProjection = {
+  retainedRunIds: ReadonlySet<string>;
+  oversizedRowTokenThreshold: number;
+};
+
+/** 单行结果 token 折算：文本按 CJK 启发式、图片块按 vendored 固定 2000 token 记账（mediaPath 损坏按纯文本）。 */
+export function estimateToolRowTokens(row: PersistedToolCall): number {
+  let chars = estimateStringChars(row.resultText);
+  if (row.mediaPath) {
+    try {
+      const media = JSON.parse(row.mediaPath) as Array<{ page: number; path: string }>;
+      if (Array.isArray(media)) chars += media.length * IMAGE_BLOCK_TOKENS * CHARS_PER_TOKEN_ESTIMATE;
+    } catch {
+      // mediaPath 损坏按纯文本记账。
+    }
+  }
+  return estimateTokensFromChars(chars);
+}
+
+function mediaPages(row: PersistedToolCall): number[] {
+  if (!row.mediaPath) return [];
+  try {
+    const media = JSON.parse(row.mediaPath) as Array<{ page: number; path: string }>;
+    return Array.isArray(media) ? media.map((item) => item.page).filter((page) => typeof page === "number") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 占位文案只依赖行自身字段（spec 4）：同库状态同字节，图片行附重取指引。 */
+export function elisionPlaceholderText(row: PersistedToolCall): string {
+  const pages = mediaPages(row);
+  if (pages.length > 0) return `第 ${pages.join("、")} 页原图已省略，如需查看可调用 read_page_image 重新获取。`;
+  return `此前 ${row.title} 结果约 ${row.resultText.length} 字符，已省略`;
+}
+
+/**
+ * elision 决策（T47，纯函数）：尾内超大行（> 阈值 token）一律占位——优先于「最近一轮强制完整」，
+ * 堵小窗口死锁；尾外行结果文本超 200 字符占位（≤200 占位比原文长，没有收益）。
+ */
+export function elideToolRow(row: PersistedToolCall, elision: ElisionProjection): boolean {
+  if (estimateToolRowTokens(row) > elision.oversizedRowTokenThreshold) return true;
+  return !elision.retainedRunIds.has(row.runId) && row.resultText.length > 200;
+}
+
+/**
+ * 保留尾（spec 3.3）：最后一轮强制完整，由此向前按 token 预算凑整轮。
+ * 纯函数——同库状态同结果；elision 边界只随新 run 落库确定性前移。
+ */
+export function resolveRetainedRunIds(input: {
+  history: ReadonlyArray<ConversationMessage>;
+  toolCalls: ReadonlyArray<PersistedToolCall>;
+  tokenBudget: number;
+}): Set<string> {
+  const runOrder: string[] = [];
+  const tokensByRun = new Map<string, number>();
+  const rowsByRun = new Map<string, PersistedToolCall[]>();
+  for (const row of input.toolCalls) {
+    const list = rowsByRun.get(row.runId);
+    if (list) list.push(row);
+    else rowsByRun.set(row.runId, [row]);
+  }
+  for (const message of input.history) {
+    if (!tokensByRun.has(message.runId)) {
+      tokensByRun.set(message.runId, 0);
+      runOrder.push(message.runId);
+    }
+    const llm = message.role === "assistant"
+      ? assistantReplayMessage(message.body)
+      : ({ role: "user", content: message.body, timestamp: 0 } satisfies UserMessage);
+    tokensByRun.set(message.runId, (tokensByRun.get(message.runId) ?? 0) + estimateTokens(llm));
+  }
+  for (const [runId, rows] of rowsByRun) {
+    const total = rows.reduce((sum, row) => sum + estimateToolRowTokens(row), 0);
+    tokensByRun.set(runId, (tokensByRun.get(runId) ?? 0) + total);
+  }
+  const retained = new Set<string>();
+  let accumulated = 0;
+  for (let index = runOrder.length - 1; index >= 0; index -= 1) {
+    const runId = runOrder[index]!;
+    retained.add(runId);
+    accumulated += tokensByRun.get(runId) ?? 0;
+    if (accumulated >= input.tokenBudget) break;
+  }
+  return retained;
+}
+
+/**
+ * 锚点分支的 elision 扣减（spec 3.5）：锚点请求含旧 run 的全量工具结果，投影替换为占位后，
+ * 判定值须扣回「原文 token − 占位 token」差值——否则投影省下的空间永远反映不到锚点口径，
+ * 第二段压缩照常触发、两段式落空。
+ */
+export function computeElisionDeduction(input: {
+  toolCalls: ReadonlyArray<PersistedToolCall>;
+  anchorRunIds: ReadonlySet<string>;
+  elision: ElisionProjection;
+}): number {
+  let deduction = 0;
+  for (const row of input.toolCalls) {
+    if (!input.anchorRunIds.has(row.runId)) continue;
+    if (!elideToolRow(row, input.elision)) continue;
+    const placeholderTokens = estimateTokensFromChars(estimateStringChars(elisionPlaceholderText(row)));
+    deduction += estimateToolRowTokens(row) - placeholderTokens;
+  }
+  return deduction;
+}
 
 function boundedFact(value: string, maxLength: number) {
   return value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, maxLength);
@@ -131,6 +246,8 @@ export type CurrentTurnInput = {
   summary?: string;
   /** 媒体文件加载器（T45）：读 media 相对路径返回 base64，缺失返回 null 降级为占位文本。 */
   loadImage: ReplayImageLoader;
+  /** elision 投影（T47）：缺省 = 全量回放（仅测试用；生产恒传）。 */
+  elision?: ElisionProjection;
 };
 
 function assistantReplayMessage(body: string): AssistantMessage {
@@ -184,7 +301,7 @@ async function toolResultContent(row: PersistedToolCall, loadImage: ReplayImageL
  * assistant 消息（Anthropic 不接受连续 assistant 轮次），后跟各自的 toolResult
  * （anthropic 适配器会把连续 toolResult 合并为单轮用户消息）。
  */
-async function synthesizeToolPairMessages(rows: PersistedToolCall[], loadImage: ReplayImageLoader): Promise<Message[]> {
+async function synthesizeToolPairMessages(rows: PersistedToolCall[], loadImage: ReplayImageLoader, elision?: ElisionProjection): Promise<Message[]> {
   const toolCallMessage: AssistantMessage = {
     role: "assistant",
     content: rows.map((row) => ({
@@ -202,6 +319,18 @@ async function synthesizeToolPairMessages(rows: PersistedToolCall[], loadImage: 
   };
   const messages: Message[] = [toolCallMessage];
   for (const row of rows) {
+    if (elision && elideToolRow(row, elision)) {
+      // 投影占位：原文与图块都不进上下文（spec 3.2），文字只依赖行自身字段。
+      messages.push({
+        role: "toolResult",
+        toolCallId: row.callId,
+        toolName: row.toolName,
+        content: [{ type: "text", text: elisionPlaceholderText(row) }],
+        isError: row.isError,
+        timestamp: 0,
+      } satisfies ToolResultMessage);
+      continue;
+    }
     messages.push({
       role: "toolResult",
       toolCallId: row.callId,
@@ -215,11 +344,12 @@ async function synthesizeToolPairMessages(rows: PersistedToolCall[], loadImage: 
 }
 
 /**
- * 压缩摘要输入用（T46）：把一次 run 的工具行合成为工具对消息，交给 vendored 序列化器
+ * 压缩摘要输入用（T46/T47）：把一次 run 的工具行合成为工具对消息，交给 vendored 序列化器
  * （toolResult 文本截 2000 字符、图片块替换为省略标记——故用估算 loader 即可，无需读文件）。
+ * 传入 elision 时被投影的行以占位进摘要（spec 3.2：序列化看到的是投影后形态）。
  */
-export async function synthesizeToolPairMessagesForSummary(rows: PersistedToolCall[]): Promise<Message[]> {
-  return synthesizeToolPairMessages(rows, estimatingImageLoader);
+export async function synthesizeToolPairMessagesForSummary(rows: PersistedToolCall[], elision?: ElisionProjection): Promise<Message[]> {
+  return synthesizeToolPairMessages(rows, estimatingImageLoader, elision);
 }
 
 /**
@@ -233,8 +363,9 @@ export async function buildReplayMessages(input: {
   history: ReadonlyArray<ConversationMessage>;
   toolCalls: ReadonlyArray<PersistedToolCall>;
   loadImage: ReplayImageLoader;
+  elision?: ElisionProjection;
 }): Promise<Message[]> {
-  const { history, toolCalls, loadImage } = input;
+  const { history, toolCalls, loadImage, elision } = input;
   const rowsByRun = new Map<string, PersistedToolCall[]>();
   for (const row of toolCalls) {
     const list = rowsByRun.get(row.runId);
@@ -251,7 +382,7 @@ export async function buildReplayMessages(input: {
     if (message.status !== "complete") continue;
     const rows = rowsByRun.get(message.runId);
     if (rows) {
-      messages.push(...(await synthesizeToolPairMessages(rows, loadImage)));
+      messages.push(...(await synthesizeToolPairMessages(rows, loadImage, elision)));
       rowsByRun.delete(message.runId);
     }
     messages.push(assistantReplayMessage(message.body));
@@ -267,13 +398,13 @@ export async function buildReplayMessages(input: {
 export async function historyToLlmMessages(
   history: ReadonlyArray<ConversationMessage>,
   toolCalls: ReadonlyArray<PersistedToolCall>,
-  { question, focus, attachments = [], summary, loadImage }: CurrentTurnInput,
+  { question, focus, attachments = [], summary, loadImage, elision }: CurrentTurnInput,
 ): Promise<Message[]> {
   const messages: Message[] = [];
   if (summary?.trim()) {
     messages.push({ role: "user", content: `【Conversation Summary】\n${summary.trim()}`, timestamp: 0 });
   }
-  messages.push(...(await buildReplayMessages({ history, toolCalls, loadImage })));
+  messages.push(...(await buildReplayMessages({ history, toolCalls, loadImage, elision })));
   const imageBlocks: ImageContent[] = attachments.map((attachment) => ({
     type: "image",
     data: attachment.data,

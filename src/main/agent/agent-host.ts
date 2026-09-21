@@ -17,10 +17,13 @@ import {
   buildQuestionContent,
   buildReplayMessages,
   buildSystemPrompt,
+  computeElisionDeduction,
   estimatingImageLoader,
   historyToLlmMessages,
+  resolveRetainedRunIds,
   synthesizeToolPairMessagesForSummary,
   toSessionEntries,
+  type ElisionProjection,
   type ReplayImageLoader,
 } from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, parseContextWindowError, toLlmModel, type ContextWindowError, type ResolvedModelConnection } from "./model-runtime.js";
@@ -275,6 +278,24 @@ export function createAgentHost(options: AgentHostOptions) {
     }
   }
 
+  /** 阈值基准（T36/T46）：连接窗口 + reserve + keepRecent 一并解析，压缩与保留尾共用同一口径。 */
+  function resolveEffectiveSettings(connection: ResolvedModelConnection) {
+    const contextWindow = injectedContextWindow
+      ?? effectiveWindowOverride
+      ?? connection.contextWindow
+      ?? DEFAULT_MODEL_CONTEXT_WINDOW;
+    const effectiveSettings: CompactionSettings = {
+      ...compactionSettings,
+      reserveTokens: options.compactionSettings?.reserveTokens
+        ?? (injectedContextWindow ? compactionSettings.reserveTokens : Math.round(contextWindow * 0.3)),
+    };
+    const keepRecentEffective = Math.max(
+      1,
+      Math.min(effectiveSettings.keepRecentTokens, contextWindow - effectiveSettings.reserveTokens - 1_000),
+    );
+    return { contextWindow, effectiveSettings, keepRecentEffective };
+  }
+
   async function compactHistory(
     sessionId: string,
     history: ConversationMessage[],
@@ -289,15 +310,11 @@ export function createAgentHost(options: AgentHostOptions) {
     const summaryMessage = previous?.summary
       ? [{ role: "user" as const, content: `【Conversation Summary】\n${previous.summary}`, timestamp: 0 }]
       : [];
-    // 阈值基准（T36/T37）：注入优先（测试/受限部署），其次撞窗自愈修正的真实窗口，再次连接配置，最后默认档。
-    const contextWindow = injectedContextWindow
-      ?? effectiveWindowOverride
-      ?? connection.contextWindow
-      ?? DEFAULT_MODEL_CONTEXT_WINDOW;
-    const effectiveSettings: CompactionSettings = {
-      ...compactionSettings,
-      reserveTokens: options.compactionSettings?.reserveTokens
-        ?? (injectedContextWindow ? compactionSettings.reserveTokens : Math.round(contextWindow * 0.3)),
+    const { contextWindow, effectiveSettings, keepRecentEffective } = resolveEffectiveSettings(connection);
+    // T47 elision 投影：保留尾外的旧行以占位进上下文（第一段），判定值按投影后口径计算。
+    const elision = {
+      retainedRunIds: resolveRetainedRunIds({ history, toolCalls, tokenBudget: keepRecentEffective }),
+      oversizedRowTokenThreshold: Math.max(2_000, Math.floor(contextWindow * 0.25)),
     };
     // 判断值（ADR 0010）：真实 usage 锚点 + 落锚点后增量（锚点已含 system prompt，不重复计）；
     // 无锚点降级为字符估算，口径计入 system prompt 与当轮问题内容，与锚点口径对齐。
@@ -308,14 +325,19 @@ export function createAgentHost(options: AgentHostOptions) {
     const anchored = Boolean(anchor) && anchor!.model === connection.model && anchorIndex >= 0;
     let contextTokens: number;
     if (anchored && anchor) {
-      // 锚点增量（T45）：走回放装配管线，工具行按 `(created_at, seq)` 计入；锚点切片从下一 run 起始，
-      // buildReplayMessages 按 run 自过滤工具行。图片按固定 2000 token 记账（估算不读文件）。
+      // 锚点增量（T45/T47）：走 elision 后的回放装配，工具行按 `(created_at, seq)` 计入；
+      // 锚点切片从下一 run 起始。锚点覆盖区间内被投影占位的行按「原文 − 占位」扣回（spec 3.5）——
+      // 没有扣减项，投影省下的空间反映不到锚点口径，两段式落空。
+      const anchorRunIds = new Set(history.slice(0, anchorIndex + 1).map((message) => message.runId));
+      const elisionDeduction = computeElisionDeduction({ toolCalls, anchorRunIds, elision });
       const anchorDeltaMessages = await buildReplayMessages({
         history: history.slice(anchorIndex + 1),
         toolCalls,
         loadImage: estimatingImageLoader,
+        elision,
       });
       contextTokens = anchor.inputTokens
+        - elisionDeduction
         + anchorDeltaMessages.reduce((total, message) => total + estimateTokens(message), 0)
         + questionEstimate;
     } else {
@@ -323,6 +345,7 @@ export function createAgentHost(options: AgentHostOptions) {
         history: workingHistory,
         toolCalls,
         loadImage: estimatingImageLoader,
+        elision,
       });
       contextTokens = [...summaryMessage, ...workingReplay]
         .reduce((total, message) => total + estimateTokens(message), 0)
@@ -366,11 +389,7 @@ export function createAgentHost(options: AgentHostOptions) {
       ];
       boundaryStart = boundaryIndex + 2;
     }
-    // 小窗口防护（T46/spec 3.2）：保留尾预算不得吃掉摘要与回答的空间。
-    const keepRecentEffective = Math.max(
-      1,
-      Math.min(effectiveSettings.keepRecentTokens, contextWindow - effectiveSettings.reserveTokens - 1_000),
-    );
+    // 小窗口防护的 keepRecent 钳制已并入 resolveEffectiveSettings（T46）。
     const isRunStart = (entry: SessionTreeEntry | undefined) =>
       entry?.type === "message" && entry.message.role === "user";
     let firstKeptIndex: number;
@@ -411,7 +430,7 @@ export function createAgentHost(options: AgentHostOptions) {
       summarizedMessages.push(entry.message);
       if (entry.message.role === "user") {
         const rows = summarizedRowsByRun.get(runIdByMessageId.get(entry.id) ?? "");
-        if (rows) summarizedMessages.push(...(await synthesizeToolPairMessagesForSummary(rows)));
+        if (rows) summarizedMessages.push(...(await synthesizeToolPairMessagesForSummary(rows, elision)));
       }
     }
     const preparation: CompactionPreparation = {
@@ -441,8 +460,15 @@ export function createAgentHost(options: AgentHostOptions) {
     store.saveSummary(sessionId, compacted.summary, throughEntry.id);
     const nextHistory = history.slice(history.findIndex((message) => message.id === throughEntry.id) + 1);
     // 压缩后仍接近阈值 → 会话进入冷却递增档；降到阈值以下 → 归零。
-    // 判断值用纯估算（锚点描述的是压缩前的请求形状，头部重写后已过期），口径含 system prompt 与当轮问题。
-    const afterMessages = await buildReplayMessages({ history: nextHistory, toolCalls, loadImage: estimatingImageLoader });
+    // 判断值用纯估算（锚点描述的是压缩前的请求形状，头部重写后已过期），口径含 system prompt 与当轮问题，
+    // 按 elision 后的投影计算（T47）。
+    const afterRetainedRunIds = resolveRetainedRunIds({ history: nextHistory, toolCalls, tokenBudget: keepRecentEffective });
+    const afterMessages = await buildReplayMessages({
+      history: nextHistory,
+      toolCalls,
+      loadImage: estimatingImageLoader,
+      elision: { retainedRunIds: afterRetainedRunIds, oversizedRowTokenThreshold: elision.oversizedRowTokenThreshold },
+    });
     const afterTokens = estimateTokens({ role: "user", content: `【Conversation Summary】\n${compacted.summary}`, timestamp: 0 })
       + afterMessages.reduce((total, message) => total + estimateTokens(message), 0)
       + systemEstimate
@@ -487,6 +513,12 @@ export function createAgentHost(options: AgentHostOptions) {
     const toolCalls: PersistedToolCall[] = [];
     // T45：历史 run 的工具行（库内读取，按 `(created_at, seq)` 序）——回放装配与压缩估算的消费源。
     const historyToolCalls = store.listToolCalls(sessionId);
+    // T47：elision 投影——保留尾外的旧行以占位进上下文（第一段），判定值按投影后口径。
+    const { contextWindow, keepRecentEffective } = resolveEffectiveSettings(connection);
+    const elision: ElisionProjection = {
+      retainedRunIds: resolveRetainedRunIds({ history: fullHistory, toolCalls: historyToolCalls, tokenBudget: keepRecentEffective }),
+      oversizedRowTokenThreshold: Math.max(2_000, Math.floor(contextWindow * 0.25)),
+    };
     let activeCallStartedAt = 0;
     const startCallClock = () => { activeCallStartedAt = Date.now(); };
     // Reading Focus 增强前移到压缩之前：压缩判断值需要当轮问题内容与 system prompt 的估算。
@@ -566,6 +598,7 @@ export function createAgentHost(options: AgentHostOptions) {
       attachments,
       summary: compacted.summary,
       loadImage: replayImageLoader,
+      elision,
     });
     const questionMessage = llmMessages[llmMessages.length - 1];
     if (!questionMessage) return;
@@ -862,6 +895,7 @@ export function createAgentHost(options: AgentHostOptions) {
           attachments,
           summary: healed.summary,
           loadImage: replayImageLoader,
+          elision,
         });
         if (healedMessages[healedMessages.length - 1]) {
           await runTurn(healedMessages);

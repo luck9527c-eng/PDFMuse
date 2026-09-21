@@ -920,21 +920,25 @@ describe("agent host", () => {
     expect(JSON.stringify(fake.requests[0]!.context.messages)).not.toContain("上一轮回答引用的原文");
   });
 
-  it("counts persisted tool rows in the compaction threshold estimate (T45)", async () => {
+  it("counts in-tail tool rows toward the estimate and elides tail-external rows (T45/T47)", async () => {
     const sessionStore = createSessionStore(dataHome);
     const session = sessionStore.ensureSession(BOOK_ID);
-    // old-0 消息体加大：确保保留尾（keepRecentTokens 16）之外有可摘要内容，压缩不会 no-op。
-    sessionStore.appendMessage({ sessionId: session.id, runId: "old-0", role: "reader", body: `旧问题零 ${"内容".repeat(80)}`, status: "complete" });
-    sessionStore.appendMessage({ sessionId: session.id, runId: "old-0", role: "assistant", body: `旧回答零 ${"回答".repeat(80)}`, status: "complete" });
-    sessionStore.appendMessage({ sessionId: session.id, runId: "old-1", role: "reader", body: "旧问题一", status: "complete" });
-    sessionStore.appendMessage({ sessionId: session.id, runId: "old-1", role: "assistant", body: "旧回答一", status: "complete" });
-    // 大工具行挂在最早的 run 上：压缩时它进入被摘要区间。
+    // 旧 run：小工具行（≤200 字符）——尾外不投影，原文保留并进摘要输入。
+    sessionStore.appendMessage({ sessionId: session.id, runId: "old-0", role: "reader", body: "旧问题零", status: "complete" });
+    sessionStore.appendMessage({ sessionId: session.id, runId: "old-0", role: "assistant", body: "旧回答零", status: "complete" });
     sessionStore.finalizeRun({
       sessionId: session.id,
       runId: "old-0",
-      toolCalls: [
-        { runId: "old-0", callId: "big", toolName: "read_pages", title: "读取页面", argumentsJson: "{}", resultText: "长文本".repeat(400), status: "executed", isError: false },
-      ],
+      toolCalls: [{ runId: "old-0", callId: "small", toolName: "book_search", title: "检索本书", argumentsJson: "{}", resultText: "小结果原文", status: "executed", isError: false }],
+    });
+    // 最新 run：大工具行在保留尾内（末轮强制完整），按全量计入估算。
+    sessionStore.appendMessage({ sessionId: session.id, runId: "old-1", role: "reader", body: "旧问题一", status: "complete" });
+    const streaming = sessionStore.appendMessage({ sessionId: session.id, runId: "old-1", role: "assistant", body: "", status: "streaming" });
+    sessionStore.finalizeRun({
+      sessionId: session.id,
+      runId: "old-1",
+      toolCalls: [{ runId: "old-1", callId: "big", toolName: "read_pages", title: "读取页面", argumentsJson: "{}", resultText: "长文本".repeat(400), status: "executed", isError: false }],
+      message: { messageId: streaming.id, body: "旧回答一", status: "complete" },
     });
     sessionStore.close();
 
@@ -953,12 +957,99 @@ describe("agent host", () => {
     await startRun("估算问题");
     await waitFor(() => lifecyclePhase(events).includes("end"));
 
-    // 消息本体远低于 700 阈值；2400 字符的工具行使无锚点估算越线 → 压缩触发（T45 前工具行不计数）。
+    // 消息本体远低于 700 阈值；保留尾内 1200 token 的大行计入估算 → 越线触发压缩（T45 前工具行不计数）。
     expect(calls).toBeGreaterThan(1);
-    // T46：摘要输入包含被摘要 run 的工具结果原文（压缩摘要失真修复）。
-    expect(JSON.stringify(fake.requests[0]?.context.messages)).toContain("长文本");
+    // 摘要输入：被摘要 run 的小工具行原文逐字保留（≤200 尾外不投影）。
+    expect(JSON.stringify(fake.requests[0]?.context.messages)).toContain("小结果原文");
+    // 大行在保留尾内，不进摘要区间。
+    expect(JSON.stringify(fake.requests[0]?.context.messages)).not.toContain("长文本");
+    // 回答请求：保留尾内大行原文完整（不投影）。
+    expect(JSON.stringify(fake.requests.at(-1)?.context.messages)).toContain("长文本");
     const persisted = createSessionStore(dataHome);
     expect(persisted.getSummary(persisted.findSession(BOOK_ID)!.id)).toBeTruthy();
+    persisted.close();
+  });
+
+  it("elides an oversized tail row so a small-window session answers without compaction thrash (T47)", async () => {
+    // 死锁场景（spec 3.2 规则 2）：单 run 历史加超大工具行——run 原子性下无可摘要区间，
+    // 旧行为会把全量行留上下文并反复触发无果压缩；投影后行被占位，判定值直接落到阈值下。
+    const sessionStore = createSessionStore(dataHome);
+    const session = sessionStore.ensureSession(BOOK_ID);
+    sessionStore.appendMessage({ sessionId: session.id, runId: "only", role: "reader", body: "唯一一问", status: "complete" });
+    const streaming = sessionStore.appendMessage({ sessionId: session.id, runId: "only", role: "assistant", body: "", status: "streaming" });
+    sessionStore.finalizeRun({
+      sessionId: session.id,
+      runId: "only",
+      toolCalls: [{ runId: "only", callId: "huge", toolName: "read_pages", title: "读取页面", argumentsJson: "{}", resultText: "长文本".repeat(800), status: "executed", isError: false }],
+      message: { messageId: streaming.id, body: "旧回答", status: "complete" },
+    });
+    sessionStore.close();
+
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("死锁回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 1_000 }),
+      compactionSettings: { keepRecentTokens: 16 },
+    });
+
+    await startRun("小窗口问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    // 尾内超大行被投影占位：判定值落到阈值下，一次压缩尝试都没有，回答照常。
+    expect(calls).toBe(1);
+    const requestText = JSON.stringify(fake.requests[0]?.context.messages);
+    expect(requestText).toContain("已省略");
+    expect(requestText).not.toContain("长文本");
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation.at(-1)?.status).toBe("complete");
+    expect(conversation.at(-1)?.body).toBe("死锁回答");
+    const persisted = createSessionStore(dataHome);
+    expect(persisted.getSummary(persisted.findSession(BOOK_ID)!.id)).toBeUndefined();
+    persisted.close();
+  });
+
+  it("deducts elided rows from the anchored threshold estimate (T47)", async () => {
+    const sessionStore = createSessionStore(dataHome);
+    const session = sessionStore.ensureSession(BOOK_ID);
+    sessionStore.appendMessage({ sessionId: session.id, runId: "old-0", role: "reader", body: "旧问题零", status: "complete" });
+    sessionStore.appendMessage({ sessionId: session.id, runId: "old-0", role: "assistant", body: "旧回答零", status: "complete" });
+    sessionStore.appendMessage({ sessionId: session.id, runId: "old-1", role: "reader", body: "旧问题一", status: "complete" });
+    const through = sessionStore.appendMessage({ sessionId: session.id, runId: "old-1", role: "assistant", body: "旧回答一", status: "complete" });
+    // 大行在锚点覆盖区间（old-0）：无锚点外推为 700 + 问题，恰好越线；扣减后落回阈值下。
+    sessionStore.finalizeRun({
+      sessionId: session.id,
+      runId: "old-0",
+      toolCalls: [{ runId: "old-0", callId: "big", toolName: "read_pages", title: "读取页面", argumentsJson: "{}", resultText: "长文本".repeat(600), status: "executed", isError: false }],
+    });
+    sessionStore.close();
+    const anchorStore = createSessionStore(dataHome);
+    anchorStore.saveSessionAnchor(session.id, 700, "test-model", through.id);
+    anchorStore.close();
+
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("扣减回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 1_000 }),
+      compactionSettings: { keepRecentTokens: 16 },
+    });
+
+    await startRun("扣减问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    // 无扣减：700 + 问题 > 700 会误触发压缩；有扣减：行被投影占位，判定值落回阈值下 → 只有回答调用。
+    expect(calls).toBe(1);
+    const persisted = createSessionStore(dataHome);
+    expect(persisted.getSummary(persisted.findSession(BOOK_ID)!.id)).toBeUndefined();
     persisted.close();
   });
 
