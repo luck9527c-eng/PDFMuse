@@ -497,12 +497,14 @@ describe("agent host", () => {
     expect(persisted.getSessionAnchor(persisted.findSession(BOOK_ID)!.id)).toMatchObject({ inputTokens: 500 });
     persisted.close();
 
-    // 生效窗口修正进程级全局：另一本书的历史（估算 ~6000）超过 8000×70%=5600 → 直接压缩。
-    // （两条消息：单条历史没有「保留尾部之前的头」，prepareCompaction 无摘要可做。）
+    // 生效窗口修正进程级全局：另一本书（两个完整 run，早 run 带大消息体）阈值估算越线 → 直接压缩。
+    // T46 run 粒度：单 run 历史无可整轮保留的摘要区间（正确 no-op），此处需要至少两个 run。
     const other = createSessionStore(dataHome);
     const otherSession = other.ensureSession(OTHER_BOOK_ID);
-    other.appendMessage({ sessionId: otherSession.id, runId: "o-1", role: "reader", body: `远超窗口 ${"内容".repeat(1500)}`, status: "complete" });
-    other.appendMessage({ sessionId: otherSession.id, runId: "o-1", role: "assistant", body: `远超回答 ${"回答".repeat(1500)}`, status: "complete" });
+    other.appendMessage({ sessionId: otherSession.id, runId: "o-0", role: "reader", body: `远超窗口 ${"内容".repeat(1500)}`, status: "complete" });
+    other.appendMessage({ sessionId: otherSession.id, runId: "o-0", role: "assistant", body: `远超回答 ${"回答".repeat(1500)}`, status: "complete" });
+    other.appendMessage({ sessionId: otherSession.id, runId: "o-1", role: "reader", body: "另一问", status: "complete" });
+    other.appendMessage({ sessionId: otherSession.id, runId: "o-1", role: "assistant", body: "另一答", status: "complete" });
     other.close();
 
     const callsBeforeOtherBook = calls;
@@ -953,6 +955,8 @@ describe("agent host", () => {
 
     // 消息本体远低于 700 阈值；2400 字符的工具行使无锚点估算越线 → 压缩触发（T45 前工具行不计数）。
     expect(calls).toBeGreaterThan(1);
+    // T46：摘要输入包含被摘要 run 的工具结果原文（压缩摘要失真修复）。
+    expect(JSON.stringify(fake.requests[0]?.context.messages)).toContain("长文本");
     const persisted = createSessionStore(dataHome);
     expect(persisted.getSummary(persisted.findSession(BOOK_ID)!.id)).toBeTruthy();
     persisted.close();
@@ -1006,18 +1010,22 @@ describe("agent host", () => {
     expect(result.ok).toBe(true);
     await waitFor(() => lifecyclePhase(events).includes("end"), 5_000);
 
-    // OpenClaw 切点在预算不足时保留最新回答原文，把被切开的问题作为分轮前缀单独摘要：
-    // 1 主摘要 + 2 分轮前缀摘要 + 3 回答。
-    expect(calls).toBe(3);
-    expect(fake.requests[2]?.context.messages.some((message) => (
+    // T46 run 粒度切点：吸附到读者问题边界，一轮问答整进或整出摘要——不再产生分轮前缀摘要。
+    // 1 主摘要 + 2 回答。
+    expect(calls).toBe(2);
+    expect(fake.requests[1]?.context.messages.some((message) => (
       typeof message.content === "string" && message.content.includes("Conversation Summary")
     ))).toBe(true);
     const conversation = host.getConversation(BOOK_ID);
     expect(conversation.filter((message) => message.role === "reader")).toHaveLength(9);
     expect(conversation.at(-1)?.body).toBe("压缩后回答");
     const persisted = createSessionStore(dataHome);
-    expect(persisted.getSummary(session.id)?.summary).toContain("历史摘要");
-    expect(persisted.getSummary(session.id)?.summary).toContain("压缩后回答");
+    const summaryState = persisted.getSummary(session.id);
+    expect(summaryState?.summary).toContain("历史摘要");
+    // 整轮保留：摘要覆盖点之后的下一条消息必须是 run 起始（读者问题），且覆盖点可按消息 id 回查。
+    const throughIndex = conversation.findIndex((message) => message.id === summaryState?.throughMessageId);
+    expect(throughIndex).toBeGreaterThan(-1);
+    expect(conversation[throughIndex + 1]?.role).toBe("reader");
     persisted.close();
   });
 

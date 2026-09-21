@@ -215,6 +215,14 @@ async function synthesizeToolPairMessages(rows: PersistedToolCall[], loadImage: 
 }
 
 /**
+ * 压缩摘要输入用（T46）：把一次 run 的工具行合成为工具对消息，交给 vendored 序列化器
+ * （toolResult 文本截 2000 字符、图片块替换为省略标记——故用估算 loader 即可，无需读文件）。
+ */
+export async function synthesizeToolPairMessagesForSummary(rows: PersistedToolCall[]): Promise<Message[]> {
+  return synthesizeToolPairMessages(rows, estimatingImageLoader);
+}
+
+/**
  * 把已持久化的会话历史装配为回放消息（T45）：
  * - 完整 run（assistant 消息 status=complete）的工具行按 `(created_at, seq)` 序合成配对，
  *   挂在该轮问题消息之后、回答消息之前；失败/取消 run 的工具行整体排除（问题消息保留，现状语义）；

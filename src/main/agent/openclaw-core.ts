@@ -8,6 +8,7 @@ export {
   compact,
   DEFAULT_COMPACTION_SETTINGS,
   estimateTokens,
+  findCutPoint,
   generateSummary,
   prepareCompaction,
   shouldCompact,

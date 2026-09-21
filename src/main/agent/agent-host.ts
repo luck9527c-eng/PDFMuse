@@ -19,6 +19,7 @@ import {
   buildSystemPrompt,
   estimatingImageLoader,
   historyToLlmMessages,
+  synthesizeToolPairMessagesForSummary,
   toSessionEntries,
   type ReplayImageLoader,
 } from "./context-assembly.js";
@@ -31,9 +32,10 @@ import {
   estimateStringChars,
   estimateTokens,
   estimateTokensFromChars,
-  prepareCompaction,
+  findCutPoint,
   shouldCompact,
   type AgentEvent,
+  type AgentMessage,
   type AgentTool,
   type AgentToolResult,
   type CompactionPreparation,
@@ -339,31 +341,89 @@ export function createAgentHost(options: AgentHostOptions) {
       return unchanged();
     }
 
-    // 重建 OpenClaw 会话树：持久化摘要落成 compaction 边界，切点选择与摘要生成交给 vendored harness。
+    // 重建 OpenClaw 会话树：持久化摘要落成 compaction 边界。
+    // T46：切点自建——findCutPoint 之后吸附到 run 边界（读者问题消息），一轮问答整进或整出摘要；
+    // firstKeptEntryId 恒为保留 run 的 reader 消息 id，保证 throughMessageId/锚点/水位线按消息 id 回查有效。
     const messageEntries = toSessionEntries(history);
     const boundaryIndex = previous
       ? messageEntries.findIndex((entry) => entry.id === previous.throughMessageId)
       : -1;
-    const pathEntries: SessionTreeEntry[] = previous && boundaryIndex >= 0 && boundaryIndex + 1 < messageEntries.length
-      ? [
-          ...messageEntries.slice(0, boundaryIndex + 1),
-          {
-            type: "compaction",
-            id: `compaction-${previous.throughMessageId}`,
-            parentId: messageEntries[boundaryIndex]!.id,
-            timestamp: messageEntries[boundaryIndex]!.timestamp,
-            summary: previous.summary,
-            firstKeptEntryId: messageEntries[boundaryIndex + 1]!.id,
-            tokensBefore: contextTokens,
-          },
-          ...messageEntries.slice(boundaryIndex + 1),
-        ]
-      : messageEntries;
-    const prepared = prepareCompaction(pathEntries, effectiveSettings);
-    if (!prepared.ok || !prepared.value) {
+    let pathEntries: SessionTreeEntry[] = messageEntries;
+    let boundaryStart = 0;
+    if (previous && boundaryIndex >= 0 && boundaryIndex + 1 < messageEntries.length) {
+      pathEntries = [
+        ...messageEntries.slice(0, boundaryIndex + 1),
+        {
+          type: "compaction",
+          id: `compaction-${previous.throughMessageId}`,
+          parentId: messageEntries[boundaryIndex]!.id,
+          timestamp: messageEntries[boundaryIndex]!.timestamp,
+          summary: previous.summary,
+          firstKeptEntryId: messageEntries[boundaryIndex + 1]!.id,
+          tokensBefore: contextTokens,
+        },
+        ...messageEntries.slice(boundaryIndex + 1),
+      ];
+      boundaryStart = boundaryIndex + 2;
+    }
+    // 小窗口防护（T46/spec 3.2）：保留尾预算不得吃掉摘要与回答的空间。
+    const keepRecentEffective = Math.max(
+      1,
+      Math.min(effectiveSettings.keepRecentTokens, contextWindow - effectiveSettings.reserveTokens - 1_000),
+    );
+    const isRunStart = (entry: SessionTreeEntry | undefined) =>
+      entry?.type === "message" && entry.message.role === "user";
+    let firstKeptIndex: number;
+    try {
+      const cut = findCutPoint(pathEntries, boundaryStart, pathEntries.length, keepRecentEffective);
+      // 先向后吸附（多保留完整 run），尾部落不到 run 起始时回退向前。
+      firstKeptIndex = -1;
+      for (let index = Math.max(cut.firstKeptEntryIndex, boundaryStart); index < pathEntries.length; index += 1) {
+        if (isRunStart(pathEntries[index])) { firstKeptIndex = index; break; }
+      }
+      if (firstKeptIndex < 0) {
+        for (let index = Math.min(cut.firstKeptEntryIndex, pathEntries.length - 1); index >= boundaryStart; index -= 1) {
+          if (isRunStart(pathEntries[index])) { firstKeptIndex = index; break; }
+        }
+      }
+    } catch {
+      // vendored 切点选择异常时保持原历史（fail-open 与摘要失败同一口径）。
       return unchanged();
     }
-    const preparation = prepared.value;
+    if (firstKeptIndex < 0 || firstKeptIndex <= boundaryStart) {
+      // 保留尾覆盖全部可摘要区间：没有可摘要内容，压缩退化为原样。
+      return unchanged();
+    }
+    // T46：摘要输入纳入被摘要 run 的工具行（run 的问题消息之后交织工具对）——
+    // 修复「压缩摘要失真」的根源问题；图片块由序列化器替换为省略标记，无需读文件。
+    const runIdByMessageId = new Map(history.map((message) => [message.id, message.runId]));
+    const summarizedRowsByRun = new Map<string, PersistedToolCall[]>();
+    for (const entry of pathEntries.slice(boundaryStart, firstKeptIndex)) {
+      if (entry.type !== "message") continue;
+      const runId = runIdByMessageId.get(entry.id);
+      if (!runId) continue;
+      const rows = toolCalls.filter((row) => row.runId === runId);
+      if (rows.length > 0) summarizedRowsByRun.set(runId, rows);
+    }
+    const summarizedMessages: AgentMessage[] = [];
+    for (const entry of pathEntries.slice(boundaryStart, firstKeptIndex)) {
+      if (entry.type !== "message") continue;
+      summarizedMessages.push(entry.message);
+      if (entry.message.role === "user") {
+        const rows = summarizedRowsByRun.get(runIdByMessageId.get(entry.id) ?? "");
+        if (rows) summarizedMessages.push(...(await synthesizeToolPairMessagesForSummary(rows)));
+      }
+    }
+    const preparation: CompactionPreparation = {
+      firstKeptEntryId: pathEntries[firstKeptIndex]!.id,
+      messagesToSummarize: summarizedMessages,
+      turnPrefixMessages: [],
+      isSplitTurn: false,
+      tokensBefore: contextTokens,
+      ...(previous?.summary ? { previousSummary: previous.summary } : {}),
+      fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+      settings: effectiveSettings,
+    };
     const compacted = await invokeCompactionWithRetry(
       preparation,
       connection,
@@ -374,9 +434,8 @@ export function createAgentHost(options: AgentHostOptions) {
       // 摘要是优化，不是回答的前置条件；失败时保持原始消息可用。
       return unchanged();
     }
-    const keptIndex = messageEntries.findIndex((entry) => entry.id === preparation.firstKeptEntryId);
-    const throughEntry = keptIndex > 0 ? messageEntries[keptIndex - 1] : undefined;
-    if (!throughEntry) {
+    const throughEntry = pathEntries[firstKeptIndex - 1];
+    if (!throughEntry || throughEntry.type !== "message") {
       return unchanged();
     }
     store.saveSummary(sessionId, compacted.summary, throughEntry.id);
