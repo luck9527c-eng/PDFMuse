@@ -24,6 +24,8 @@ import {
   shouldCompact,
   type AgentEvent,
   type AgentTool,
+  type CompactionPreparation,
+  type CompactionResult,
   type CompactionSettings,
   type Message,
   type SessionTreeEntry,
@@ -74,6 +76,10 @@ export type AgentHostOptions = {
   /** OpenClaw compaction trigger and retention can be lowered in tests or constrained deployments. */
   compactionContextWindow?: number;
   compactionSettings?: Partial<CompactionSettings>;
+  /** 摘要请求硬超时（T43）；缺省 180s。到点中断压缩并按失败处理（fail-open 保持原历史）。 */
+  compactionTimeoutMs?: number;
+  /** 摘要重试退避基数（T43 测试注入）；生产默认 500ms，按尝试指数递增、5s 封顶。 */
+  compactionRetryBaseDelayMs?: number;
   /** 测试注入假模型流；生产默认使用 @openclaw/ai Provider Adapter。 */
   createStreamFn?: (connection: ResolvedModelConnection) => StreamFn;
 };
@@ -86,6 +92,18 @@ const MAX_BOOK_SEARCH_CALLS = 3;
 const MAX_WEB_SEARCH_CALLS = 2;
 /** 压缩冷却递增档（ADR 0010）：压缩后仍接近阈值时按会话进入冷却，防止每问白打一次摘要调用。 */
 const COMPACTION_COOLDOWN_STEPS_MS = [60_000, 300_000, 900_000];
+/** 摘要请求硬超时（T43）：挂死的摘要调用不得占住会话 lane；到点中断并按失败处理（fail-open）。 */
+const COMPACTION_TIMEOUT_MS = 180_000;
+/** 摘要重试（T43）：共 3 次尝试，指数退避 500ms 起、5s 封顶；aborted（取消/超时）与 invalid_session 不重试。 */
+const COMPACTION_RETRY_ATTEMPTS = 3;
+const COMPACTION_RETRY_BASE_DELAY_MS = 500;
+const COMPACTION_RETRY_MAX_DELAY_MS = 5_000;
+/** 领域摘要指令（T43）：经 compact() 的 customInstructions 进入摘要请求（vendored 侧追加为 "Additional focus:"）。 */
+const COMPACTION_DOMAIN_INSTRUCTIONS = [
+  "这是 PDF 书籍阅读问答会话的摘要，供后续继续辅导 Reader。",
+  "必须保留：读者每个问题的要点；回答已确认的书内结论；出现的页码、原文引用与术语（逐字精确，不得改写）；检索得到的关键发现。",
+  "省略寒暄与重复；不得引入会话中不存在的信息。",
+].join("\n");
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -171,6 +189,10 @@ export function createAgentHost(options: AgentHostOptions) {
     ...DEFAULT_COMPACTION_SETTINGS,
     ...options.compactionSettings,
   };
+  // T43：摘要请求的硬超时与重试退避基数；压缩阶段（含撞窗自愈）可被取消即时中断。
+  const compactionTimeoutMs = options.compactionTimeoutMs ?? COMPACTION_TIMEOUT_MS;
+  const compactionRetryBaseDelayMs = options.compactionRetryBaseDelayMs ?? COMPACTION_RETRY_BASE_DELAY_MS;
+  const compactionControllers = new Map<string, AbortController>();
   const makeStreamFn = options.createStreamFn ?? createModelStreamFn;
   // 每个 Book Conversation 一条串行 lane；lane 尾部为空时移除，避免长期驻留。
   const sessionLanes = new Map<string, Promise<void>>();
@@ -199,12 +221,43 @@ export function createAgentHost(options: AgentHostOptions) {
     return run;
   }
 
+  /**
+   * 摘要调用 + 指数退避重试（T43）：成功返回 CompactionResult，永久失败返回 undefined。
+   * 空摘要按 summarization_failed 口径对待；aborted（用户取消/硬超时）与 invalid_session
+   * （确定性失败）不重试；fail-open 语义由调用方处理（返回 undefined → 保持原历史照常回答）。
+   */
+  async function invokeCompactionWithRetry(
+    preparation: CompactionPreparation,
+    connection: ResolvedModelConnection,
+    streamFn: StreamFn,
+    signal: AbortSignal | undefined,
+  ): Promise<CompactionResult | undefined> {
+    for (let attempt = 1; ; attempt += 1) {
+      const result = await compact(
+        preparation,
+        toLlmModel(connection),
+        connection.apiKey,
+        undefined,
+        COMPACTION_DOMAIN_INSTRUCTIONS,
+        signal,
+        undefined,
+        streamFn,
+      );
+      if (result.ok && result.value.summary.trim()) return result.value;
+      const failureCode = result.ok ? "summarization_failed" : result.error.code;
+      if (attempt >= COMPACTION_RETRY_ATTEMPTS || signal?.aborted === true || failureCode !== "summarization_failed") {
+        return undefined;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(COMPACTION_RETRY_MAX_DELAY_MS, compactionRetryBaseDelayMs * 2 ** (attempt - 1))));
+    }
+  }
+
   async function compactHistory(
     sessionId: string,
     history: ConversationMessage[],
     connection: ResolvedModelConnection,
     streamFn?: StreamFn,
-    overrides: { force?: boolean; systemPrompt?: string; questionContent?: string } = {},
+    overrides: { force?: boolean; systemPrompt?: string; questionContent?: string; signal?: AbortSignal } = {},
   ): Promise<{ history: ConversationMessage[]; summary?: string }> {
     const previous = store.getSummary(sessionId);
     const previousIndex = previous ? history.findIndex((message) => message.id === previous.throughMessageId) : -1;
@@ -279,17 +332,13 @@ export function createAgentHost(options: AgentHostOptions) {
       return unchanged();
     }
     const preparation = prepared.value;
-    const compacted = await compact(
+    const compacted = await invokeCompactionWithRetry(
       preparation,
-      toLlmModel(connection),
-      connection.apiKey,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+      connection,
       streamFn ?? makeStreamFn(connection),
+      overrides.signal,
     );
-    if (!compacted.ok || !compacted.value.summary.trim()) {
+    if (!compacted) {
       // 摘要是优化，不是回答的前置条件；失败时保持原始消息可用。
       return unchanged();
     }
@@ -298,12 +347,12 @@ export function createAgentHost(options: AgentHostOptions) {
     if (!throughEntry) {
       return unchanged();
     }
-    store.saveSummary(sessionId, compacted.value.summary, throughEntry.id);
+    store.saveSummary(sessionId, compacted.summary, throughEntry.id);
     const nextHistory = history.slice(history.findIndex((message) => message.id === throughEntry.id) + 1);
     // 压缩后仍接近阈值 → 会话进入冷却递增档；降到阈值以下 → 归零。
     // 判断值用纯估算（锚点描述的是压缩前的请求形状，头部重写后已过期），口径含 system prompt 与当轮问题。
     const afterMessages = usableLlmMessages(nextHistory);
-    const afterTokens = estimateTokens({ role: "user", content: `【Conversation Summary】\n${compacted.value.summary}`, timestamp: 0 })
+    const afterTokens = estimateTokens({ role: "user", content: `【Conversation Summary】\n${compacted.summary}`, timestamp: 0 })
       + afterMessages.reduce((total, message) => total + estimateTokens(message), 0)
       + systemEstimate
       + questionEstimate;
@@ -314,7 +363,7 @@ export function createAgentHost(options: AgentHostOptions) {
     } else {
       compactionCooldowns.delete(sessionId);
     }
-    return { history: nextHistory, summary: compacted.value.summary };
+    return { history: nextHistory, summary: compacted.summary };
   }
 
   async function executeRun(input: {
@@ -360,19 +409,35 @@ export function createAgentHost(options: AgentHostOptions) {
     )?.evidence;
     const questionContent = buildQuestionContent(question, focusWithContext, previousEvidence);
     const systemPrompt = buildSystemPrompt(profile, bookTitle ? { title: bookTitle } : undefined);
-    const compactionStartedAt = Date.now();
-    const compacted = await compactHistory(
-      sessionId,
-      fullHistory,
-      connection,
-      wrapStreamFnWithDiagnostics(() => makeStreamFn(connection), () => "compaction", collector, options.emit, startCallClock),
-      { systemPrompt, questionContent },
-    );
-    const compactionRequest = collector.run.requests.filter((item) => item.role === "compaction").at(-1);
-    if (compactionRequest && compactionRequest.durationMs === undefined) {
-      const durationMs = Date.now() - compactionStartedAt;
-      collector.completeRequest(compactionRequest.callIndex, durationMs);
-      options.emit({ stream: "diagnostics", kind: "request-complete", runId, sessionId, callIndex: compactionRequest.callIndex, durationMs });
+    // T43：压缩请求带硬超时与取消信号，挂死或用户取消即时中断，不占住会话 lane。
+    // 控制器仅伴随压缩窗口（初始压缩与撞窗自愈）；回答阶段无压缩在飞，cancel 走 agent.abort。
+    const runCompaction = async (overrides: { force?: boolean }) => {
+      const compactionController = new AbortController();
+      compactionControllers.set(runId, compactionController);
+      try {
+        const signal = AbortSignal.any([compactionController.signal, AbortSignal.timeout(compactionTimeoutMs)]);
+        return await compactHistory(
+          sessionId,
+          fullHistory,
+          connection,
+          wrapStreamFnWithDiagnostics(() => makeStreamFn(connection), () => "compaction", collector, options.emit, startCallClock),
+          { ...overrides, systemPrompt, questionContent, signal },
+        );
+      } finally {
+        compactionControllers.delete(runId);
+      }
+    };
+    const compacted = await runCompaction({});
+    // T43：重试会产生多条 compaction 请求条目，全部按各自起点补全耗时。
+    let recordedCompaction = false;
+    for (const request of collector.run.requests) {
+      if (request.role !== "compaction" || request.durationMs !== undefined) continue;
+      recordedCompaction = true;
+      const durationMs = Date.now() - Date.parse(request.startedAt);
+      collector.completeRequest(request.callIndex, durationMs);
+      options.emit({ stream: "diagnostics", kind: "request-complete", runId, sessionId, callIndex: request.callIndex, durationMs });
+    }
+    if (recordedCompaction) {
       diagnosticsStore.record(bookId, collector.run);
     }
     const history = compacted.history;
@@ -648,13 +713,7 @@ export function createAgentHost(options: AgentHostOptions) {
       assistantFailure = undefined;
       overWindow = undefined;
       assistantBodyStart = assistantBody.length;
-      const healed = await compactHistory(
-        sessionId,
-        fullHistory,
-        connection,
-        wrapStreamFnWithDiagnostics(() => makeStreamFn(connection), () => "compaction", collector, options.emit, startCallClock),
-        { force: true, systemPrompt, questionContent },
-      );
+      const healed = await runCompaction({ force: true });
       if (!cancelledBeforeStart.delete(runId)) {
         const healedMessages = historyToLlmMessages(healed.history, {
           question,
@@ -786,6 +845,8 @@ export function createAgentHost(options: AgentHostOptions) {
       }
       // 尚未排到的运行：记录取消意图，执行前直接跳过。
       cancelledBeforeStart.add(runId);
+      // T43：已开跑但仍在压缩阶段的运行，即时中断摘要请求，不空等。
+      compactionControllers.get(runId)?.abort();
     },
     async cancelBook(bookId: string) {
       const runs = [...runBooks.entries()].filter(([, run]) => run.bookId === bookId);
@@ -796,6 +857,7 @@ export function createAgentHost(options: AgentHostOptions) {
           active.agent.abort("book-removed");
         } else {
           cancelledBeforeStart.add(runId);
+          compactionControllers.get(runId)?.abort();
         }
       }
       const sessionId = runs[0]?.[1].sessionId ?? store.findSession(bookId)?.id;

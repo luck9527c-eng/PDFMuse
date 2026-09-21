@@ -545,6 +545,217 @@ describe("agent host", () => {
     expect(calls).toBe(3);
   });
 
+  it("aborts a hung compaction at the injected timeout and still answers (fail-open)", async () => {
+    seedAnchorHistory(80);
+    let historyAttempts = 0;
+    let summaryAborted = false;
+    const fake = createFakeStreamFn(({ request, push }) => {
+      const isSummary = /summarization/i.test(request.context.systemPrompt ?? "");
+      if (!isSummary) {
+        push({ type: "start", partial: assistantMessage("") });
+        push({ type: "done", reason: "stop", message: assistantMessage("超时回答") });
+        return;
+      }
+      // keepRecentTokens:16 会使切点落在轮次中间，split turn 每次压缩尝试产生
+      // 历史摘要 + 轮前缀摘要两次补全；重试计数只看历史摘要（轮前缀提示词特征区分）。
+      if (/PREFIX of a turn/i.test(JSON.stringify(request.context.messages))) return;
+      historyAttempts += 1;
+      // 挂死的摘要流：不推送任何事件，等硬超时信号中止。
+      request.options?.signal?.addEventListener("abort", () => {
+        summaryAborted += 1;
+        push({ type: "error", reason: "aborted", error: assistantMessage("", "aborted") });
+      });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 1_000 }),
+      compactionSettings: { keepRecentTokens: 16 },
+      compactionTimeoutMs: 50,
+      compactionRetryBaseDelayMs: 1,
+    });
+
+    await startRun("挂死摘要问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    // 硬超时按 aborted 口径处理：摘要只尝试 1 次（不重试）；fail-open 保持原历史照常回答。
+    expect(historyAttempts).toBe(1);
+    expect(summaryAborted).toBe(1);
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation.at(-1)?.status).toBe("complete");
+    expect(conversation.at(-1)?.body).toBe("超时回答");
+    const persisted = createSessionStore(dataHome);
+    expect(persisted.getSummary(persisted.findSession(BOOK_ID)!.id)).toBeUndefined();
+    persisted.close();
+  });
+
+  it("interrupts the in-flight compaction when the reader cancels", async () => {
+    const { sessionId } = seedAnchorHistory(80);
+    let summaryStarted = false;
+    let summaryAborted = false;
+    const fake = createFakeStreamFn(({ request, push }) => {
+      const isSummary = /summarization/i.test(request.context.systemPrompt ?? "");
+      if (!isSummary) {
+        push({ type: "start", partial: assistantMessage("") });
+        push({ type: "done", reason: "stop", message: assistantMessage("不应到达的回答") });
+        return;
+      }
+      summaryStarted = true;
+      request.options?.signal?.addEventListener("abort", () => {
+        summaryAborted = true;
+        push({ type: "error", reason: "aborted", error: assistantMessage("", "aborted") });
+      });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 1_000 }),
+      compactionSettings: { keepRecentTokens: 16 },
+      compactionRetryBaseDelayMs: 1,
+    });
+
+    const result = await startRun("取消压缩问题");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    await waitFor(() => summaryStarted);
+    host.cancel(result.runId);
+    await waitFor(() => lifecyclePhase(events).includes("cancelled"));
+
+    // 取消即时中断摘要请求（不空等、不重试），也不会走到回答调用。
+    expect(summaryAborted).toBe(true);
+    expect(fake.requests.every((request) => /summarization/i.test(request.context.systemPrompt ?? ""))).toBe(true);
+    // 只有种子历史在库：当轮问题尚未落盘（压缩阶段取消的既有语义）。
+    expect(host.getConversation(BOOK_ID)).toHaveLength(4);
+    expect(host.getConversation(BOOK_ID).every((message) => message.runId !== result.runId)).toBe(true);
+    const persisted = createSessionStore(dataHome);
+    expect(persisted.getSummary(sessionId)).toBeUndefined();
+    persisted.close();
+  });
+
+  it("retries a failed compaction summary and passes domain instructions", async () => {
+    seedAnchorHistory(80);
+    let historyAttempts = 0;
+    let summaryRequest: CapturedRequest | undefined;
+    const fake = createFakeStreamFn(({ request, push }) => {
+      const isSummary = /summarization/i.test(request.context.systemPrompt ?? "");
+      if (!isSummary) {
+        push({ type: "start", partial: assistantMessage("") });
+        push({ type: "done", reason: "stop", message: assistantMessage("重试回答") });
+        return;
+      }
+      const isTurnPrefix = /PREFIX of a turn/i.test(JSON.stringify(request.context.messages));
+      if (isTurnPrefix) {
+        push({ type: "start", partial: assistantMessage("") });
+        push({ type: "done", reason: "stop", message: assistantMessage("前缀摘要") });
+        return;
+      }
+      historyAttempts += 1;
+      summaryRequest = request;
+      if (historyAttempts <= 2) {
+        push({ type: "error", reason: "error", error: assistantMessage("", "error", "summary boom") });
+        return;
+      }
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("重试后的摘要内容") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 1_000 }),
+      compactionSettings: { keepRecentTokens: 16 },
+      compactionRetryBaseDelayMs: 1,
+    });
+
+    await startRun("重试摘要问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    // 前两次历史摘要失败（summarization_failed 可重试），第三次成功并落库。
+    expect(historyAttempts).toBe(3);
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation.at(-1)?.status).toBe("complete");
+    const persisted = createSessionStore(dataHome);
+    expect(persisted.getSummary(persisted.findSession(BOOK_ID)!.id)?.summary).toContain("重试后的摘要内容");
+    persisted.close();
+    // 摘要请求带领域指令（vendored 以 "Additional focus:" 追加 customInstructions）。
+    const promptText = JSON.stringify(summaryRequest?.context.messages ?? []);
+    expect(promptText).toContain("Additional focus:");
+    expect(promptText).toContain("页码");
+    expect(promptText).toContain("术语");
+  });
+
+  it("answers on the original history when compaction retries are exhausted", async () => {
+    seedAnchorHistory(80);
+    let historyAttempts = 0;
+    const fake = createFakeStreamFn(({ request, push }) => {
+      const isSummary = /summarization/i.test(request.context.systemPrompt ?? "");
+      if (!isSummary) {
+        push({ type: "start", partial: assistantMessage("") });
+        push({ type: "done", reason: "stop", message: assistantMessage("兜底回答") });
+        return;
+      }
+      if (/PREFIX of a turn/i.test(JSON.stringify(request.context.messages))) return;
+      historyAttempts += 1;
+      push({ type: "error", reason: "error", error: assistantMessage("", "error", "summary down") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 1_000 }),
+      compactionSettings: { keepRecentTokens: 16 },
+      compactionRetryBaseDelayMs: 1,
+    });
+
+    await startRun("重试耗尽问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    // 共 3 次尝试后放弃；fail-open：原历史照常回答，摘要不落库。
+    expect(historyAttempts).toBe(3);
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation.at(-1)?.status).toBe("complete");
+    expect(conversation.at(-1)?.body).toBe("兜底回答");
+    const persisted = createSessionStore(dataHome);
+    expect(persisted.getSummary(persisted.findSession(BOOK_ID)!.id)).toBeUndefined();
+    persisted.close();
+  });
+
+  it("retries an empty compaction summary as a retryable failure", async () => {
+    seedAnchorHistory(80);
+    let historyAttempts = 0;
+    const fake = createFakeStreamFn(({ request, push }) => {
+      const isSummary = /summarization/i.test(request.context.systemPrompt ?? "");
+      if (!isSummary) {
+        push({ type: "start", partial: assistantMessage("") });
+        push({ type: "done", reason: "stop", message: assistantMessage("空摘要回答") });
+        return;
+      }
+      const isTurnPrefix = /PREFIX of a turn/i.test(JSON.stringify(request.context.messages));
+      if (isTurnPrefix) {
+        push({ type: "start", partial: assistantMessage("") });
+        push({ type: "done", reason: "stop", message: assistantMessage("前缀摘要") });
+        return;
+      }
+      historyAttempts += 1;
+      push({ type: "start", partial: assistantMessage("") });
+      if (historyAttempts <= 2) {
+        // 有效停止但无文本 → 空摘要，按可重试失败处理。
+        push({ type: "done", reason: "stop", message: assistantMessage("") });
+        return;
+      }
+      push({ type: "done", reason: "stop", message: assistantMessage("空摘要重试后的内容") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      loadModelConnection: async () => ({ ...CONNECTION, contextWindow: 1_000 }),
+      compactionSettings: { keepRecentTokens: 16 },
+      compactionRetryBaseDelayMs: 1,
+    });
+
+    await startRun("空摘要问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    expect(historyAttempts).toBe(3);
+    const persisted = createSessionStore(dataHome);
+    expect(persisted.getSummary(persisted.findSession(BOOK_ID)!.id)?.summary).toContain("空摘要重试后的内容");
+    persisted.close();
+    expect(host.getConversation(BOOK_ID).at(-1)?.body).toBe("空摘要回答");
+  });
+
   it("forwards the Book Conversation session id to the model stream options", async () => {
     const fake = createFakeStreamFn(({ push }) => {
       push({ type: "start", partial: assistantMessage("") });
