@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { AgentStreamEvent, ConversationEvidence, StartAgentRunResult } from "../../shared/contracts.js";
@@ -838,13 +839,16 @@ describe("agent host", () => {
     const session = sessionStore.ensureSession(BOOK_ID);
     sessionStore.appendMessage({ sessionId: session.id, runId: "seed-run", role: "reader", body: "上一轮的问题", status: "complete" });
     const streaming = sessionStore.appendMessage({ sessionId: session.id, runId: "seed-run", role: "assistant", body: "", status: "streaming" });
-    sessionStore.finalizeMessage({
+    sessionStore.finalizeRun({
       sessionId: session.id,
-      messageId: streaming.id,
       runId: "seed-run",
-      body: "上一轮的回答",
-      status: "complete",
-      ...(evidence ? { evidence } : {}),
+      toolCalls: [],
+      message: {
+        messageId: streaming.id,
+        body: "上一轮的回答",
+        status: "complete",
+        ...(evidence ? { evidence } : {}),
+      },
     });
     sessionStore.close();
   }
@@ -1036,6 +1040,7 @@ describe("agent host", () => {
         pageBudget: context.pageBudget,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
+        savePageImage: async (id: string, page: number) => ({ relativePath: `${id}/p${page}-test.png` }),
       })),
     });
 
@@ -1110,6 +1115,7 @@ describe("agent host", () => {
         pageBudget: context.pageBudget,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
+        savePageImage: async (id: string, page: number) => ({ relativePath: `${id}/p${page}-test.png` }),
       })),
     });
 
@@ -1532,6 +1538,7 @@ describe("agent host", () => {
         pageBudget: context.pageBudget,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
+        savePageImage: async (id: string, page: number) => ({ relativePath: `${id}/p${page}-test.png` }),
       })),
     });
 
@@ -1561,5 +1568,125 @@ describe("agent host", () => {
     await Promise.resolve();
     bookIndex.close();
     library.close();
+  });
+
+  it("persists the full tool-call trail of a run at finalize (T44)", async () => {
+    // 自定义同名 book_search 工具：走 wrapper 的上限计数与落库路径，结果可控。
+    // 单次运行内连续 4 轮工具调用：前三次执行，第四次被拒，随后模型基于拒绝说明收尾。
+    let turns = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      turns += 1;
+      if (turns > 4) {
+        push({ type: "start", partial: assistantMessage("") });
+        push({ type: "text_delta", contentIndex: 0, delta: "上限回答" });
+        push({ type: "done", reason: "stop", message: assistantMessage("上限回答") });
+        return;
+      }
+      const toolCallMessage = assistantMessage("", "toolUse");
+      toolCallMessage.content = [
+        { type: "text", text: "查一下" },
+        { type: "toolCall", id: `call-${turns}`, name: "book_search", arguments: { query: `测试 ${turns}` } },
+      ];
+      push({ type: "start", partial: toolCallMessage });
+      push({ type: "text_delta", contentIndex: 0, delta: "查一下" });
+      push({
+        type: "toolcall_end",
+        contentIndex: 1,
+        toolCall: { type: "toolCall", id: `call-${turns}`, name: "book_search", arguments: { query: `测试 ${turns}` } },
+        partial: toolCallMessage,
+      });
+      push({ type: "done", reason: "toolUse", message: toolCallMessage });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      buildTools: () => [{
+        name: "book_search",
+        label: "检索本书",
+        description: "",
+        parameters: Type.Object({ query: Type.String() }),
+        async execute() {
+          return { content: [{ type: "text" as const, text: `检索结果 ${turns}` }], details: undefined };
+        },
+      }],
+    });
+
+    await startRun("工具轨迹问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    const rows = database.prepare(
+      "SELECT run_id, seq, call_id, tool_name, title, arguments_json, result_text, status, is_error FROM agent_tool_calls ORDER BY created_at, seq",
+    ).all() as Array<Record<string, unknown>>;
+    database.close();
+
+    expect(rows).toHaveLength(4);
+    expect(rows.map((row) => [row.status, row.is_error])).toEqual([
+      ["executed", 0],
+      ["executed", 0],
+      ["executed", 0],
+      ["rejected", 1],
+    ]);
+    expect(rows[3]?.result_text).toContain("已达到本轮上限");
+    expect(rows[0]).toMatchObject({
+      call_id: "call-1",
+      tool_name: "book_search",
+      title: "检索本书",
+      arguments_json: '{"query":"测试 1"}',
+      result_text: "检索结果 1",
+    });
+  });
+
+  it("persists an error row when a tool throws and still answers (T44)", async () => {
+    let turns = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      turns += 1;
+      if (turns > 1) {
+        push({ type: "start", partial: assistantMessage("") });
+        push({ type: "text_delta", contentIndex: 0, delta: "兜底回答" });
+        push({ type: "done", reason: "stop", message: assistantMessage("兜底回答") });
+        return;
+      }
+      const toolCallMessage = assistantMessage("", "toolUse");
+      toolCallMessage.content = [
+        { type: "text", text: "查一下" },
+        { type: "toolCall", id: "call-boom-1", name: "boom", arguments: {} },
+      ];
+      push({ type: "start", partial: toolCallMessage });
+      push({ type: "text_delta", contentIndex: 0, delta: "查一下" });
+      push({
+        type: "toolcall_end",
+        contentIndex: 1,
+        toolCall: { type: "toolCall", id: "call-boom-1", name: "boom", arguments: {} },
+        partial: toolCallMessage,
+      });
+      push({ type: "done", reason: "toolUse", message: toolCallMessage });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      buildTools: () => [{
+        name: "boom",
+        label: "会爆炸的工具",
+        description: "",
+        parameters: Type.Object({}),
+        async execute() {
+          throw new Error("工具炸了");
+        },
+      }],
+    });
+
+    await startRun("工具报错问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    const rows = database.prepare("SELECT tool_name, title, result_text, status, is_error FROM agent_tool_calls").all() as Array<Record<string, unknown>>;
+    database.close();
+    expect(rows).toEqual([{
+      tool_name: "boom",
+      title: "会爆炸的工具",
+      result_text: "工具炸了",
+      status: "error",
+      is_error: 1,
+    }]);
+    expect(host.getConversation(BOOK_ID).at(-1)?.status).toBe("complete");
   });
 });

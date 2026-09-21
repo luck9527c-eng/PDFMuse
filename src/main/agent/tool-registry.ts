@@ -33,6 +33,8 @@ export type ToolExecutionContext = {
   renderPageImage(bookId: string, page: number, scale: number): Promise<RenderedPageImage>;
   /** 每问图片预算（agent-host 每问新建、跨调用共享）：页数与次数钳制在工具层执行。 */
   pageBudget: PageImageBudget;
+  /** 原图转存 book 媒体目录（T44）：live 与回放共享同一份文件字节，会话库只存相对路径。 */
+  savePageImage(bookId: string, page: number, pngBase64: string): Promise<{ relativePath: string }>;
   webSearch?: WebSearchModule;
 };
 
@@ -42,6 +44,8 @@ export type ToolExecutionOutcome = {
   evidence?: PdfEvidence[];
   /** 随结果发送给模型的页面原图（base64 PNG）；read_page_image 使用。 */
   images?: Array<{ page: number; mimeType: "image/png"; data: string }>;
+  /** 已转存媒体目录的原图引用（T44）；随 details 到达 agent-host 的落库层。 */
+  media?: Array<{ page: number; path: string }>;
 };
 
 type RegisteredTool = {
@@ -237,6 +241,25 @@ const readPageImageSchema = Type.Object({
 export const MAX_PAGE_IMAGE_CALLS = 2;
 export const MAX_PAGE_IMAGE_PAGES = 4;
 
+/** provider 图片硬限制（T44）：仅超限时降采样重渲，常规尺寸不重编码（公式清晰度优先）。 */
+const IMAGE_HARD_LIMIT_EDGE_PX = 8_000;
+const IMAGE_HARD_LIMIT_BYTES = 5 * 1024 * 1024;
+
+/** 渲染单页并在超出 provider 硬限制时按比例降采样（页图常规尺寸下不触发）。 */
+async function renderWithinHardLimits(ctx: ToolExecutionContext, page: number): Promise<RenderedPageImage> {
+  let scale = 2;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const rendered = await ctx.renderPageImage(ctx.bookId, page, scale);
+    const bytes = Math.floor(rendered.imageData.length * 3 / 4);
+    const maxEdge = Math.max(rendered.width, rendered.height);
+    if (maxEdge <= IMAGE_HARD_LIMIT_EDGE_PX && bytes <= IMAGE_HARD_LIMIT_BYTES) return rendered;
+    const edgeFactor = maxEdge > IMAGE_HARD_LIMIT_EDGE_PX ? IMAGE_HARD_LIMIT_EDGE_PX / maxEdge : 1;
+    const byteFactor = bytes > IMAGE_HARD_LIMIT_BYTES ? Math.sqrt(IMAGE_HARD_LIMIT_BYTES / bytes) : 1;
+    scale = Math.max(0.5, scale * Math.min(edgeFactor, byteFactor) * 0.99);
+  }
+  throw new Error("页面原图超出尺寸硬限制，降采样后仍超限。");
+}
+
 /** read_page_image：渲染页面原图发给模型，精确查看公式、表格与结构。每问受页预算与次数钳制。 */
 function createReadPageImageTool(): RegisteredTool {
   return {
@@ -262,13 +285,17 @@ function createReadPageImageTool(): RegisteredTool {
       const allowed = requested.slice(0, remaining);
       const overBudget = requested.slice(remaining);
       const images: NonNullable<ToolExecutionOutcome["images"]> = [];
+      const media: NonNullable<ToolExecutionOutcome["media"]> = [];
       const failed: number[] = [];
       for (const page of allowed) {
         try {
-          const rendered = await ctx.renderPageImage(ctx.bookId, page, 2);
+          const rendered = await renderWithinHardLimits(ctx, page);
+          // 原图落盘后以同一份字节发给模型：live 与回放字节天然一致（T44）。
+          const saved = await ctx.savePageImage(ctx.bookId, page, rendered.imageData);
           images.push({ page, mimeType: "image/png", data: rendered.imageData });
+          media.push({ page, path: saved.relativePath });
         } catch {
-          // 单页渲染失败继续其余页，失败页不扣预算、在结果中说明。
+          // 单页渲染或落盘失败继续其余页，失败页不扣预算、在结果中说明。
           failed.push(page);
         }
       }
@@ -298,6 +325,7 @@ function createReadPageImageTool(): RegisteredTool {
         contentText: `${echo}\n以下是第 ${label} 页的原图，请以此为准阅读公式与结构。${failed.length > 0 ? `（第 ${failed.join("、")} 页渲染失败未附上。）` : ""}${budgetNote}`,
         evidence,
         images,
+        media,
       };
     },
   };

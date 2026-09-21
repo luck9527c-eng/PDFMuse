@@ -24,6 +24,7 @@ import {
   shouldCompact,
   type AgentEvent,
   type AgentTool,
+  type AgentToolResult,
   type CompactionPreparation,
   type CompactionResult,
   type CompactionSettings,
@@ -31,7 +32,7 @@ import {
   type SessionTreeEntry,
   type StreamFn,
 } from "./openclaw-core.js";
-import { createSessionStore, type SessionStore } from "./session-store.js";
+import { createSessionStore, type PersistedToolCall, type SessionStore } from "./session-store.js";
 import {
   createDiagnosticsStore,
   createRunCollector,
@@ -106,12 +107,17 @@ const COMPACTION_DOMAIN_INSTRUCTIONS = [
 ].join("\n");
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
+/** 工具结果 details 里的媒体引用 → media_path JSON（`[{"page":N,"path":...}]`；无媒体时 undefined）。 */
+function toolMediaPathJson(details: unknown): string | undefined {
+  const media = (details as { media?: Array<{ page: number; path: string }> } | undefined)?.media;
+  return media && media.length > 0 ? JSON.stringify(media) : undefined;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isReadingFocus(value: unknown): value is ReadingFocus {
-  if (!isRecord(value)) return false;
+function isReadingFocus(value: unknown): value is ReadingFocus {  if (!isRecord(value)) return false;
   const currentPage = value.currentPage;
   if (typeof currentPage !== "number" || !Number.isSafeInteger(currentPage) || currentPage <= 0) return false;
   if (value.selectedPassage !== undefined) {
@@ -501,6 +507,8 @@ export function createAgentHost(options: AgentHostOptions) {
     // 工具包装：捕获参数、结果与耗时进运行诊断；检索类工具设每轮上限防散射打捞。
     let bookSearchCalls = 0;
     let webSearchCalls = 0;
+    // T44：工具调用全保真轨迹（诊断视图照旧截断，此处不二次截断），run 收尾时随 finalizeRun 批量落库。
+    const toolCalls: PersistedToolCall[] = [];
     const diagnosticsTools = tools.map((tool): AgentTool => ({
       ...tool,
       async execute(toolCallId, params, signal, onUpdate) {
@@ -509,6 +517,15 @@ export function createAgentHost(options: AgentHostOptions) {
           bookSearchCalls += 1;
           if (bookSearchCalls > MAX_BOOK_SEARCH_CALLS) {
             const blockedText = `book_search 已达到本轮上限（${MAX_BOOK_SEARCH_CALLS} 次）。请基于已检索到的内容回答；若信息不足，请向 Reader 明确说明。`;
+            toolCalls.push({
+              callId: toolCallId,
+              toolName: tool.name,
+              title: tool.label ?? tool.name,
+              argumentsJson: JSON.stringify(params),
+              resultText: blockedText,
+              status: "rejected",
+              isError: true,
+            });
             const toolCall: RunDiagnosticsToolCall = {
               callId: toolCallId,
               name: tool.name,
@@ -526,6 +543,15 @@ export function createAgentHost(options: AgentHostOptions) {
           webSearchCalls += 1;
           if (webSearchCalls > MAX_WEB_SEARCH_CALLS) {
             const blockedText = `web_search 已达到本轮上限（${MAX_WEB_SEARCH_CALLS} 次）。请基于已获得的网络资料回答，并标注来源。`;
+            toolCalls.push({
+              callId: toolCallId,
+              toolName: tool.name,
+              title: tool.label ?? tool.name,
+              argumentsJson: JSON.stringify(params),
+              resultText: blockedText,
+              status: "rejected",
+              isError: true,
+            });
             const toolCall: RunDiagnosticsToolCall = {
               callId: toolCallId,
               name: tool.name,
@@ -540,8 +566,33 @@ export function createAgentHost(options: AgentHostOptions) {
           }
         }
         const startedAt = Date.now();
-        const result = await tool.execute(toolCallId, params, signal, onUpdate);
+        let result: AgentToolResult<unknown>;
+        try {
+          result = await tool.execute(toolCallId, params, signal, onUpdate);
+        } catch (error) {
+          // 执行出错：落 error 行后原样上抛，由 agent 循环合成错误工具结果。
+          toolCalls.push({
+            callId: toolCallId,
+            toolName: tool.name,
+            title: tool.label ?? tool.name,
+            argumentsJson: JSON.stringify(params),
+            resultText: error instanceof Error ? error.message : String(error),
+            status: "error",
+            isError: true,
+          });
+          throw error;
+        }
         const firstText = result.content.find((block): block is Extract<typeof block, { type: "text" }> => block.type === "text");
+        toolCalls.push({
+          callId: toolCallId,
+          toolName: tool.name,
+          title: tool.label ?? tool.name,
+          argumentsJson: JSON.stringify(params),
+          resultText: firstText?.text ?? "",
+          status: "executed",
+          isError: false,
+          mediaPath: toolMediaPathJson(result.details),
+        });
         const toolCall: RunDiagnosticsToolCall = {
           callId: toolCallId,
           name: tool.name,
@@ -730,37 +781,36 @@ export function createAgentHost(options: AgentHostOptions) {
       }
     }
 
-    if (assistantMessageId) {
-      const finalized = store.finalizeMessage({
-        sessionId,
-        messageId: assistantMessageId,
+    // T44：run 级收尾——工具行与消息收尾同一事务；首请求即失败（无 assistant 消息）也落工具行，
+    // 修复旧 finalizeMessage 路径下工具行无声丢失的收尾漏洞。
+    const message = assistantMessageId ? {
+      messageId: assistantMessageId,
+      body: assistantBody,
+      status: assistantFailure?.status ?? "complete" as const,
+      errorMessage: assistantFailure?.message,
+      evidence: collectEvidence(),
+    } : undefined;
+    const finalized = store.finalizeRun({ sessionId, runId, toolCalls, message });
+    if (finalized && message) {
+      if (!assistantFailure && lastAnswerInput > 0) {
+        store.saveSessionAnchor(sessionId, lastAnswerInput, connection.model, message.messageId);
+      }
+      if (assistantFailure?.status !== "cancelled" && assistantBody) {
+        await options.indexConversationMessage?.(bookId, {
+          id: message.messageId,
+          role: "assistant",
+          body: assistantBody,
+          status: assistantFailure?.status ?? "complete",
+        });
+        indexedThrough.set(sessionId, message.messageId);
+      }
+      options.emit({
+        stream: "message",
         runId,
-        body: assistantBody,
+        sessionId,
         status: assistantFailure?.status ?? "complete",
         errorMessage: assistantFailure?.message,
-        evidence: collectEvidence(),
       });
-      if (finalized) {
-        if (!assistantFailure && lastAnswerInput > 0) {
-          store.saveSessionAnchor(sessionId, lastAnswerInput, connection.model, assistantMessageId);
-        }
-        if (assistantFailure?.status !== "cancelled" && assistantBody) {
-          await options.indexConversationMessage?.(bookId, {
-            id: assistantMessageId,
-            role: "assistant",
-            body: assistantBody,
-            status: assistantFailure?.status ?? "complete",
-          });
-          indexedThrough.set(sessionId, assistantMessageId);
-        }
-        options.emit({
-          stream: "message",
-          runId,
-          sessionId,
-          status: assistantFailure?.status ?? "complete",
-          errorMessage: assistantFailure?.message,
-        });
-      }
     }
 
     collector.finish(assistantFailure?.status === "error" ? "error" : assistantFailure?.status === "cancelled" ? "cancelled" : "complete");

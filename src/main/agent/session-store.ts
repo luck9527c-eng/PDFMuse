@@ -89,6 +89,26 @@ export type SessionStoreOptions = {
   deleteConversationEmbeddings?: (bookId: string, database: DatabaseSync) => void;
 };
 
+/**
+ * 工具调用落库行（T44）：一次 run 的完整调用轨迹，finalizeRun 时批量写入。
+ * status 三类——executed（工具层实际执行）、rejected（工具层拒绝：预算/上限钳制）、error（执行出错）；
+ * schema 校验被拒的调用不落库（发生在 vendored agent-loop 内部，宿主无捕获点）。
+ */
+export type PersistedToolCall = {
+  /** provider toolCallId，回放合成 toolCall/toolResult 配对的依据。 */
+  callId: string;
+  toolName: string;
+  /** 工具注册表中文标题（冗余落库，展示与占位文案免反查）。 */
+  title: string;
+  argumentsJson: string;
+  /** 结果文本全量（工具层截断是唯一截断，此处不二次截断）。 */
+  resultText: string;
+  status: "executed" | "rejected" | "error";
+  isError: boolean;
+  /** 图片行的媒体引用 JSON（`[{"page":N,"path":"<bookId>/<file>"}]`，相对 media 根目录）；非图片行为空。 */
+  mediaPath?: string;
+};
+
 export function createSessionStore(dataHome: string, options: SessionStoreOptions = {}) {
   const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
   database.exec(`
@@ -118,8 +138,25 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS agent_tool_calls (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+      run_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      call_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      title TEXT NOT NULL,
+      arguments_json TEXT NOT NULL,
+      result_text TEXT NOT NULL,
+      media_path TEXT,
+      status TEXT NOT NULL CHECK (status IN ('executed', 'rejected', 'error')),
+      is_error INTEGER NOT NULL CHECK (is_error IN (0, 1)),
+      created_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS agent_messages_session_order
       ON agent_messages(session_id, created_at, id);
+    CREATE INDEX IF NOT EXISTS agent_tool_calls_run_order
+      ON agent_tool_calls(session_id, created_at, seq);
   `);
   const sessionColumns = new Set(
     (database.prepare("PRAGMA table_info(agent_sessions)").all() as { name: string }[])
@@ -165,6 +202,12 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
       id, session_id, run_id, role, body, status, error_message, focus_json, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const insertToolCallStatement = database.prepare(`
+    INSERT INTO agent_tool_calls (
+      id, session_id, run_id, seq, call_id, tool_name, title, arguments_json, result_text, media_path, status, is_error, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const clearToolCallsStatement = database.prepare("DELETE FROM agent_tool_calls WHERE session_id = ?");
   const updateMessageStatement = database.prepare(`
     UPDATE agent_messages
     SET body = ?, status = ?, error_message = ?, evidence_json = COALESCE(?, evidence_json), updated_at = ?
@@ -249,6 +292,7 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
       if (!session) return;
       database.exec("BEGIN IMMEDIATE");
       try {
+        clearToolCallsStatement.run(session.id);
         clearMessagesStatement.run(session.id);
         resetSessionStateStatement.run(now(), session.id);
         options.deleteConversationEmbeddings?.(bookId, database);
@@ -266,6 +310,9 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
 
     /** 每书数据清理钩子：在调用方提供的连接上删除本书会话与消息（消息先删以满足外键）。 */
     deleteBookData(bookId: string, connection: DatabaseSync) {
+      connection.prepare(
+        "DELETE FROM agent_tool_calls WHERE session_id IN (SELECT id FROM agent_sessions WHERE book_id = ?)",
+      ).run(bookId);
       connection.prepare(
         "DELETE FROM agent_messages WHERE session_id IN (SELECT id FROM agent_sessions WHERE book_id = ?)",
       ).run(bookId);
@@ -317,31 +364,69 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
       };
     },
 
-    // 只有仍处于 streaming 且属于同一运行的消息才允许收尾；过期运行不得覆盖新结果。
-    finalizeMessage(input: {
+    /**
+     * run 级收尾（T44）：单一事务内完成本 run 工具行的批量 INSERT 与（若有）assistant 消息的收尾 UPDATE。
+     * 工具行以入参数组顺序写入 seq（1 起），读取排序一律 `(created_at, seq)`——批量共享同一 created_at，
+     * UUID 主键不能作序。崩溃等未达终态的 run 不会调到本接口，工具行一行不留（与「失败 run 排除回放」口径一致）。
+     * 返回值表示消息是否收尾成功（所有权校验失败或未提供消息时为 false，工具行照常写入）。
+     */
+    finalizeRun(input: {
       sessionId: string;
-      messageId: string;
       runId: string;
-      body: string;
-      status: AgentMessageStatus;
-      errorMessage?: string;
-      evidence?: ConversationEvidence[];
-    }) {
-      const owned = findMessageRunStatement.get(input.messageId, input.sessionId) as
-        | { run_id: string; status: string }
-        | undefined;
-      if (!owned || owned.run_id !== input.runId || owned.status !== "streaming") return false;
-      updateMessageStatement.run(
-        input.body,
-        input.status,
-        input.errorMessage ?? null,
-        input.evidence && input.evidence.length > 0 ? JSON.stringify(input.evidence) : null,
-        now(),
-        input.messageId,
-        input.sessionId,
-      );
-      touchSessionStatement.run(now(), input.sessionId);
-      return true;
+      toolCalls: PersistedToolCall[];
+      message?: {
+        messageId: string;
+        body: string;
+        status: AgentMessageStatus;
+        errorMessage?: string;
+        evidence?: ConversationEvidence[];
+      };
+    }): boolean {
+      const timestamp = now();
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        let messageFinalized = false;
+        if (input.message) {
+          const owned = findMessageRunStatement.get(input.message.messageId, input.sessionId) as
+            | { run_id: string; status: string }
+            | undefined;
+          if (owned && owned.run_id === input.runId && owned.status === "streaming") {
+            updateMessageStatement.run(
+              input.message.body,
+              input.message.status,
+              input.message.errorMessage ?? null,
+              input.message.evidence && input.message.evidence.length > 0 ? JSON.stringify(input.message.evidence) : null,
+              timestamp,
+              input.message.messageId,
+              input.sessionId,
+            );
+            touchSessionStatement.run(timestamp, input.sessionId);
+            messageFinalized = true;
+          }
+        }
+        for (const [index, call] of input.toolCalls.entries()) {
+          insertToolCallStatement.run(
+            randomUUID(),
+            input.sessionId,
+            input.runId,
+            index + 1,
+            call.callId,
+            call.toolName,
+            call.title,
+            call.argumentsJson,
+            call.resultText,
+            call.mediaPath ?? null,
+            call.status,
+            call.isError ? 1 : 0,
+            timestamp,
+          );
+        }
+        database.exec("COMMIT");
+        return messageFinalized;
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
     },
 
     listMessages(sessionId: string): ConversationMessage[] {

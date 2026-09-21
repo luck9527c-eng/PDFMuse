@@ -153,4 +153,96 @@ describe("session store", () => {
     reopened.close();
     store = undefined as unknown as ReturnType<typeof createSessionStore>;
   });
+
+  it("finalizeRun 批量落工具行：seq 按入参序、字段完整、消息同事务收尾（T44）", () => {
+    store = createSessionStore(dataHome);
+    const session = store.ensureSession(BOOK_ID);
+    const streaming = store.appendMessage({ sessionId: session.id, runId: "run-t44", role: "assistant", body: "", status: "streaming" });
+    const finalized = store.finalizeRun({
+      sessionId: session.id,
+      runId: "run-t44",
+      toolCalls: [
+        { callId: "call-2", toolName: "book_search", title: "检索本书", argumentsJson: '{"query":"二"}', resultText: "结果二", status: "executed", isError: false },
+        { callId: "call-1", toolName: "book_search", title: "检索本书", argumentsJson: '{"query":"一"}', resultText: "结果一", status: "executed", isError: false },
+      ],
+      message: { messageId: streaming.id, body: "回答", status: "complete" },
+    });
+
+    expect(finalized).toBe(true);
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    const rows = database.prepare("SELECT * FROM agent_tool_calls ORDER BY created_at, seq").all() as Array<Record<string, unknown>>;
+    database.close();
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.seq)).toEqual([1, 2]);
+    expect(rows[0]).toMatchObject({
+      session_id: session.id,
+      run_id: "run-t44",
+      call_id: "call-2",
+      tool_name: "book_search",
+      title: "检索本书",
+      arguments_json: '{"query":"二"}',
+      result_text: "结果二",
+      status: "executed",
+      is_error: 0,
+      media_path: null,
+    });
+    expect(store.listMessages(session.id).at(-1)).toMatchObject({ body: "回答", status: "complete" });
+  });
+
+  it("finalizeRun 消息所有权失败仍落工具行，且可只落工具行（T44 收尾漏洞修复）", () => {
+    store = createSessionStore(dataHome);
+    const session = store.ensureSession(BOOK_ID);
+    // 消息属于另一个 run：所有权校验失败，消息不收尾但工具行照常落库。
+    const otherRun = store.appendMessage({ sessionId: session.id, runId: "other-run", role: "assistant", body: "", status: "streaming" });
+    const finalized = store.finalizeRun({
+      sessionId: session.id,
+      runId: "run-t44b",
+      toolCalls: [{ callId: "call-x", toolName: "read_pages", title: "读取页面", argumentsJson: "{}", resultText: "页面文本", status: "executed", isError: false }],
+      message: { messageId: otherRun.id, body: "不应生效", status: "complete" },
+    });
+    expect(finalized).toBe(false);
+    // 无消息输入（首请求即失败等终态）也照常落行。
+    store.finalizeRun({
+      sessionId: session.id,
+      runId: "run-t44c",
+      toolCalls: [{ callId: "call-y", toolName: "book_search", title: "检索本书", argumentsJson: "{}", resultText: "拒绝", status: "rejected", isError: true, mediaPath: '[{"page":3,"path":"x/p3.png"}]' }],
+    });
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    const rows = database.prepare("SELECT run_id, call_id, status, is_error, media_path FROM agent_tool_calls ORDER BY created_at, seq").all() as Array<Record<string, unknown>>;
+    database.close();
+    expect(rows).toEqual([
+      { run_id: "run-t44b", call_id: "call-x", status: "executed", is_error: 0, media_path: null },
+      { run_id: "run-t44c", call_id: "call-y", status: "rejected", is_error: 1, media_path: '[{"page":3,"path":"x/p3.png"}]' },
+    ]);
+    // streaming 行经公开视图映射为 cancelled（中断语义），证明消息未被收尾。
+    expect(store.listMessages(session.id).at(-1)?.status).toBe("cancelled");
+  });
+
+  it("clearConversation 与 deleteBookData 一并清理工具行（T44）", () => {
+    store = createSessionStore(dataHome);
+    const session = store.ensureSession(BOOK_ID);
+    store.finalizeRun({
+      sessionId: session.id,
+      runId: "run-x",
+      toolCalls: [{ callId: "c", toolName: "book_search", title: "检索本书", argumentsJson: "{}", resultText: "r", status: "executed", isError: false }],
+    });
+    const other = store.ensureSession(OTHER_BOOK_ID);
+    store.finalizeRun({
+      sessionId: other.id,
+      runId: "run-y",
+      toolCalls: [{ callId: "c2", toolName: "book_search", title: "检索本书", argumentsJson: "{}", resultText: "r2", status: "executed", isError: false }],
+    });
+
+    store.clearConversation(BOOK_ID);
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    const countFor = (bookId: string) => (database.prepare(
+      "SELECT COUNT(*) AS n FROM agent_tool_calls WHERE session_id IN (SELECT id FROM agent_sessions WHERE book_id = ?)",
+    ).get(bookId) as { n: number }).n;
+    expect(countFor(BOOK_ID)).toBe(0);
+    expect(countFor(OTHER_BOOK_ID)).toBe(1);
+
+    store.deleteBookData(OTHER_BOOK_ID, database);
+    expect(countFor(OTHER_BOOK_ID)).toBe(0);
+    database.close();
+  });
 });

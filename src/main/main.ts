@@ -18,6 +18,7 @@ import { buildAiOutlineCompleter } from "./agent/outline-ai.js";
 import { createSessionStore } from "./agent/session-store.js";
 import { createToolRegistry } from "./agent/tool-registry.js";
 import { createWebSearchModule } from "./agent/web-search.js";
+import { createToolMedia } from "./tool-media.js";
 import { createOcrModule } from "./ocr.js";
 import { createWorkerMineruEngine } from "./mineru.js";
 import { createPageRenderer } from "./page-render.js";
@@ -260,6 +261,9 @@ app.whenReady().then(async () => {
     library.registerBookDataCleaner(bookOutline.deleteBookData);
     library.registerBookDataCleaner(ocr.deleteBookData);
     library.registerBookDataCleaner(backgroundJobs.deleteBookData);
+    // T44：read_page_image 原图媒体目录（<dataHome>/media/<bookId>），删除书籍数据时整目录移除。
+    const toolMedia = createToolMedia(startupPreflight.dataHome);
+    library.registerBookDataCleaner(toolMedia.deleteBookData);
     void readAppConfig(configPath)
       .then((config) => {
         if (!config.embedding?.baseUrl.trim() || !config.embedding.model.trim()) {
@@ -295,6 +299,7 @@ app.whenReady().then(async () => {
         pageBudget: context.pageBudget,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
+        savePageImage: toolMedia.savePageImage,
         webSearch,
       })),
       indexConversationMessage: async (bookId, message) => {

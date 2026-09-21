@@ -8,6 +8,7 @@ import { createLibraryModule } from "../library.js";
 import { createPageRenderer } from "../page-render.js";
 import { createToolRegistry, type PageImageBudget } from "./tool-registry.js";
 import { validateToolArguments } from "./openclaw-core.js";
+import { createToolMedia } from "../tool-media.js";
 
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
 
@@ -42,6 +43,7 @@ describe("tool registry", () => {
       bookId,
       bookIndex,
       renderPageImage: (id: string, page: number, scale: number) => pageRenderer.renderPage(id, page, scale),
+      savePageImage: async (id: string, page: number) => ({ relativePath: `${id}/p${page}-test.png` }),
       pageBudget: budget,
       reportEvidence: reportEvidence as (evidence: never[]) => void,
     };
@@ -73,6 +75,24 @@ describe("tool registry", () => {
     const details = result.details as { evidence?: Array<{ page: number; snippet: string }>; displaySummary?: string };
     expect(details.evidence?.map((item) => item.page)).toEqual([1, 2]);
     expect(details.displaySummary).toContain("第 1、2 页");
+  });
+
+  it("persists page image files to the media directory with references in details (T44)", async () => {
+    const toolMedia = createToolMedia(dataHome);
+    const registry = createToolRegistry();
+    const tool = registry.buildAgentTools(() => ({ ...context(), savePageImage: toolMedia.savePageImage }))
+      .find((item) => item.name === "read_page_image")!;
+    const result = await tool.execute("call-media-1", { pages: [1, 2] });
+
+    const details = result.details as { media?: Array<{ page: number; path: string }> };
+    expect(details.media?.map((item) => item.page)).toEqual([1, 2]);
+    for (const item of details.media ?? []) {
+      // 落盘字节 = 随结果发给模型的字节（live 与回放同源）。
+      const stored = await readFile(path.join(dataHome, "media", item.path));
+      expect(stored.length).toBeGreaterThan(100);
+    }
+    const content = result.content as Array<{ type: string; data?: string }>;
+    expect(content.filter((block) => block.type === "image")).toHaveLength(2);
   });
 
   it("steers read_page_image to locate first and default one page", () => {
