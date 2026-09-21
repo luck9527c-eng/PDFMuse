@@ -95,6 +95,8 @@ export type SessionStoreOptions = {
  * schema 校验被拒的调用不落库（发生在 vendored agent-loop 内部，宿主无捕获点）。
  */
 export type PersistedToolCall = {
+  /** 所属 run；写侧由 finalizeRun 的 input.runId 统一落列，读接口回填。 */
+  runId: string;
   /** provider toolCallId，回放合成 toolCall/toolResult 配对的依据。 */
   callId: string;
   toolName: string;
@@ -221,6 +223,12 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
     FROM agent_messages
     WHERE session_id = ?
     ORDER BY created_at ASC, id ASC
+  `);
+  const listToolCallsStatement = database.prepare(`
+    SELECT run_id, call_id, tool_name, title, arguments_json, result_text, media_path, status, is_error
+    FROM agent_tool_calls
+    WHERE session_id = ?
+    ORDER BY created_at ASC, seq ASC
   `);
   const abandonStreamingStatement = database.prepare(`
     UPDATE agent_messages
@@ -431,6 +439,31 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
 
     listMessages(sessionId: string): ConversationMessage[] {
       return (listMessagesStatement.all(sessionId) as MessageRow[]).map(toConversationMessage);
+    },
+
+    /** 会话工具行读接口（T45）：回放装配与压缩估算按 `(created_at, seq)` 序消费。 */
+    listToolCalls(sessionId: string): PersistedToolCall[] {
+      return (listToolCallsStatement.all(sessionId) as Array<{
+        run_id: string;
+        call_id: string;
+        tool_name: string;
+        title: string;
+        arguments_json: string;
+        result_text: string;
+        media_path: string | null;
+        status: PersistedToolCall["status"];
+        is_error: 0 | 1;
+      }>).map((row) => ({
+        runId: row.run_id,
+        callId: row.call_id,
+        toolName: row.tool_name,
+        title: row.title,
+        argumentsJson: row.arguments_json,
+        resultText: row.result_text,
+        status: row.status,
+        isError: row.is_error === 1,
+        ...(row.media_path ? { mediaPath: row.media_path } : {}),
+      }));
     },
 
     // 异常退出遗留的 streaming 占位在下次启动时转为取消，保留已写入内容。

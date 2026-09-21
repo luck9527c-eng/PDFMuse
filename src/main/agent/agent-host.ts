@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 import type {
   AgentStreamEvent,
@@ -10,7 +12,16 @@ import type {
   StartAgentRunResult,
 } from "../../shared/contracts.js";
 import { CONVERSATION_EVIDENCE_MAX, DEFAULT_MODEL_CONTEXT_WINDOW, MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES, MAX_AGENT_IMAGE_TOTAL_BYTES } from "../../shared/contracts.js";
-import { assistantText, buildQuestionContent, buildSystemPrompt, historyMessagesToLlmMessages, historyToLlmMessages, toSessionEntries } from "./context-assembly.js";
+import {
+  assistantText,
+  buildQuestionContent,
+  buildReplayMessages,
+  buildSystemPrompt,
+  estimatingImageLoader,
+  historyToLlmMessages,
+  toSessionEntries,
+  type ReplayImageLoader,
+} from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, parseContextWindowError, toLlmModel, type ContextWindowError, type ResolvedModelConnection } from "./model-runtime.js";
 import type { PageImageBudget } from "./tool-registry.js";
 import {
@@ -180,11 +191,6 @@ type ActiveRun = {
 type AssistantFailure = { status: "error" | "cancelled"; message?: string };
 
 /** 错误/取消的回答不进入模型上下文，与 context-assembly 的可用性过滤保持同一规则。 */
-function usableLlmMessages(history: ConversationMessage[]) {
-  return historyMessagesToLlmMessages(
-    history.filter((message) => message.role === "reader" || message.status === "complete"),
-  );
-}
 
 export function createAgentHost(options: AgentHostOptions) {
   const store: SessionStore = options.store ?? createSessionStore(options.dataHome);
@@ -213,6 +219,15 @@ export function createAgentHost(options: AgentHostOptions) {
   let effectiveWindowOverride: number | undefined;
   // 压缩冷却：per session 内存态，重启归零；压缩后仍接近阈值时进入，防止每问白打一次摘要调用。
   const compactionCooldowns = new Map<string, { level: number; until: number }>();
+
+  // T45：回放媒体加载——缺失降级占位文本（媒体目录被移动是便携分发下的现实场景）。
+  const replayImageLoader: ReplayImageLoader = async (relativePath) => {
+    try {
+      return (await readFile(path.join(options.dataHome, "media", relativePath))).toString("base64");
+    } catch {
+      return null;
+    }
+  };
 
   store.abandonInterruptedMessages("程序中断，回答未完成。");
 
@@ -261,6 +276,7 @@ export function createAgentHost(options: AgentHostOptions) {
   async function compactHistory(
     sessionId: string,
     history: ConversationMessage[],
+    toolCalls: ReadonlyArray<PersistedToolCall>,
     connection: ResolvedModelConnection,
     streamFn?: StreamFn,
     overrides: { force?: boolean; systemPrompt?: string; questionContent?: string; signal?: AbortSignal } = {},
@@ -268,7 +284,6 @@ export function createAgentHost(options: AgentHostOptions) {
     const previous = store.getSummary(sessionId);
     const previousIndex = previous ? history.findIndex((message) => message.id === previous.throughMessageId) : -1;
     const workingHistory = previousIndex >= 0 ? history.slice(previousIndex + 1) : history;
-    const historyMessages = usableLlmMessages(workingHistory);
     const summaryMessage = previous?.summary
       ? [{ role: "user" as const, content: `【Conversation Summary】\n${previous.summary}`, timestamp: 0 }]
       : [];
@@ -291,12 +306,23 @@ export function createAgentHost(options: AgentHostOptions) {
     const anchored = Boolean(anchor) && anchor!.model === connection.model && anchorIndex >= 0;
     let contextTokens: number;
     if (anchored && anchor) {
-      const anchorDelta = usableLlmMessages(history.slice(anchorIndex + 1));
+      // 锚点增量（T45）：走回放装配管线，工具行按 `(created_at, seq)` 计入；锚点切片从下一 run 起始，
+      // buildReplayMessages 按 run 自过滤工具行。图片按固定 2000 token 记账（估算不读文件）。
+      const anchorDeltaMessages = await buildReplayMessages({
+        history: history.slice(anchorIndex + 1),
+        toolCalls,
+        loadImage: estimatingImageLoader,
+      });
       contextTokens = anchor.inputTokens
-        + anchorDelta.reduce((total, message) => total + estimateTokens(message), 0)
+        + anchorDeltaMessages.reduce((total, message) => total + estimateTokens(message), 0)
         + questionEstimate;
     } else {
-      contextTokens = [...summaryMessage, ...historyMessages]
+      const workingReplay = await buildReplayMessages({
+        history: workingHistory,
+        toolCalls,
+        loadImage: estimatingImageLoader,
+      });
+      contextTokens = [...summaryMessage, ...workingReplay]
         .reduce((total, message) => total + estimateTokens(message), 0)
         + systemEstimate
         + questionEstimate;
@@ -357,7 +383,7 @@ export function createAgentHost(options: AgentHostOptions) {
     const nextHistory = history.slice(history.findIndex((message) => message.id === throughEntry.id) + 1);
     // 压缩后仍接近阈值 → 会话进入冷却递增档；降到阈值以下 → 归零。
     // 判断值用纯估算（锚点描述的是压缩前的请求形状，头部重写后已过期），口径含 system prompt 与当轮问题。
-    const afterMessages = usableLlmMessages(nextHistory);
+    const afterMessages = await buildReplayMessages({ history: nextHistory, toolCalls, loadImage: estimatingImageLoader });
     const afterTokens = estimateTokens({ role: "user", content: `【Conversation Summary】\n${compacted.summary}`, timestamp: 0 })
       + afterMessages.reduce((total, message) => total + estimateTokens(message), 0)
       + systemEstimate
@@ -398,9 +424,13 @@ export function createAgentHost(options: AgentHostOptions) {
 
     // Reader 问题先落盘：失败或中断时问题和阅读焦点不丢失。
     const fullHistory = store.listMessages(sessionId);
+    // T44：本 run 的工具调用全保真轨迹；声明提前——压缩估算与回放装配都要消费。
+    const toolCalls: PersistedToolCall[] = [];
+    // T45：历史 run 的工具行（库内读取，按 `(created_at, seq)` 序）——回放装配与压缩估算的消费源。
+    const historyToolCalls = store.listToolCalls(sessionId);
     let activeCallStartedAt = 0;
     const startCallClock = () => { activeCallStartedAt = Date.now(); };
-    // Reading Focus 增强与上轮 Evidence 前移到压缩之前：压缩判断值需要当轮问题内容与 system prompt 的估算。
+    // Reading Focus 增强前移到压缩之前：压缩判断值需要当轮问题内容与 system prompt 的估算。
     const sectionTitle = focus ? await options.resolveReadingSection?.(bookId, focus.currentPage) : undefined;
     const chapterRange = focus ? await options.resolveChapterRange?.(bookId, focus.currentPage) : undefined;
     const focusWithContext: ReadingFocus | undefined = focus ? {
@@ -409,11 +439,7 @@ export function createAgentHost(options: AgentHostOptions) {
       ...(sectionTitle ? { sectionTitle } : {}),
       ...(chapterRange ? { chapterRange } : {}),
     } : undefined;
-    // 上轮 Evidence 注入：只取最近一条完成回答（常数开销，不随会话累积），追问免重查一手原文。
-    const previousEvidence = fullHistory.findLast(
-      (message) => message.role === "assistant" && message.status === "complete",
-    )?.evidence;
-    const questionContent = buildQuestionContent(question, focusWithContext, previousEvidence);
+    const questionContent = buildQuestionContent(question, focusWithContext);
     const systemPrompt = buildSystemPrompt(profile, bookTitle ? { title: bookTitle } : undefined);
     // T43：压缩请求带硬超时与取消信号，挂死或用户取消即时中断，不占住会话 lane。
     // 控制器仅伴随压缩窗口（初始压缩与撞窗自愈）；回答阶段无压缩在飞，cancel 走 agent.abort。
@@ -425,6 +451,7 @@ export function createAgentHost(options: AgentHostOptions) {
         return await compactHistory(
           sessionId,
           fullHistory,
+          overrides.force ? [...historyToolCalls, ...toolCalls] : historyToolCalls,
           connection,
           wrapStreamFnWithDiagnostics(() => makeStreamFn(connection), () => "compaction", collector, options.emit, startCallClock),
           { ...overrides, systemPrompt, questionContent, signal },
@@ -474,12 +501,12 @@ export function createAgentHost(options: AgentHostOptions) {
     });
     indexedThrough.set(sessionId, readerMessage.id);
 
-    const llmMessages = historyToLlmMessages(history, {
+    const llmMessages = await historyToLlmMessages(history, historyToolCalls, {
       question,
       focus: focusWithContext,
       attachments,
       summary: compacted.summary,
-      previousEvidence,
+      loadImage: replayImageLoader,
     });
     const questionMessage = llmMessages[llmMessages.length - 1];
     if (!questionMessage) return;
@@ -507,8 +534,8 @@ export function createAgentHost(options: AgentHostOptions) {
     // 工具包装：捕获参数、结果与耗时进运行诊断；检索类工具设每轮上限防散射打捞。
     let bookSearchCalls = 0;
     let webSearchCalls = 0;
-    // T44：工具调用全保真轨迹（诊断视图照旧截断，此处不二次截断），run 收尾时随 finalizeRun 批量落库。
-    const toolCalls: PersistedToolCall[] = [];
+    // 工具包装：捕获参数、结果与耗时进运行诊断；检索类工具设每轮上限防散射打捞。
+    // 全保真行已在 executeRun 前段声明（toolCalls），此处只负责追加。
     const diagnosticsTools = tools.map((tool): AgentTool => ({
       ...tool,
       async execute(toolCallId, params, signal, onUpdate) {
@@ -518,6 +545,7 @@ export function createAgentHost(options: AgentHostOptions) {
           if (bookSearchCalls > MAX_BOOK_SEARCH_CALLS) {
             const blockedText = `book_search 已达到本轮上限（${MAX_BOOK_SEARCH_CALLS} 次）。请基于已检索到的内容回答；若信息不足，请向 Reader 明确说明。`;
             toolCalls.push({
+              runId,
               callId: toolCallId,
               toolName: tool.name,
               title: tool.label ?? tool.name,
@@ -544,6 +572,7 @@ export function createAgentHost(options: AgentHostOptions) {
           if (webSearchCalls > MAX_WEB_SEARCH_CALLS) {
             const blockedText = `web_search 已达到本轮上限（${MAX_WEB_SEARCH_CALLS} 次）。请基于已获得的网络资料回答，并标注来源。`;
             toolCalls.push({
+              runId,
               callId: toolCallId,
               toolName: tool.name,
               title: tool.label ?? tool.name,
@@ -572,6 +601,7 @@ export function createAgentHost(options: AgentHostOptions) {
         } catch (error) {
           // 执行出错：落 error 行后原样上抛，由 agent 循环合成错误工具结果。
           toolCalls.push({
+            runId,
             callId: toolCallId,
             toolName: tool.name,
             title: tool.label ?? tool.name,
@@ -584,6 +614,7 @@ export function createAgentHost(options: AgentHostOptions) {
         }
         const firstText = result.content.find((block): block is Extract<typeof block, { type: "text" }> => block.type === "text");
         toolCalls.push({
+          runId,
           callId: toolCallId,
           toolName: tool.name,
           title: tool.label ?? tool.name,
@@ -766,12 +797,12 @@ export function createAgentHost(options: AgentHostOptions) {
       assistantBodyStart = assistantBody.length;
       const healed = await runCompaction({ force: true });
       if (!cancelledBeforeStart.delete(runId)) {
-        const healedMessages = historyToLlmMessages(healed.history, {
+        const healedMessages = await historyToLlmMessages(healed.history, historyToolCalls, {
           question,
           focus: focusWithContext,
           attachments,
           summary: healed.summary,
-          previousEvidence,
+          loadImage: replayImageLoader,
         });
         if (healedMessages[healedMessages.length - 1]) {
           await runTurn(healedMessages);
