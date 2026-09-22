@@ -55,6 +55,22 @@ describe("preflightDataHome", () => {
     await expect(hasOcrResources(applicationDirectory)).resolves.toBe(false);
   });
 
+  it("字节码是派生缓存：写入 __pycache__/.pyc 不改变目录哈希", async () => {
+    const applicationDirectory = await createWorkspace();
+    const resources = path.join(applicationDirectory, "resources");
+    const runtime = path.join(resources, "mineru-runtime");
+    await mkdir(path.join(runtime, "Lib", "site-packages"), { recursive: true });
+    await Promise.all([
+      writeFile(path.join(runtime, "python.exe"), "runtime"),
+      writeFile(path.join(runtime, "Lib", "site-packages", "model.onnx"), "model"),
+    ]);
+    const before = await hashOcrResource(runtime);
+    await mkdir(path.join(runtime, "Lib", "site-packages", "__pycache__"), { recursive: true });
+    await writeFile(path.join(runtime, "Lib", "site-packages", "__pycache__", "model.cpython-311.pyc"), "bytecode");
+    await writeFile(path.join(runtime, "Lib", "site-packages", "loose.pyc"), "bytecode");
+    await expect(hashOcrResource(runtime)).resolves.toBe(before);
+  });
+
   it("creates the complete portable data root beside the application", async () => {
     const applicationDirectory = await createWorkspace();
 

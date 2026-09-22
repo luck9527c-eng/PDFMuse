@@ -50,9 +50,13 @@ async function collectResourceFiles(directory: string, relative = ""): Promise<s
   const files: string[] = [];
   for (const entry of entries) {
     const child = path.join(relative, entry.name);
-    if (entry.isDirectory()) files.push(...await collectResourceFiles(directory, child));
-    else if (entry.isFile()) files.push(child);
-    else throw new Error("OCR 资源包含不支持的文件类型。");
+    // 字节码是派生缓存：与 prepare-mineru-runtime.mjs 的清单规则一致，不参与哈希。
+    if (entry.isDirectory() && entry.name === "__pycache__") continue;
+    if (entry.isDirectory()) files.push(...(await collectResourceFiles(directory, child)));
+    else if (entry.isFile()) {
+      if (entry.name.endsWith(".pyc")) continue;
+      files.push(child);
+    } else throw new Error("OCR 资源包含不支持的文件类型。");
   }
   return files;
 }

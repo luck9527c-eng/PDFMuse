@@ -23,7 +23,7 @@ mkdirSync(OUT_DIR, { recursive: true });
 const child = spawn(PYTHON, [WORKER], {
   cwd: ROOT,
   stdio: ["pipe", "pipe", "pipe"],
-  env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8", MINERU_HOME },
+  env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8", PYTHONDONTWRITEBYTECODE: "1", MINERU_HOME },
 });
 child.stderr.on("data", (d) => process.stderr.write(`[worker] ${d}`));
 

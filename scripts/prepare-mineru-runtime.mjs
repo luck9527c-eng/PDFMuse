@@ -67,9 +67,13 @@ async function listFiles(directory, relative = "") {
   const files = [];
   for (const entry of entries) {
     const child = path.join(relative, entry.name);
+    // 字节码是派生缓存：不参与哈希，避免运行期写入导致清单永久性误报。
+    if (entry.name === "__pycache__" && entry.isDirectory()) continue;
     if (entry.isDirectory()) files.push(...await listFiles(directory, child));
-    else if (entry.isFile()) files.push(child);
-    else throw new Error(`MinerU 资源包含不支持的文件类型：${child}`);
+    else if (entry.isFile()) {
+      if (entry.name.endsWith(".pyc")) continue;
+      files.push(child);
+    } else throw new Error(`MinerU 资源包含不支持的文件类型：${child}`);
   }
   return files;
 }
