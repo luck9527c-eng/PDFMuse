@@ -20,6 +20,7 @@ import {
   computeElisionDeduction,
   estimatingImageLoader,
   historyToLlmMessages,
+  parseMediaRefs,
   resolveRetainedRunIds,
   synthesizeToolPairMessagesForSummary,
   toSessionEntries,
@@ -133,7 +134,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isReadingFocus(value: unknown): value is ReadingFocus {  if (!isRecord(value)) return false;
+function isReadingFocus(value: unknown): value is ReadingFocus {
+  if (!isRecord(value)) return false;
   const currentPage = value.currentPage;
   if (typeof currentPage !== "number" || !Number.isSafeInteger(currentPage) || currentPage <= 0) return false;
   if (value.selectedPassage !== undefined) {
@@ -278,6 +280,19 @@ export function createAgentHost(options: AgentHostOptions) {
     }
   }
 
+  /** elision 投影（T47）：保留尾与超大行阈值统一解析——压缩估算、回放装配、摘要输入共用同一实例。 */
+  function resolveElision(
+    history: ConversationMessage[],
+    toolCalls: ReadonlyArray<PersistedToolCall>,
+    keepRecentEffective: number,
+    contextWindow: number,
+  ): ElisionProjection {
+    return {
+      retainedRunIds: resolveRetainedRunIds({ history, toolCalls, tokenBudget: keepRecentEffective }),
+      oversizedRowTokenThreshold: Math.max(2_000, Math.floor(contextWindow * 0.25)),
+    };
+  }
+
   /** 阈值基准（T36/T46）：连接窗口 + reserve + keepRecent 一并解析，压缩与保留尾共用同一口径。 */
   function resolveEffectiveSettings(connection: ResolvedModelConnection) {
     const contextWindow = injectedContextWindow
@@ -312,10 +327,7 @@ export function createAgentHost(options: AgentHostOptions) {
       : [];
     const { contextWindow, effectiveSettings, keepRecentEffective } = resolveEffectiveSettings(connection);
     // T47 elision 投影：保留尾外的旧行以占位进上下文（第一段），判定值按投影后口径计算。
-    const elision = {
-      retainedRunIds: resolveRetainedRunIds({ history, toolCalls, tokenBudget: keepRecentEffective }),
-      oversizedRowTokenThreshold: Math.max(2_000, Math.floor(contextWindow * 0.25)),
-    };
+    const elision = resolveElision(history, toolCalls, keepRecentEffective, contextWindow);
     // 判断值（ADR 0010）：真实 usage 锚点 + 落锚点后增量（锚点已含 system prompt，不重复计）；
     // 无锚点降级为字符估算，口径计入 system prompt 与当轮问题内容，与锚点口径对齐。
     const systemEstimate = estimateTokensFromChars(estimateStringChars(overrides.systemPrompt ?? ""));
@@ -462,12 +474,11 @@ export function createAgentHost(options: AgentHostOptions) {
     // 压缩后仍接近阈值 → 会话进入冷却递增档；降到阈值以下 → 归零。
     // 判断值用纯估算（锚点描述的是压缩前的请求形状，头部重写后已过期），口径含 system prompt 与当轮问题，
     // 按 elision 后的投影计算（T47）。
-    const afterRetainedRunIds = resolveRetainedRunIds({ history: nextHistory, toolCalls, tokenBudget: keepRecentEffective });
     const afterMessages = await buildReplayMessages({
       history: nextHistory,
       toolCalls,
       loadImage: estimatingImageLoader,
-      elision: { retainedRunIds: afterRetainedRunIds, oversizedRowTokenThreshold: elision.oversizedRowTokenThreshold },
+      elision: resolveElision(nextHistory, toolCalls, keepRecentEffective, contextWindow),
     });
     const afterTokens = estimateTokens({ role: "user", content: `【Conversation Summary】\n${compacted.summary}`, timestamp: 0 })
       + afterMessages.reduce((total, message) => total + estimateTokens(message), 0)
@@ -515,10 +526,7 @@ export function createAgentHost(options: AgentHostOptions) {
     const historyToolCalls = store.listToolCalls(sessionId);
     // T47：elision 投影——保留尾外的旧行以占位进上下文（第一段），判定值按投影后口径。
     const { contextWindow, keepRecentEffective } = resolveEffectiveSettings(connection);
-    const elision: ElisionProjection = {
-      retainedRunIds: resolveRetainedRunIds({ history: fullHistory, toolCalls: historyToolCalls, tokenBudget: keepRecentEffective }),
-      oversizedRowTokenThreshold: Math.max(2_000, Math.floor(contextWindow * 0.25)),
-    };
+    const elision = resolveElision(fullHistory, historyToolCalls, keepRecentEffective, contextWindow);
     let activeCallStartedAt = 0;
     const startCallClock = () => { activeCallStartedAt = Date.now(); };
     // Reading Focus 增强前移到压缩之前：压缩判断值需要当轮问题内容与 system prompt 的估算。
@@ -539,10 +547,14 @@ export function createAgentHost(options: AgentHostOptions) {
       compactionControllers.set(runId, compactionController);
       try {
         const signal = AbortSignal.any([compactionController.signal, AbortSignal.timeout(compactionTimeoutMs)]);
+        // 撞窗自愈（双轴审查修复）：重载会话——当前 run 的读者问题在首次压缩后才落库，
+        // 旧 fullHistory 看不见它，合并进来的本轮工具行按 run 归属过滤会被无声丢弃。
+        const history = overrides.force ? store.listMessages(sessionId) : fullHistory;
+        const rowsForCompaction = overrides.force ? [...historyToolCalls, ...toolCalls] : historyToolCalls;
         return await compactHistory(
           sessionId,
-          fullHistory,
-          overrides.force ? [...historyToolCalls, ...toolCalls] : historyToolCalls,
+          history,
+          rowsForCompaction,
           connection,
           wrapStreamFnWithDiagnostics(() => makeStreamFn(connection), () => "compaction", collector, options.emit, startCallClock),
           { ...overrides, systemPrompt, questionContent, signal },
@@ -626,8 +638,10 @@ export function createAgentHost(options: AgentHostOptions) {
     // 工具包装：捕获参数、结果与耗时进运行诊断；检索类工具设每轮上限防散射打捞。
     let bookSearchCalls = 0;
     let webSearchCalls = 0;
-    // 工具包装：捕获参数、结果与耗时进运行诊断；检索类工具设每轮上限防散射打捞。
-    // 全保真行已在 executeRun 前段声明（toolCalls），此处只负责追加。
+    // 全保真行已在 executeRun 前段声明（toolCalls），经 recordToolCall 追加。
+    const recordToolCall = (row: Omit<PersistedToolCall, "runId">) => {
+      toolCalls.push({ runId, ...row });
+    };
     const diagnosticsTools = tools.map((tool): AgentTool => ({
       ...tool,
       async execute(toolCallId, params, signal, onUpdate) {
@@ -636,8 +650,7 @@ export function createAgentHost(options: AgentHostOptions) {
           bookSearchCalls += 1;
           if (bookSearchCalls > MAX_BOOK_SEARCH_CALLS) {
             const blockedText = `book_search 已达到本轮上限（${MAX_BOOK_SEARCH_CALLS} 次）。请基于已检索到的内容回答；若信息不足，请向 Reader 明确说明。`;
-            toolCalls.push({
-              runId,
+            recordToolCall({
               callId: toolCallId,
               toolName: tool.name,
               title: tool.label ?? tool.name,
@@ -663,8 +676,7 @@ export function createAgentHost(options: AgentHostOptions) {
           webSearchCalls += 1;
           if (webSearchCalls > MAX_WEB_SEARCH_CALLS) {
             const blockedText = `web_search 已达到本轮上限（${MAX_WEB_SEARCH_CALLS} 次）。请基于已获得的网络资料回答，并标注来源。`;
-            toolCalls.push({
-              runId,
+            recordToolCall({
               callId: toolCallId,
               toolName: tool.name,
               title: tool.label ?? tool.name,
@@ -692,8 +704,7 @@ export function createAgentHost(options: AgentHostOptions) {
           result = await tool.execute(toolCallId, params, signal, onUpdate);
         } catch (error) {
           // 执行出错：落 error 行后原样上抛，由 agent 循环合成错误工具结果。
-          toolCalls.push({
-            runId,
+          recordToolCall({
             callId: toolCallId,
             toolName: tool.name,
             title: tool.label ?? tool.name,
@@ -705,16 +716,18 @@ export function createAgentHost(options: AgentHostOptions) {
           throw error;
         }
         const firstText = result.content.find((block): block is Extract<typeof block, { type: "text" }> => block.type === "text");
-        toolCalls.push({
-          runId,
+        const mediaPath = toolMediaPathJson(result.details);
+        const imagePages = parseMediaRefs(mediaPath).map((ref) => ref.page);
+        recordToolCall({
           callId: toolCallId,
           toolName: tool.name,
           title: tool.label ?? tool.name,
           argumentsJson: JSON.stringify(params),
-          resultText: firstText?.text ?? "",
+          // 图片行按 spec 1.1 落固定附图说明（live 文案含一次性预算回显，不入库）。
+          resultText: imagePages.length > 0 ? `已附上第 ${imagePages.join("、")} 页原图` : firstText?.text ?? "",
           status: "executed",
           isError: false,
-          mediaPath: toolMediaPathJson(result.details),
+          ...(mediaPath ? { mediaPath } : {}),
         });
         const toolCall: RunDiagnosticsToolCall = {
           callId: toolCallId,
@@ -889,7 +902,8 @@ export function createAgentHost(options: AgentHostOptions) {
       assistantBodyStart = assistantBody.length;
       const healed = await runCompaction({ force: true });
       if (!cancelledBeforeStart.delete(runId)) {
-        const healedMessages = await historyToLlmMessages(healed.history, historyToolCalls, {
+        // 自愈重答的回放可能含当前 run 的读者消息（重载后的历史），工具行用合并列表。
+        const healedMessages = await historyToLlmMessages(healed.history, [...historyToolCalls, ...toolCalls], {
           question,
           focus: focusWithContext,
           attachments,

@@ -36,23 +36,19 @@ export type ElisionProjection = {
 
 /** 单行结果 token 折算：文本按 CJK 启发式、图片块按 vendored 固定 2000 token 记账（mediaPath 损坏按纯文本）。 */
 export function estimateToolRowTokens(row: PersistedToolCall): number {
-  let chars = estimateStringChars(row.resultText);
-  if (row.mediaPath) {
-    try {
-      const media = JSON.parse(row.mediaPath) as Array<{ page: number; path: string }>;
-      if (Array.isArray(media)) chars += media.length * IMAGE_BLOCK_TOKENS * CHARS_PER_TOKEN_ESTIMATE;
-    } catch {
-      // mediaPath 损坏按纯文本记账。
-    }
-  }
+  const refs = parseMediaRefs(row.mediaPath);
+  const chars = estimateStringChars(row.resultText) + refs.length * IMAGE_BLOCK_TOKENS * CHARS_PER_TOKEN_ESTIMATE;
   return estimateTokensFromChars(chars);
 }
 
-function mediaPages(row: PersistedToolCall): number[] {
-  if (!row.mediaPath) return [];
+/** media_path JSON → 媒体引用（损坏/缺省按空处理）；三个消费方共享同一解析。 */
+export function parseMediaRefs(mediaPath: string | undefined): Array<{ page: number; path: string }> {
+  if (!mediaPath) return [];
   try {
-    const media = JSON.parse(row.mediaPath) as Array<{ page: number; path: string }>;
-    return Array.isArray(media) ? media.map((item) => item.page).filter((page) => typeof page === "number") : [];
+    const media = JSON.parse(mediaPath) as Array<{ page: number; path: string }>;
+    return Array.isArray(media)
+      ? media.filter((item) => typeof item?.page === "number" && typeof item?.path === "string")
+      : [];
   } catch {
     return [];
   }
@@ -60,7 +56,7 @@ function mediaPages(row: PersistedToolCall): number[] {
 
 /** 占位文案只依赖行自身字段（spec 4）：同库状态同字节，图片行附重取指引。 */
 export function elisionPlaceholderText(row: PersistedToolCall): string {
-  const pages = mediaPages(row);
+  const pages = parseMediaRefs(row.mediaPath).map((ref) => ref.page);
   if (pages.length > 0) return `第 ${pages.join("、")} 页原图已省略，如需查看可调用 read_page_image 重新获取。`;
   return `此前 ${row.title} 结果约 ${row.resultText.length} 字符，已省略`;
 }
@@ -74,6 +70,17 @@ export function elideToolRow(row: PersistedToolCall, elision: ElisionProjection)
   return !elision.retainedRunIds.has(row.runId) && row.resultText.length > 200;
 }
 
+/** 工具行按 run 分组（buildReplayMessages 与 resolveRetainedRunIds 共享同一形状）。 */
+function groupRowsByRun(toolCalls: ReadonlyArray<PersistedToolCall>): Map<string, PersistedToolCall[]> {
+  const rowsByRun = new Map<string, PersistedToolCall[]>();
+  for (const row of toolCalls) {
+    const list = rowsByRun.get(row.runId);
+    if (list) list.push(row);
+    else rowsByRun.set(row.runId, [row]);
+  }
+  return rowsByRun;
+}
+
 /**
  * 保留尾（spec 3.3）：最后一轮强制完整，由此向前按 token 预算凑整轮。
  * 纯函数——同库状态同结果；elision 边界只随新 run 落库确定性前移。
@@ -85,12 +92,7 @@ export function resolveRetainedRunIds(input: {
 }): Set<string> {
   const runOrder: string[] = [];
   const tokensByRun = new Map<string, number>();
-  const rowsByRun = new Map<string, PersistedToolCall[]>();
-  for (const row of input.toolCalls) {
-    const list = rowsByRun.get(row.runId);
-    if (list) list.push(row);
-    else rowsByRun.set(row.runId, [row]);
-  }
+  const rowsByRun = groupRowsByRun(input.toolCalls);
   for (const message of input.history) {
     if (!tokensByRun.has(message.runId)) {
       tokensByRun.set(message.runId, 0);
@@ -274,26 +276,17 @@ function safeParseArguments(json: string): Record<string, unknown> {
   }
 }
 
-/** 图片行 → 图块；文件缺失降级为占位文本（便携分发下媒体目录被移动是现实场景）。 */
+/** 图片行 → 图块；缺一即整条降级为占位模板（spec 2.1/4）——媒体目录被用户移动是便携分发下的现实场景。 */
 async function toolResultContent(row: PersistedToolCall, loadImage: ReplayImageLoader): Promise<(TextContent | ImageContent)[]> {
-  const content: (TextContent | ImageContent)[] = [{ type: "text", text: row.resultText }];
-  if (!row.mediaPath) return content;
-  try {
-    const media = JSON.parse(row.mediaPath) as Array<{ page: number; path: string }>;
-    if (!Array.isArray(media)) return content;
-    for (const item of media) {
-      if (typeof item?.path !== "string") continue;
-      const base64 = await loadImage(item.path);
-      if (base64) {
-        content.push({ type: "image", data: base64, mimeType: "image/png" });
-      } else {
-        content.push({ type: "text", text: `第 ${item.page} 页原图已缺失，如需查看请调用 read_page_image 重新获取。` });
-      }
-    }
-  } catch {
-    // mediaPath 损坏按纯文本结果处理，不炸装配。
+  const refs = parseMediaRefs(row.mediaPath);
+  if (refs.length === 0) return [{ type: "text", text: row.resultText }];
+  const images: ImageContent[] = [];
+  for (const ref of refs) {
+    const base64 = await loadImage(ref.path);
+    if (!base64) return [{ type: "text", text: elisionPlaceholderText(row) }];
+    images.push({ type: "image", data: base64, mimeType: "image/png" });
   }
-  return content;
+  return [{ type: "text", text: row.resultText }, ...images];
 }
 
 /**
@@ -366,12 +359,7 @@ export async function buildReplayMessages(input: {
   elision?: ElisionProjection;
 }): Promise<Message[]> {
   const { history, toolCalls, loadImage, elision } = input;
-  const rowsByRun = new Map<string, PersistedToolCall[]>();
-  for (const row of toolCalls) {
-    const list = rowsByRun.get(row.runId);
-    if (list) list.push(row);
-    else rowsByRun.set(row.runId, [row]);
-  }
+  const rowsByRun = groupRowsByRun(toolCalls);
 
   const messages: Message[] = [];
   for (const message of history) {

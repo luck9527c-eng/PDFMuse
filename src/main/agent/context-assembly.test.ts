@@ -77,8 +77,10 @@ describe("context assembly replay", () => {
     const executed = messages[2] as ToolResultMessage;
     expect(executed.toolCallId).toBe("c1");
     expect(executed.isError).toBe(false);
-    expect(executed.content.filter((block) => block.type === "image")).toHaveLength(1);
-    expect(executed.content.some((block) => block.type === "text" && block.text.includes("第 2 页原图已缺失"))).toBe(true);
+    // 缺一即整条降级为 4 节占位模板（审查修复：不再部分附图 + 变体注记）。
+    expect(executed.content).toEqual([
+      { type: "text", text: "第 1、2 页原图已省略，如需查看可调用 read_page_image 重新获取。" },
+    ]);
 
     const rejected = messages[3] as ToolResultMessage;
     expect(rejected.toolCallId).toBe("c2");
