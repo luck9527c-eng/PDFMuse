@@ -34,40 +34,22 @@ export function normalizePageRects(page: Rectangle, selections: Rectangle[]): No
 }
 
 /**
- * 选区命中的 OCR 块的 bbox 矩形（MinerU 坐标直接定位高亮，替代拟合字形的错位矩形）；
- * 页面无 OCR 文字层或选区未命中任何块时返回 null，调用方回落到原生字形矩形。
+ * 扫描页选区的高亮矩形：只取选区起点所在的 OCR 块 bbox（MinerU 坐标直接定位）。
+ * 不取"所有相交块"——块 bbox 彼此重叠，大范围选区会叠成整页色块（Reader 截图复盘）；
+ * 点击选整块交互下起点块恒为被点击块。起点不在 OCR 层时返回 null，调用方回落原生字形矩形。
  */
-export function ocrSelectionRects(page: HTMLElement, range: Range): Rectangle[] | null {
-  const spans = page.querySelectorAll<HTMLElement>(".ocr-text-layer span");
-  if (spans.length === 0) return null;
-  const rects: Rectangle[] = [];
-  for (const span of spans) {
-    if (!range.intersectsNode(span)) continue;
-    const rect = span.getBoundingClientRect();
-    rects.push({
-      left: rect.left,
-      top: rect.top,
-      right: rect.right,
-      bottom: rect.bottom,
-      width: rect.width,
-      height: rect.height,
-    });
-  }
-  return rects.length > 0 ? rects : null;
-}
-
-/** 多矩形的外接框（popover 锚点）；空集返回 null。 */
-export function unionRect(rects: Rectangle[]): Rectangle | null {
-  if (rects.length === 0) return null;
-  let left = Number.POSITIVE_INFINITY;
-  let top = Number.POSITIVE_INFINITY;
-  let right = Number.NEGATIVE_INFINITY;
-  let bottom = Number.NEGATIVE_INFINITY;
-  for (const rect of rects) {
-    left = Math.min(left, rect.left);
-    top = Math.min(top, rect.top);
-    right = Math.max(right, rect.right);
-    bottom = Math.max(bottom, rect.bottom);
-  }
-  return { left, top, right, bottom, width: right - left, height: bottom - top };
+export function ocrAnchorRect(page: HTMLElement, range: Range): Rectangle | null {
+  const container = range.startContainer;
+  const element = container instanceof Element ? container : container.parentElement;
+  const span = element?.closest<HTMLElement>(".ocr-text-layer span");
+  if (!span || !page.contains(span)) return null;
+  const rect = span.getBoundingClientRect();
+  return {
+    left: rect.left,
+    top: rect.top,
+    right: rect.right,
+    bottom: rect.bottom,
+    width: rect.width,
+    height: rect.height,
+  };
 }

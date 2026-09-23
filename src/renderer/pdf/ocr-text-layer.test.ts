@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { RecognizedPageText } from "../../shared/contracts";
 import { fitSpanFontSize, mountRecognizedTextLayer } from "./ocr-text-layer";
-import { ocrSelectionRects, unionRect } from "./selection-geometry";
+import { ocrAnchorRect } from "./selection-geometry";
 
 function recognizedPageWith(blocks: RecognizedPageText["blocks"]): RecognizedPageText {
   return {
@@ -198,7 +198,7 @@ describe("点击选整块", () => {
   });
 });
 
-describe("OCR 块选区矩形（高亮直接用 MinerU 块 bbox）", () => {
+describe("OCR 块选区矩形（高亮只取选区起点所在块）", () => {
   function stubOcrPage(rects: Array<null | { left: number; top: number; right: number; bottom: number; width: number; height: number }>) {
     const page = document.createElement("div");
     const layer = document.createElement("div");
@@ -206,6 +206,7 @@ describe("OCR 块选区矩形（高亮直接用 MinerU 块 bbox）", () => {
     page.appendChild(layer);
     const spans = rects.map((rect) => {
       const span = document.createElement("span");
+      span.textContent = "块文本";
       layer.appendChild(span);
       if (rect) vi.spyOn(span, "getBoundingClientRect").mockReturnValue(rect as DOMRect);
       return span;
@@ -213,33 +214,32 @@ describe("OCR 块选区矩形（高亮直接用 MinerU 块 bbox）", () => {
     return { page, spans };
   }
 
-  function fakeRange(hitIndex: number | null) {
-    return {
-      intersectsNode: (node: Node) => {
-        const spans = (node as Element).closest?.(".ocr-text-layer")?.querySelectorAll("span") ?? [];
-        return hitIndex !== null && Array.from(spans).indexOf(node as HTMLSpanElement) === hitIndex;
-      },
-    } as unknown as Range;
+  function fakeRangeAt(container: Node | null) {
+    return { startContainer: container } as unknown as Range;
   }
 
-  it("选区命中的 OCR 块返回其 bbox 矩形，未命中任何块返回 null", () => {
+  it("选区起点所在块返回其 bbox 矩形（元素容器）", () => {
     const first = { left: 10, top: 20, right: 110, bottom: 50, width: 100, height: 30 };
     const second = { left: 12, top: 60, right: 112, bottom: 90, width: 100, height: 30 };
-    const { page } = stubOcrPage([first, second]);
-    expect(ocrSelectionRects(page, fakeRange(1))).toEqual([second]);
-    expect(ocrSelectionRects(page, fakeRange(null))).toBeNull();
+    const { page, spans } = stubOcrPage([first, second]);
+    expect(ocrAnchorRect(page, fakeRangeAt(spans[1]!))).toEqual(second);
   });
 
-  it("页面没有 OCR 文字层时返回 null（原生文字层走字形矩形）", () => {
+  it("起点是块内文本节点时经父元素归到该块", () => {
+    const first = { left: 10, top: 20, right: 110, bottom: 50, width: 100, height: 30 };
+    const second = { left: 12, top: 60, right: 112, bottom: 90, width: 100, height: 30 };
+    const { page, spans } = stubOcrPage([first, second]);
+    expect(ocrAnchorRect(page, fakeRangeAt(spans[1]!.firstChild))).toEqual(second);
+  });
+
+  it("起点不在 OCR 层内时返回 null（原生文字层回落字形矩形）", () => {
+    const first = { left: 10, top: 20, right: 110, bottom: 50, width: 100, height: 30 };
+    const { page } = stubOcrPage([first]);
+    expect(ocrAnchorRect(page, fakeRangeAt(page))).toBeNull();
+  });
+
+  it("页面没有 OCR 文字层时返回 null", () => {
     const page = document.createElement("div");
-    expect(ocrSelectionRects(page, fakeRange(0))).toBeNull();
-  });
-
-  it("unionRect 求多块矩形的外接框，空集返回 null", () => {
-    expect(unionRect([
-      { left: 10, top: 20, right: 110, bottom: 50, width: 100, height: 30 },
-      { left: 30, top: 60, right: 150, bottom: 90, width: 120, height: 30 },
-    ])).toEqual({ left: 10, top: 20, right: 150, bottom: 90, width: 140, height: 70 });
-    expect(unionRect([])).toBeNull();
+    expect(ocrAnchorRect(page, fakeRangeAt(page))).toBeNull();
   });
 });
