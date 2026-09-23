@@ -2,12 +2,12 @@
   "schemaVersion": 1,
   "engine": "MinerU",
   "engineVersion": "4.0.2",
-  "runtime": "Python 3.11.9 + ONNX Runtime (MinerU basic)",
+  "runtime": "Python 3.11.9 + ONNX Runtime + CUDA torch (MinerU basic, small_backend=torch)",
   "model": "basic",
   "files": [
     {
       "path": "mineru-runtime",
-      "sha256": "cea18056c08610086919e9e0c04d891f0bde04b2137dba269021b9caae14c7e3"
+      "sha256": "8fa0b4aa3d4cac276cf2f5e46b87c3d6713235df7397ca691ade29b7800a9348"
     },
     {
       "path": "mineru-worker/mineru_worker.py",
