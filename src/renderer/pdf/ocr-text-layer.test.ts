@@ -2,7 +2,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { RecognizedPageText } from "../../shared/contracts";
-import { mountRecognizedTextLayer } from "./ocr-text-layer";
+import { fitSpanFontSize, mountRecognizedTextLayer } from "./ocr-text-layer";
 
 function recognizedPageWith(blocks: RecognizedPageText["blocks"]): RecognizedPageText {
   return {
@@ -77,5 +77,48 @@ describe("OCR text layer", () => {
     const spans = Array.from(page.querySelectorAll<HTMLElement>(".ocr-text-layer span"));
     expect(spans).toHaveLength(1);
     expect(spans[0]?.textContent).toBe("正常文本");
+  });
+});
+
+describe("fitSpanFontSize", () => {
+  function stubBox(offsetWidth: number, offsetHeight: number, scrollWidth: number) {
+    return {
+      offsetWidth,
+      offsetHeight,
+      scrollWidth,
+      style: { fontSize: "", whiteSpace: "" },
+    };
+  }
+
+  it("按盒面积与单行总宽解出字号：100×50 盒、单行 80000px → 25px 并恢复折行", () => {
+    const span = stubBox(100, 50, 80_000);
+    expect(fitSpanFontSize(span)).toBe(25);
+    expect(span.style.fontSize).toBe("25px");
+    expect(span.style.whiteSpace).toBe("normal");
+  });
+
+  it("字号夹在上限 64px：短文本大盒子不再放大", () => {
+    const span = stubBox(200, 50, 8_000);
+    expect(fitSpanFontSize(span)).toBe(64);
+    expect(span.style.fontSize).toBe("64px");
+  });
+
+  it("字号夹在下限 6px：超长文本小盒子不再缩小", () => {
+    const span = stubBox(100, 50, 80_000_000);
+    expect(fitSpanFontSize(span)).toBe(6);
+    expect(span.style.fontSize).toBe("6px");
+  });
+
+  it("无布局（测试/隐藏页）时跳过拟合且不碰样式", () => {
+    const span = stubBox(0, 50, 8_000);
+    expect(fitSpanFontSize(span)).toBeUndefined();
+    expect(span.style.fontSize).toBe("");
+    expect(span.style.whiteSpace).toBe("");
+  });
+
+  it("单行总宽为 0（空内容）时跳过拟合", () => {
+    const span = stubBox(100, 50, 0);
+    expect(fitSpanFontSize(span)).toBeUndefined();
+    expect(span.style.fontSize).toBe("");
   });
 });
