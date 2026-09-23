@@ -16,6 +16,8 @@ export type WorkerMineruOptions = {
   command?: string;
   args?: string[];
   mineruHome?: string;
+  /** 小模型推理后端：onnx（CPU 默认）或 torch（CUDA GPU）。透传 MINERU_MODEL_SMALL_BACKEND。 */
+  smallBackend?: string;
   model?: string;
   inputVersion?: string;
   engineVersion?: string;
@@ -28,6 +30,7 @@ export function createWorkerMineruEngine(options: WorkerMineruOptions = {}): Min
       ...(options.command ? { PDFMUSE_MINERU_COMMAND: options.command } : {}),
       ...(options.args ? { PDFMUSE_MINERU_ARGS: JSON.stringify(options.args) } : {}),
       ...(options.mineruHome ? { PDFMUSE_MINERU_HOME: options.mineruHome } : {}),
+      ...(options.smallBackend ? { PDFMUSE_MINERU_SMALL_BACKEND: options.smallBackend } : {}),
     },
   });
   const pending = new Map<string, { resolve: (value: MineruPageData) => void; reject: (error: Error) => void; cleanup(): void }>();
