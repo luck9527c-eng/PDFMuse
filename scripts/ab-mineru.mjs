@@ -50,7 +50,8 @@ function recognize(pdfPath, page) {
   return new Promise((resolve, reject) => {
     const id = `p${nextId++}`;
     pending.set(id, { resolve, reject });
-    child.stdin.write(`${JSON.stringify({ id, pdfPath, page })}\n`);
+    // 对比文档需要每页 markdown（含公式 LaTeX 渲染），显式请求。
+    child.stdin.write(`${JSON.stringify({ id, pdfPath, page, markdown: true })}\n`);
   });
 }
 
