@@ -8,6 +8,7 @@ import { createLibraryModule } from "../library.js";
 import { createPageRenderer } from "../page-render.js";
 import { createToolRegistry, type PageImageBudget } from "./tool-registry.js";
 import { validateToolArguments } from "./openclaw-core.js";
+import { createSessionStore } from "./session-store.js";
 import { createToolMedia } from "../tool-media.js";
 
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
@@ -18,11 +19,16 @@ describe("tool registry", () => {
   let bookIndex: ReturnType<typeof createBookIndex>;
   let pageRenderer: ReturnType<typeof createPageRenderer>;
   let bookId: string;
+  const recognizedPagesByPage = new Map<string, Array<{ type: string; text: string; bbox: [number, number, number, number] }>>();
 
   beforeEach(async () => {
     dataHome = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-tools-"));
     library = createLibraryModule(dataHome);
-    bookIndex = createBookIndex(dataHome, { getBookSource: (id) => library.getBookSource(id) });
+    bookIndex = createBookIndex(dataHome, {
+      getBookSource: (id) => library.getBookSource(id),
+      // 识别页判定走同一读接口：indexRecognizedPage 写过的页按 OCR 来源挂模态声明。
+      readRecognizedBlocks: (id, page) => recognizedPagesByPage.get(`${id}:${page}`),
+    });
     pageRenderer = createPageRenderer((id) => bookIndex.loadBookByBookId(id));
     const opened = await library.openPath(FIXTURE);
     expect(opened.ok).toBe(true);
@@ -54,13 +60,22 @@ describe("tool registry", () => {
     expect(registry.toolNames()).toEqual(["book_search", "read_pages", "read_page_image", "web_search"]);
   });
 
-  it("attaches the OCR modality note to read_pages results", async () => {
+  it("attaches the OCR modality note only to recognized pages", async () => {
     const registry = createToolRegistry();
     const tool = registry.buildAgentTools(context).find((item) => item.name === "read_pages")!;
-    const result = await tool.execute("call-note-1", { pages: [1] });
-    const text = (result.content[0] as { text: string }).text;
-    expect(text).toContain("read_page_image");
-    expect(text).toContain("版面解析生成");
+    // 原生文本页没有版面失真，不再挂模态声明。
+    const nativeResult = await tool.execute("call-note-0", { pages: [1] });
+    const nativeText = (nativeResult.content[0] as { text: string }).text;
+    expect(nativeText).not.toContain("版面解析生成");
+    expect(nativeText).not.toContain("read_page_image");
+
+    // 有 Recognized Text 块的页按识别来源挂模态声明。
+    recognizedPagesByPage.set(`${bookId}:2`, [{ type: "text", text: "扫描页识别文本", bbox: [0, 0, 1, 1] }]);
+    bookIndex.indexRecognizedPage(bookId, 2, [{ text: "扫描页识别文本" }]);
+    const ocrResult = await tool.execute("call-note-1", { pages: [2] });
+    const ocrText = (ocrResult.content[0] as { text: string }).text;
+    expect(ocrText).toContain("read_page_image");
+    expect(ocrText).toContain("版面解析生成");
   });
 
   it("returns rendered page images as image content blocks via read_page_image", async () => {
@@ -252,6 +267,43 @@ describe("tool registry", () => {
     const result = await tool.execute("call-1", { query: "绝对不存在的词组" });
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain("没有在书中找到相关内容");
+  });
+
+  it("points to read_pages when a search misses the book or only recalls older conversation", async () => {
+    const registry = createToolRegistry();
+    const tool = registry.buildAgentTools(() => ({ ...context(), focus: { currentPage: 10 } }))[0]!;
+
+    // 空命中：把下一步写进结果——改用 read_pages 读当前页附近的整页原文。
+    const empty = await tool.execute("call-hint-0", { query: "绝对不存在的词组" });
+    const emptyText = (empty.content[0] as { text: string }).text;
+    expect(emptyText).toContain("没有在书中找到相关内容");
+    expect(emptyText).toContain("read_pages");
+    expect(emptyText).toContain("第 10 页");
+
+    // 只召回较早对话：同样未命中本书页面，提示读整页而不是继续检索。
+    const sessionStore = createSessionStore(dataHome);
+    const session = sessionStore.ensureSession(bookId);
+    sessionStore.appendMessage({
+      sessionId: session.id,
+      runId: "old-run",
+      role: "assistant",
+      body: "上次聊过 极冷门词组 的含义",
+      status: "complete",
+    });
+    const conversationIndex = createBookIndex(dataHome, {
+      getBookSource: (id) => library.getBookSource(id),
+      getConversationSearch: () => sessionStore.searchMessages,
+    });
+    const conversationTool = registry.buildAgentTools(() => (
+      { ...context(), bookIndex: conversationIndex, focus: { currentPage: 10 } }
+    ))[0]!;
+    const onlyConversation = await conversationTool.execute("call-hint-1", { query: "极冷门词组" });
+    const onlyText = (onlyConversation.content[0] as { text: string }).text;
+    expect(onlyText).toContain("较早对话");
+    expect(onlyText).toContain("未命中本书页面");
+    expect(onlyText).toContain("read_pages");
+    sessionStore.close();
+    conversationIndex.close();
   });
 
   it("reuses the persisted index across executions", async () => {

@@ -284,11 +284,25 @@ describe("book outline", () => {
     expect(outline.get(BOOK_ID)).toEqual([]);
   });
 
-  it("recognizes the real fixture embedded outline without persisting a replacement", async () => {
+  it("recognizes the real fixture embedded outline and persists it for retrieval weighting", async () => {
     const outline = createBookOutlineModule(dataHome);
     closeOutline = outline.close;
     const bytes = new Uint8Array(await readFile(NAVIGATION_FIXTURE));
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes }));
+    expect(result.status).toBe("embedded");
+    // 内嵌书签落库为可读目录：渲染端继续直接消费 PDF 大纲，检索的所在章加权读这份。
+    const nodes = outline.get(BOOK_ID);
+    expect(nodes?.map((node) => node.label)).toEqual(["Chapter One", "Chapter Two", "Chapter Three"]);
+    expect(nodes?.every((node) => node.page !== undefined)).toBe(true);
+    expect(nodes?.[0]?.children[0]).toMatchObject({ label: "Section One", page: 1 });
+  });
+
+  it("embedded outline without node accessors still persists nothing", async () => {
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource([[{ text: "Generated Heading", size: 24, y: 700 }]], { embedded: true }),
+    });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(result.status).toBe("embedded");
     expect(outline.get(BOOK_ID)).toBeUndefined();
   });

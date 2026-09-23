@@ -81,6 +81,8 @@ export type AgentHostOptions = {
     reportEvidence(evidence: ConversationEvidence[]): void;
     /** 本问（一次运行）共享的原图页预算：页数与次数钳制在工具层执行。 */
     pageBudget: PageImageBudget;
+    /** 本问 run id：检索召回「较早对话」时排除本轮自身消息。 */
+    runId?: string;
   }): AgentTool[];
   /** 将已完成的会话消息交给检索模块；失败不得阻断回答。 */
   indexConversationMessage?(bookId: string, message: {
@@ -616,14 +618,22 @@ export function createAgentHost(options: AgentHostOptions) {
     if (!questionMessage) return;
 
     // 证据聚合：每页只保留相关度最高的一条，总量按分数截断，参考页不随搜索次数膨胀。
+    // 回放装配后追问常常零工具调用（上轮原文已在上下文里），但正文仍会写「原文（第 N 页）」——
+    // 本轮没有任何工具上报证据时，收尾回退到上一条 complete 回答的证据页，参考页标签不落空；
+    // 只要本轮上报过证据就完全以本轮为准，上一轮的旧页码不挤占本轮参考页。
     const evidenceByPage = new Map<number, ConversationEvidence>();
+    let toolEvidenceReported = false;
+    const inheritedEvidence = [...fullHistory].reverse()
+      .find((message) => message.role === "assistant" && message.status === "complete")
+      ?.evidence ?? [];
     const reportEvidence = (evidence: ConversationEvidence[]) => {
+      toolEvidenceReported = true;
       for (const item of evidence) {
         const existing = evidenceByPage.get(item.page);
         if (!existing || (item.score ?? 0) > (existing.score ?? 0)) evidenceByPage.set(item.page, item);
       }
     };
-    const collectEvidence = () => [...evidenceByPage.values()]
+    const collectEvidence = () => (toolEvidenceReported ? [...evidenceByPage.values()] : inheritedEvidence)
       .sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
       .slice(0, CONVERSATION_EVIDENCE_MAX)
       .sort((left, right) => left.page - right.page);
@@ -633,6 +643,7 @@ export function createAgentHost(options: AgentHostOptions) {
       reportEvidence,
       // 每问新建：预算随运行生命周期，下一问自动重置。
       pageBudget: { pagesDelivered: 0, calls: 0 },
+      runId,
     }) ?? [];
 
     // 工具包装：捕获参数、结果与耗时进运行诊断；检索类工具设每轮上限防散射打捞。

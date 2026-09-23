@@ -310,7 +310,7 @@ export function App() {
     return () => unsubscribe?.();
   }, []);
 
-  const visibleBackgroundJob = useMemo(() => {
+  const visibleBackgroundJobs = useMemo(() => {
     const rank: Record<BackgroundJob["status"], number> = {
       running: 0,
       queued: 1,
@@ -319,22 +319,25 @@ export function App() {
       completed: 4,
       cancelled: 5,
     };
-    const latestByKind = backgroundJobs.filter((job, index, jobs) => (
-      jobs.findIndex((candidate) => candidate.kind === job.kind) === index
+    // 只显示进行中的任务（完成/取消即时退场）；同类任务取最新一条，按状态紧急度排序。
+    const live = backgroundJobs.filter((job) => rank[job.status] <= 3);
+    const latestByKind = live.filter((job, index, jobs) => (
+      live.findIndex((candidate) => candidate.kind === job.kind) === index
     ));
-    return latestByKind.sort((left, right) => rank[left.status] - rank[right.status])[0];
+    return latestByKind.sort((left, right) => rank[left.status] - rank[right.status]);
   }, [backgroundJobs]);
 
-  const mutateBackgroundJob = useCallback(async (action: "pause" | "resume" | "cancel") => {
-    if (!book || !visibleBackgroundJob || !window.pdfMuse) return;
+  const mutateBackgroundJob = useCallback(async (job: BackgroundJob, action: "pause" | "resume" | "cancel") => {
+    if (!book || !window.pdfMuse) return;
     const method = action === "pause"
       ? window.pdfMuse.pauseBackgroundJob
       : action === "resume"
         ? window.pdfMuse.resumeBackgroundJob
         : window.pdfMuse.cancelBackgroundJob;
-    await method(visibleBackgroundJob.id);
-  }, [book, visibleBackgroundJob]);
+    await method(job.id);
+  }, [book]);
 
+  // 内嵌书签现在也会落库一份（供检索加权），渲染端仍以 PDF 大纲为显示首选；两侧同源不会冲突。
   const effectiveOutline = viewerState.outline.length > 0 ? viewerState.outline : generatedOutline ?? [];
   const outlineJob = backgroundJobs.find((job) => job.kind === "outline");
   const outlineEmptyMessage = outlineJob?.status === "running" || outlineJob?.status === "queued"
@@ -773,28 +776,35 @@ export function App() {
             <IconButton label="在 PDF 中查找" onClick={() => setFindOpen((value) => !value)}><Search /></IconButton>
             <IconButton label={ocrLoading ? "正在识别当前页" : "识别当前页文字"} disabled={ocrLoading} onClick={() => void recognizeCurrentPage}><ScanText /></IconButton>
           </div>
-          {visibleBackgroundJob && (
+          {visibleBackgroundJobs.length > 0 && (
             <div className="background-job-control">
-                <span
-                  className={`background-job-status ${visibleBackgroundJob.status}`}
-                  title={visibleBackgroundJob.errorMessage}
-                  role="status"
-                >
-                  {visibleBackgroundJob.status === "running" && <Loader2 size={13} />}
-                  <span>{BACKGROUND_JOB_KIND_LABELS[visibleBackgroundJob.kind]} · {BACKGROUND_JOB_STATUS_LABELS[visibleBackgroundJob.status]}</span>
-                  {visibleBackgroundJob.total > 0 && visibleBackgroundJob.status !== "failed" && (
-                    <span>{visibleBackgroundJob.progress}/{visibleBackgroundJob.total}</span>
+              {visibleBackgroundJobs.slice(0, 3).map((job) => (
+                <div className="background-job-item" key={job.id}>
+                  <span
+                    className={`background-job-status ${job.status}`}
+                    title={job.errorMessage}
+                    role="status"
+                  >
+                    {job.status === "running" && <Loader2 size={13} />}
+                    <span>{BACKGROUND_JOB_KIND_LABELS[job.kind]} · {BACKGROUND_JOB_STATUS_LABELS[job.status]}</span>
+                    {job.total > 0 && job.status !== "failed" && (
+                      <span>{job.progress}/{job.total}</span>
+                    )}
+                  </span>
+                  {(job.status === "running" || job.status === "queued") && (
+                    <IconButton label="暂停后台任务" onClick={() => void mutateBackgroundJob(job, "pause")}><Pause /></IconButton>
                   )}
-                </span>
-                {(visibleBackgroundJob.status === "running" || visibleBackgroundJob.status === "queued") && (
-                  <IconButton label="暂停后台任务" onClick={() => void mutateBackgroundJob("pause")}><Pause /></IconButton>
-                )}
-                {(visibleBackgroundJob.status === "paused" || visibleBackgroundJob.status === "failed") && (
-                  <IconButton label={visibleBackgroundJob.status === "failed" ? "重试后台任务" : "继续后台任务"} onClick={() => void mutateBackgroundJob("resume")}><Play /></IconButton>
-                )}
-                {(visibleBackgroundJob.status === "running" || visibleBackgroundJob.status === "queued" || visibleBackgroundJob.status === "paused") && (
-                  <IconButton label="取消后台任务" onClick={() => void mutateBackgroundJob("cancel")}><X /></IconButton>
-                )}
+                  {(job.status === "paused" || job.status === "failed") && (
+                    <IconButton label={job.status === "failed" ? "重试后台任务" : "继续后台任务"} onClick={() => void mutateBackgroundJob(job, "resume")}><Play /></IconButton>
+                  )}
+                  {(job.status === "running" || job.status === "queued" || job.status === "paused") && (
+                    <IconButton label="取消后台任务" onClick={() => void mutateBackgroundJob(job, "cancel")}><X /></IconButton>
+                  )}
+                </div>
+              ))}
+              {visibleBackgroundJobs.length > 3 && (
+                <span className="background-job-overflow">+{visibleBackgroundJobs.length - 3}</span>
+              )}
             </div>
           )}
           {findOpen && (

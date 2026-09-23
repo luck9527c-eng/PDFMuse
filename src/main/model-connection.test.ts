@@ -189,7 +189,7 @@ describe("Model Connection Module", () => {
       body: {
         model: "working-model",
         messages: [{ role: "user", content: "请回复 OK" }],
-        max_tokens: 1,
+        max_tokens: 16,
         stream: false,
       },
     });
@@ -243,7 +243,7 @@ describe("Model Connection Module", () => {
       body: {
         model: "claude-test-model",
         messages: [{ role: "user", content: "请回复 OK" }],
-        max_tokens: 1,
+        max_tokens: 16,
       },
     });
     await expect(connection.get()).resolves.toMatchObject({ protocol: "anthropic" });
@@ -292,7 +292,7 @@ describe("Model Connection Module", () => {
     })).resolves.toEqual({
       ok: false,
       code: "AUTHENTICATION_ERROR",
-      message: "API 密钥无效，或当前账号没有访问该模型的权限。",
+      message: "API 密钥无效，或当前账号没有访问该模型的权限。（服务返回：invalid token）",
     });
   });
 
@@ -405,5 +405,207 @@ describe("Model Connection Module", () => {
       ok: false,
       code: "VALIDATION_ERROR",
     });
+  });
+
+  it("OpenAI 协议在裸域名地址上自动补全 /v1 路径", async () => {
+    let receivedUrl: string | undefined;
+    const baseUrl = await listen(createServer((request, response) => {
+      receivedUrl = request.url;
+      if (!request.url?.startsWith("/v1/")) {
+        response.writeHead(403, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({
+          message: "HTTP node only allows access to inference API paths (/v1/chat/completions)",
+          success: false,
+        }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: "OK" } }],
+      }));
+    }));
+    const dataHome = await createDataHome();
+    const connection = createModelConnectionModule(dataHome);
+
+    await expect(connection.test({
+      protocol: "openai",
+      baseUrl,
+      model: "working-model",
+      apiKey: "secret",
+    })).resolves.toMatchObject({ ok: true });
+    expect(receivedUrl).toBe("/v1/chat/completions");
+  });
+
+  it("连接测试的 max_tokens 满足推理服务最低限制", async () => {
+    let receivedBody: { max_tokens?: number } = {};
+    const baseUrl = await listen(createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        receivedBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if ((receivedBody.max_tokens ?? 0) < 3) {
+          response.writeHead(400, { "Content-Type": "application/json" });
+          response.end(JSON.stringify({
+            error: { message: "max_tokens must be greater than 2", type: "invalid_request_error" },
+          }));
+          return;
+        }
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify(request.url?.endsWith("/messages")
+          ? { content: [{ type: "text", text: "OK" }] }
+          : { choices: [{ message: { role: "assistant", content: "OK" } }] }));
+      });
+    }));
+    const dataHome = await createDataHome();
+    const connection = createModelConnectionModule(dataHome);
+
+    await expect(connection.test({
+      protocol: "openai",
+      baseUrl: `${baseUrl}/v1`,
+      model: "working-model",
+      apiKey: "secret",
+    })).resolves.toMatchObject({ ok: true });
+    await expect(connection.test({
+      protocol: "anthropic",
+      baseUrl: `${baseUrl}/v1`,
+      model: "working-model",
+      apiKey: "secret",
+    })).resolves.toMatchObject({ ok: true });
+    expect(receivedBody.max_tokens).toBeGreaterThanOrEqual(3);
+  });
+
+  it("非鉴权失败时透传服务端错误信息", async () => {
+    const baseUrl = await listen(createServer((_request, response) => {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        error: { message: "max_tokens must be greater than 2", type: "invalid_request_error" },
+      }));
+    }));
+    const dataHome = await createDataHome();
+    const connection = createModelConnectionModule(dataHome);
+
+    await expect(connection.test({
+      protocol: "anthropic",
+      baseUrl: `${baseUrl}/v1`,
+      model: "working-model",
+      apiKey: "secret",
+    })).resolves.toMatchObject({
+      ok: false,
+      code: "INVALID_RESPONSE",
+      message: expect.stringContaining("max_tokens must be greater than 2"),
+    });
+  });
+
+  it("将限流与服务器错误映射为可重试结果", async () => {
+    const baseUrl = await listen(createServer((_request, response) => {
+      response.writeHead(503, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "upstream unavailable" } }));
+    }));
+    const dataHome = await createDataHome();
+    const connection = createModelConnectionModule(dataHome);
+
+    await expect(connection.test({
+      protocol: "openai",
+      baseUrl: `${baseUrl}/v1`,
+      model: "working-model",
+      apiKey: "secret",
+    })).resolves.toEqual({
+      ok: false,
+      code: "SERVICE_ERROR",
+      message: "对话模型服务暂时不可用，请稍后重试。",
+    });
+  });
+
+  it("粘贴完整端点路径时不重复拼接", async () => {
+    let receivedUrl: string | undefined;
+    const baseUrl = await listen(createServer((request, response) => {
+      receivedUrl = request.url;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify(request.url?.endsWith("/messages")
+        ? { content: [{ type: "text", text: "OK" }] }
+        : { choices: [{ message: { role: "assistant", content: "OK" } }] }));
+    }));
+    const dataHome = await createDataHome();
+    const connection = createModelConnectionModule(dataHome);
+
+    await expect(connection.test({
+      protocol: "openai",
+      baseUrl: `${baseUrl}/v1/chat/completions`,
+      model: "working-model",
+      apiKey: "secret",
+    })).resolves.toMatchObject({ ok: true });
+    expect(receivedUrl).toBe("/v1/chat/completions");
+
+    await expect(connection.test({
+      protocol: "anthropic",
+      baseUrl: `${baseUrl}/v1/messages`,
+      model: "working-model",
+      apiKey: "secret",
+    })).resolves.toMatchObject({ ok: true });
+    expect(receivedUrl).toBe("/v1/messages");
+  });
+
+  it("推理模型返回空 content 时仍视为协议兼容", async () => {
+    const baseUrl = await listen(createServer((_request, response) => {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        choices: [{ finish_reason: "length", message: { role: "assistant", content: null } }],
+      }));
+    }));
+    const dataHome = await createDataHome();
+    const connection = createModelConnectionModule(dataHome);
+
+    await expect(connection.test({
+      protocol: "openai",
+      baseUrl: `${baseUrl}/v1`,
+      model: "reasoning-model",
+      apiKey: "secret",
+    })).resolves.toMatchObject({ ok: true });
+  });
+
+  it("预设兼容旗标决定探测请求的 max-tokens 字段名", async () => {
+    let receivedBody: Record<string, unknown> = {};
+    const baseUrl = await listen(createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        receivedBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify(request.url?.endsWith("/messages")
+          ? { content: [{ type: "text", text: "OK" }] }
+          : { choices: [{ message: { role: "assistant", content: "OK" } }] }));
+      });
+    }));
+    const dataHome = await createDataHome();
+    const connection = createModelConnectionModule(dataHome);
+
+    // OpenAI 家族预设只认 max_completion_tokens。
+    await expect(connection.test({
+      protocol: "openai",
+      baseUrl: `${baseUrl}/v1`,
+      model: "working-model",
+      apiKey: "secret",
+      maxTokensField: "max_completion_tokens",
+    })).resolves.toMatchObject({ ok: true });
+    expect(receivedBody.max_completion_tokens).toBe(16);
+    expect(receivedBody.max_tokens).toBeUndefined();
+
+    // 缺省与 Anthropic 协议通行 max_tokens；预设旗标对 Anthropic 不生效。
+    await expect(connection.test({
+      protocol: "openai",
+      baseUrl: `${baseUrl}/v1`,
+      model: "working-model",
+      apiKey: "secret",
+    })).resolves.toMatchObject({ ok: true });
+    expect(receivedBody.max_tokens).toBe(16);
+    await expect(connection.test({
+      protocol: "anthropic",
+      baseUrl: `${baseUrl}/v1`,
+      model: "working-model",
+      apiKey: "secret",
+      maxTokensField: "max_completion_tokens",
+    })).resolves.toMatchObject({ ok: true });
+    expect(receivedBody.max_tokens).toBe(16);
+    expect(receivedBody.max_completion_tokens).toBeUndefined();
   });
 });

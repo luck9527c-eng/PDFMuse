@@ -915,9 +915,73 @@ describe("agent host", () => {
     buildHost({ createStreamFn: () => fake.streamFn });
 
     await startRun("接着聊");
-    await waitFor(() => events.some((event) => event.stream === "lifecycle" && event.phase === "end"));
+    await waitFor(() => lifecyclePhase(events).includes("end"));
 
     expect(JSON.stringify(fake.requests[0]!.context.messages)).not.toContain("上一轮回答引用的原文");
+  });
+
+  it("inherits the previous answer's evidence pages when the follow-up calls no tools", async () => {
+    seedAnsweredConversation([{ source: "pdf", page: 12, snippet: "定积分", trust: "trusted", score: 1 }]);
+    const fake = createFakeStreamFn(({ push }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("原文（第 12 页）讲的是……") });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    await startRun("再讲讲那个定理");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    // 零工具调用的追问没有新证据，但正文写了「第 12 页」——参考页标签回退到上一轮证据页。
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation.at(-1)?.evidence).toEqual([
+      { source: "pdf", page: 12, snippet: "定积分", trust: "trusted", score: 1 },
+    ]);
+  });
+
+  it("keeps only this run's tool evidence instead of mixing in the previous answer's pages", async () => {
+    seedAnsweredConversation([{ source: "pdf", page: 12, snippet: "上一轮的页", trust: "trusted", score: 1 }]);
+    const requests: CapturedRequest[] = [];
+    const streamFn = async (model: Model, context: Context, options?: SimpleStreamOptions) => {
+      const request: CapturedRequest = { model, context, options };
+      requests.push(request);
+      const stream = new AssistantMessageEventStream();
+      void Promise.resolve().then(() => {
+        if (requests.length === 1) {
+          const toolCallMessage = assistantMessage("", "toolUse");
+          toolCallMessage.content = [{ type: "toolCall", id: "call-inh-1", name: "fake_evidence", arguments: {} }];
+          stream.push({ type: "start", partial: toolCallMessage });
+          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-inh-1", name: "fake_evidence", arguments: {} }, partial: toolCallMessage });
+          stream.push({ type: "done", reason: "toolUse", message: toolCallMessage });
+          return;
+        }
+        stream.push({ type: "start", partial: assistantMessage("") });
+        stream.push({ type: "done", reason: "stop", message: assistantMessage("本轮回答") });
+      });
+      return stream;
+    };
+    buildHost({
+      createStreamFn: () => streamFn,
+      buildTools: (context) => [{
+        name: "fake_evidence",
+        label: "假证据工具",
+        description: "测试用",
+        parameters: { type: "object", properties: {} },
+        async execute(toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: unknown) {
+          void toolCallId; void params; void signal; void onUpdate;
+          context.reportEvidence([{ source: "pdf", page: 3, snippet: "本轮的页", trust: "trusted", score: 0.9 }]);
+          return { content: [{ type: "text" as const, text: "完成" }] };
+        },
+      } as never],
+    });
+
+    await startRun("换个问题");
+    await waitFor(() => lifecyclePhase(events).includes("end"));
+
+    // 本轮工具上报过证据就完全以本轮为准：上一轮的旧页码不挤占参考页。
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation.at(-1)?.evidence).toEqual([
+      { source: "pdf", page: 3, snippet: "本轮的页", trust: "trusted", score: 0.9 },
+    ]);
   });
 
   it("counts in-tail tool rows toward the estimate and elides tail-external rows (T45/T47)", async () => {

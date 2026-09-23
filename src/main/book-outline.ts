@@ -27,6 +27,8 @@ export type OutlineDocument = {
   pageCount: number;
   hasValidEmbeddedOutline: boolean;
   getNativeLines(page: number): Promise<OutlineTextLine[]>;
+  /** 内嵌书签（PDF 大纲）：渲染端已直接消费；这里落库一份供检索的章节范围加权。 */
+  getEmbeddedNodes?(): Promise<BookOutlineNode[]>;
   close(): Promise<void>;
 };
 
@@ -425,12 +427,45 @@ async function hasValidOutline(document: PdfDocument, items: PdfOutlineItem[] | 
   return false;
 }
 
+/** PDF 大纲 → BookOutlineNode 树（与渲染端 resolveOutline 同构）：只留可解析页码的条目。 */
+async function resolveEmbeddedNodes(
+  document: PdfDocument,
+  items: PdfOutlineItem[] | null,
+  lineage = "embedded",
+): Promise<BookOutlineNode[]> {
+  if (!items) return [];
+  const nodes: BookOutlineNode[] = [];
+  for (const [index, item] of items.entries()) {
+    let page: number | undefined;
+    if (item.dest) {
+      try {
+        const destination = typeof item.dest === "string" ? await document.getDestination(item.dest) : item.dest;
+        const target = destination?.[0];
+        if (typeof target === "number") page = target + 1;
+        else if (target) page = (await document.getPageIndex(target)) + 1;
+      } catch {
+        page = undefined;
+      }
+    }
+    nodes.push({
+      id: `${lineage}-${index}`,
+      label: item.title.trim() || `未命名章节 ${index + 1}`,
+      ...(page === undefined ? {} : { page }),
+      children: await resolveEmbeddedNodes(document, item.items, `${lineage}-${index}`),
+    });
+  }
+  return nodes;
+}
+
 async function openPdfOutlineDocument(source: { bytes: Uint8Array; password?: string }): Promise<OutlineDocument> {
   const loadingTask = getDocument({ data: source.bytes.slice(), ...(source.password ? { password: source.password } : {}) });
   const document = await loadingTask.promise;
   return {
     pageCount: document.numPages,
     hasValidEmbeddedOutline: await hasValidOutline(document, await document.getOutline()),
+    async getEmbeddedNodes() {
+      return resolveEmbeddedNodes(document, await document.getOutline());
+    },
     async getNativeLines(pageNumber) {
       const page = await document.getPage(pageNumber);
       const content = await page.getTextContent();
@@ -606,6 +641,21 @@ export function createBookOutlineModule(
     try {
       if (document.hasValidEmbeddedOutline) {
         invalidate(bookId);
+        // 内嵌书签落库为可读目录（渲染端仍直接消费 PDF 大纲）：检索的所在章加权
+        // 只读 book_outlines，不落库的书对「先验」是隐身书，恰是最该吃到加权的结构良好的书。
+        if (document.getEmbeddedNodes) {
+          const nodes = await document.getEmbeddedNodes();
+          database.prepare(`
+            INSERT INTO book_outlines (book_id, version, nodes_json, total_pages, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(book_id) DO UPDATE SET
+            version = excluded.version,
+            nodes_json = excluded.nodes_json,
+            total_pages = excluded.total_pages,
+            updated_at = excluded.updated_at
+          `).run(bookId, OUTLINE_VERSION, JSON.stringify(nodes), document.pageCount, new Date().toISOString());
+          options.onOutlineChange?.(bookId);
+        }
         return { status: "embedded" as const, nodes: [], processedPages: 0, totalPages: document.pageCount };
       }
       // AI 目录：成功结论（含「无目录」）入库缓存；失败（无模型/网络）不缓存，下次打开自动重试。

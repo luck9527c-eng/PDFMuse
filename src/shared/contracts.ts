@@ -95,6 +95,9 @@ export type LibraryMutationResult =
 
 export type ModelProtocol = "openai" | "anthropic";
 
+/** 探测请求携带的 max-tokens 字段名；OpenAI 家族推理模型只认 max_completion_tokens，其余通行 max_tokens。 */
+export type MaxTokensField = "max_tokens" | "max_completion_tokens";
+
 export function isModelProtocol(value: unknown): value is ModelProtocol {
   return value === "openai" || value === "anthropic";
 }
@@ -144,6 +147,8 @@ export type TestModelConnectionInput = {
   model: string;
   apiKey?: string;
   clearApiKey?: boolean;
+  /** 探测请求的 max-tokens 字段名；缺省 max_tokens。 */
+  maxTokensField?: MaxTokensField;
 };
 
 export type TestModelConnectionResult =
@@ -159,6 +164,7 @@ export type TestModelConnectionResult =
         | "AUTHENTICATION_ERROR"
         | "NETWORK_ERROR"
         | "TIMEOUT"
+        | "SERVICE_ERROR"
         | "INVALID_RESPONSE";
       message: string;
     };

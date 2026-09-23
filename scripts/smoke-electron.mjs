@@ -693,7 +693,7 @@ try {
     body: {
       model: "smoke-chat-model",
       messages: [{ role: "user", content: "请回复 OK" }],
-      max_tokens: 1,
+      max_tokens: 16,
       stream: false,
     },
   });
@@ -762,7 +762,21 @@ try {
   );
   assert.deepEqual(
     protocolOptions,
-    ["OpenAI", "Anthropic", "256K tokens", "1M tokens"],
+    [
+      // 厂商预设选择器（自定义 + MODEL_PROVIDER_PRESETS）
+      "自定义",
+      "DeepSeek",
+      "Moonshot Kimi",
+      "智谱 GLM",
+      "OpenAI",
+      "Anthropic",
+      // 协议选择器
+      "OpenAI",
+      "Anthropic",
+      // 上下文窗口档位
+      "256K tokens",
+      "1M tokens",
+    ],
     "model protocol and context window options are incomplete",
   );
   const visibleTooltipsWithoutHover = await evaluate(

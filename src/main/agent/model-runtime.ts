@@ -1,4 +1,5 @@
 import type { ModelProtocol } from "../../shared/contracts.js";
+import { normalizeChatApiBase } from "../chat-endpoint.js";
 import {
   createLlmRuntime,
   registerBuiltInApiProviders,
@@ -7,6 +8,7 @@ import {
   type SimpleStreamOptions,
   type StreamFn,
 } from "./openclaw-core.js";
+import { installStreamSanitizingFetch } from "./stream-sanitizer.js";
 
 export type ResolvedModelConnection = {
   protocol: ModelProtocol;
@@ -17,6 +19,9 @@ export type ResolvedModelConnection = {
   contextWindow?: number;
 };
 
+// 推理模型的 SSE 里带 reasoning_content 会让适配器把可见正文扣到流结束才吐（见 stream-sanitizer）。
+// 运行时创建前装好，保证后面每个模型调用都走同一层剥离。
+installStreamSanitizingFetch();
 const llmRuntime = createLlmRuntime();
 // 内置协议适配器（openai-completions、anthropic-messages 等）按需注册后懒加载。
 registerBuiltInApiProviders(llmRuntime.registry);
@@ -28,7 +33,8 @@ export function toLlmModel(connection: ResolvedModelConnection, supportsVision =
     name: connection.model,
     api: connection.protocol === "anthropic" ? "anthropic-messages" : "openai-completions",
     provider: "pdfmuse",
-    baseUrl: connection.baseUrl,
+    // 与连接测试共用同一归一化：裸域名补 /v1、完整端点去尾，SDK 在此基础上拼协议路由。
+    baseUrl: normalizeChatApiBase(connection.protocol, connection.baseUrl),
     reasoning: false,
     input: supportsVision ? ["text", "image"] : ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

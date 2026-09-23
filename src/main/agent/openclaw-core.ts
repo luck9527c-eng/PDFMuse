@@ -28,6 +28,7 @@ export {
 
 export {
   AssistantMessageEventStream,
+  configureAiTransportHost,
   createLlmRuntime,
   type Api,
   type AssistantMessage,

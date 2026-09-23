@@ -40,9 +40,13 @@ function validationError(): SaveEmbeddingConnectionResult & TestEmbeddingConnect
 
 function embeddingsUrl(baseUrl: string) {
   const url = new URL(baseUrl);
-  url.pathname = `${url.pathname.replace(/\/+$/, "")}/embeddings`;
   url.search = "";
   url.hash = "";
+  // 与对话连接的 /v1 归一化同一策略：裸域名补 /v1，粘贴完整端点不重复拼接。
+  let pathname = url.pathname.replace(/\/+$/, "");
+  if (pathname.endsWith("/embeddings")) pathname = pathname.slice(0, -"/embeddings".length);
+  if (!pathname.endsWith("/v1")) pathname = `${pathname}/v1`;
+  url.pathname = `${pathname}/embeddings`;
   return url;
 }
 

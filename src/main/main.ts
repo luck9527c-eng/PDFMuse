@@ -145,6 +145,7 @@ app.whenReady().then(async () => {
     closeOcr = ocr.close;
     // 会话检索读接口晚接（会话存储在检索模块之后创建），与 getEmbeddingProvider 同为懒取。
     let searchConversationMessages: ((bookId: string, likePattern: string) => Array<{ id: string; body: string }>) | undefined;
+    let listRunMessageIds: ((bookId: string, runId: string) => string[]) | undefined;
     const bookIndex = createBookIndex(startupPreflight.dataHome, {
       onEmbeddingError: (error) => {
         const diagnostic = error instanceof Error
@@ -163,6 +164,7 @@ app.whenReady().then(async () => {
       getBookSource: (bookId) => library.getBookSource(bookId),
       readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
       getConversationSearch: () => searchConversationMessages,
+      getRunMessageIds: (bookId, runId) => listRunMessageIds?.(bookId, runId) ?? [],
     });
     closeBookIndex = bookIndex.close;
     // 页面渲染独立模块（T34）：OCR 链路、视觉工具与目录 AI 共用，检索模块不再依赖 canvas。
@@ -171,6 +173,7 @@ app.whenReady().then(async () => {
       deleteConversationEmbeddings: bookIndex.deleteConversationEmbeddings,
     });
     searchConversationMessages = sessionStore.searchMessages;
+    listRunMessageIds = sessionStore.listRunMessageIds;
     const loadChatConnection = async (): Promise<ResolvedModelConnection | undefined> => {
       const config = await readAppConfig(configPath);
       return config.chat
@@ -328,6 +331,7 @@ app.whenReady().then(async () => {
         focus: context.focus,
         reportEvidence: context.reportEvidence,
         pageBudget: context.pageBudget,
+        runId: context.runId,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
         savePageImage: toolMedia.savePageImage,

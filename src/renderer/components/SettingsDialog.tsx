@@ -15,6 +15,7 @@ import { useEffect, useState } from "react";
 
 import type { AppearanceSettings, ModelConnectionState } from "../../shared/contracts";
 import { DEFAULT_MODEL_CONTEXT_WINDOW, MODEL_CONTEXT_WINDOW_OPTIONS } from "../../shared/contracts";
+import { findModelProviderPreset, MODEL_PROVIDER_PRESETS } from "../../shared/model-presets";
 import { AppearanceSection } from "./AppearanceSection";
 import { EmbeddingConnectionSection } from "./EmbeddingConnectionSection";
 import { IconButton } from "./IconButton";
@@ -62,6 +63,7 @@ export function SettingsDialog({
   const [open, setOpen] = useState(false);
   const [section, setSection] = useState<SettingsSection>("connection");
   const [connection, setConnection] = useState(EMPTY_CONNECTION);
+  const [presetId, setPresetId] = useState("custom");
   const [apiKey, setApiKey] = useState("");
   const [clearApiKey, setClearApiKey] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -83,6 +85,7 @@ export function SettingsDialog({
       .then((saved) => {
         if (disposed) return;
         setConnection(saved);
+        setPresetId("custom");
         setApiKey("");
         setClearApiKey(false);
       })
@@ -97,14 +100,33 @@ export function SettingsDialog({
     };
   }, [open]);
 
-  const draft = () => ({
-    protocol: connection.protocol,
-    baseUrl: connection.baseUrl,
-    model: connection.model,
-    contextWindow: connection.contextWindow,
-    ...(apiKey ? { apiKey } : {}),
-    ...(clearApiKey ? { clearApiKey: true } : {}),
-  });
+  const draft = () => {
+    const preset = findModelProviderPreset(presetId);
+    return {
+      protocol: connection.protocol,
+      baseUrl: connection.baseUrl,
+      model: connection.model,
+      contextWindow: connection.contextWindow,
+      ...(apiKey ? { apiKey } : {}),
+      ...(clearApiKey ? { clearApiKey: true } : {}),
+      // 预设带来兼容旗标（如 OpenAI 家族只认 max_completion_tokens）；自定义输入不带。
+      ...(preset ? { maxTokensField: preset.maxTokensField } : {}),
+    };
+  };
+
+  const applyPreset = (id: string) => {
+    setPresetId(id);
+    const preset = findModelProviderPreset(id);
+    if (preset) {
+      setConnection((current) => ({
+        ...current,
+        protocol: preset.protocol,
+        baseUrl: preset.baseUrl,
+        model: preset.exampleModel,
+        contextWindow: preset.contextWindow,
+      }));
+    }
+  };
 
   const saveConnection = async () => {
     if (!window.pdfMuse) return;
@@ -204,13 +226,29 @@ export function SettingsDialog({
                     {connection.hasApiKey && <span className="saved-key-state"><KeyRound size={13} />已保存密钥</span>}
                   </div>
                   <label>
+                    常用模型商
+                    <select
+                      value={presetId}
+                      onChange={(event) => applyPreset(event.target.value)}
+                      disabled={busy}
+                    >
+                      <option value="custom">自定义</option>
+                      {MODEL_PROVIDER_PRESETS.map((preset) => (
+                        <option key={preset.id} value={preset.id}>{preset.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
                     接口协议
                     <select
                       value={connection.protocol}
-                      onChange={(event) => setConnection((current) => ({
-                        ...current,
-                        protocol: event.target.value === "anthropic" ? "anthropic" : "openai",
-                      }))}
+                      onChange={(event) => {
+                        setPresetId("custom");
+                        setConnection((current) => ({
+                          ...current,
+                          protocol: event.target.value === "anthropic" ? "anthropic" : "openai",
+                        }));
+                      }}
                       disabled={busy}
                     >
                       <option value="openai">OpenAI</option>
@@ -221,7 +259,10 @@ export function SettingsDialog({
                     接口地址
                     <input
                       value={connection.baseUrl}
-                      onChange={(event) => setConnection((current) => ({ ...current, baseUrl: event.target.value }))}
+                      onChange={(event) => {
+                        setPresetId("custom");
+                        setConnection((current) => ({ ...current, baseUrl: event.target.value }));
+                      }}
                       placeholder={connection.protocol === "openai"
                         ? "https://api.openai.com/v1"
                         : "https://api.anthropic.com"}
@@ -232,7 +273,10 @@ export function SettingsDialog({
                     模型名称
                     <input
                       value={connection.model}
-                      onChange={(event) => setConnection((current) => ({ ...current, model: event.target.value }))}
+                      onChange={(event) => {
+                        setPresetId("custom");
+                        setConnection((current) => ({ ...current, model: event.target.value }));
+                      }}
                       placeholder="模型名称"
                       disabled={busy}
                     />
@@ -241,10 +285,13 @@ export function SettingsDialog({
                     上下文窗口
                     <select
                       value={connection.contextWindow}
-                      onChange={(event) => setConnection((current) => ({
-                        ...current,
-                        contextWindow: Number(event.target.value),
-                      }))}
+                      onChange={(event) => {
+                        setPresetId("custom");
+                        setConnection((current) => ({
+                          ...current,
+                          contextWindow: Number(event.target.value),
+                        }));
+                      }}
                       disabled={busy}
                     >
                       {MODEL_CONTEXT_WINDOW_OPTIONS.map((tokens) => (

@@ -47,6 +47,20 @@ describe("session store", () => {
     expect(store.searchMessages("c".repeat(64), "%讲解%")).toEqual([]);
   });
 
+  it("listRunMessageIds 只返回本书指定 run 的消息 id", async () => {
+    store = createSessionStore(dataHome);
+    const session = store.ensureSession(BOOK_ID);
+    store.appendMessage({ sessionId: session.id, runId: "run-a", role: "reader", body: "A 轮的问题", status: "complete" });
+    store.appendMessage({ sessionId: session.id, runId: "run-b", role: "assistant", body: "B 轮的回答", status: "complete" });
+    const other = store.ensureSession(OTHER_BOOK_ID);
+    store.appendMessage({ sessionId: other.id, runId: "run-a", role: "reader", body: "他书同 run 不串", status: "complete" });
+
+    const ids = store.listRunMessageIds(BOOK_ID, "run-a");
+    expect(ids).toHaveLength(1);
+    expect(ids[0]).toEqual(expect.any(String));
+    expect(store.listRunMessageIds(BOOK_ID, "run-x")).toEqual([]);
+  });
+
   it("deleteBookData 在给定连接上清掉本书会话与消息且不影响他书", () => {
     store = createSessionStore(dataHome);
     const kept = seedConversation(OTHER_BOOK_ID);

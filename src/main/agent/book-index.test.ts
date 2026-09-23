@@ -4,7 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createBookIndex, keepStrongHits, tokenizeForIndex, type EmbeddingProvider } from "./book-index.js";
+import { createBookIndex, keepStrongHits, pageTextSemanticFactor, splitSearchTerms, tokenizeForIndex, type EmbeddingProvider } from "./book-index.js";
 import { createLibraryModule } from "../library.js";
 import { createSessionStore } from "./session-store.js";
 
@@ -48,6 +48,27 @@ describe("tokenizeForIndex", () => {
   it("splits CJK text into single-character tokens and keeps words intact", () => {
     expect(tokenizeForIndex("能量守恒 energy")).toBe("能 量 守 恒 energy");
     expect(tokenizeForIndex("Chapter One")).toBe("Chapter One");
+  });
+});
+
+describe("splitSearchTerms", () => {
+  it("splits multi-term queries on whitespace and CJK punctuation, dedupes and caps", () => {
+    expect(splitSearchTerms("请假 审批 年假")).toEqual(["请假", "审批", "年假"]);
+    expect(splitSearchTerms("请假，审批、年假;事假")).toEqual(["请假", "审批", "年假", "事假"]);
+    expect(splitSearchTerms("重复 重复 其他")).toEqual(["重复", "其他"]);
+    expect(splitSearchTerms("单个词")).toEqual(["单个词"]);
+    expect(splitSearchTerms("   ")).toEqual([]);
+  });
+});
+
+describe("pageTextSemanticFactor", () => {
+  it("discounts short pages and dot-leader TOC lines", () => {
+    expect(pageTextSemanticFactor("长正文的页，".repeat(40))).toBe(1);
+    // 封面页：二十来个字符的短文本压到下限。
+    expect(pageTextSemanticFactor("广州通易科技有限公司员工手册")).toBe(0.4);
+    // 目录页：点导引不承载语义，有效长度只按正文行计。
+    const toc = "目 录\n" + Array.from({ length: 10 }, (_, index) => `第${index}章 标题.......... ${index + 3}`).join("\n");
+    expect(pageTextSemanticFactor(toc)).toBeLessThan(0.6);
   });
 });
 
@@ -253,10 +274,12 @@ describe("book index", () => {
       getEmbeddingProvider: () => provider,
       getBookSource: (bookId) => library.getBookSource(bookId),
       getConversationSearch: () => sessionStore.searchMessages,
+      getRunMessageIds: (id, runId) => sessionStore.listRunMessageIds(id, runId),
     });
     await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
     const session = sessionStore.ensureSession(bookId);
-    sessionStore.appendMessage({
+    // 语义行的 source_id 用库里的消息行 id（与生产 indexConversationMessage 的接线一致）。
+    const seededAnswer = sessionStore.appendMessage({
       sessionId: session.id,
       runId: "run-1",
       role: "assistant",
@@ -271,19 +294,70 @@ describe("book index", () => {
       status: "error",
     });
     await index.indexConversationMessage(bookId, {
-      id: "message-1",
+      id: seededAnswer.id,
       role: "assistant",
       body: "这是一条可供后续回顾的记忆",
       status: "complete",
     });
+    // 上一轮的语义腿召回：正文不含检索词「回顾」，只有向量腿能召回它。
+    const seededSleep = sessionStore.appendMessage({
+      sessionId: session.id,
+      runId: "run-1",
+      role: "assistant",
+      body: "记忆在睡眠中巩固",
+      status: "complete",
+    });
+    await index.indexConversationMessage(bookId, {
+      id: seededSleep.id,
+      role: "assistant",
+      body: "记忆在睡眠中巩固",
+      status: "complete",
+    });
+    const currentQuestion = sessionStore.appendMessage({
+      sessionId: session.id,
+      runId: "run-2",
+      role: "reader",
+      body: "本轮提问也提到回顾",
+      status: "complete",
+    });
+    await index.indexConversationMessage(bookId, {
+      id: currentQuestion.id,
+      role: "reader",
+      body: "本轮提问也提到回顾",
+      status: "complete",
+    });
+    // 本轮问题的另一种形状：不含检索词，只会从语义腿召回——同样必须被排除。
+    const currentFollowup = sessionStore.appendMessage({
+      sessionId: session.id,
+      runId: "run-2",
+      role: "reader",
+      body: "帮我把刚才的记忆再展开讲讲",
+      status: "complete",
+    });
+    await index.indexConversationMessage(bookId, {
+      id: currentFollowup.id,
+      role: "reader",
+      body: "帮我把刚才的记忆再展开讲讲",
+      status: "complete",
+    });
 
-    const search = await index.search(bookId, "回顾", 8);
+    const search = await index.search(bookId, "回顾", 8, undefined, undefined, "run-2");
     expect(search.status).toBe("ok");
     if (search.status !== "ok") return;
+    // 当前 run 的消息不召回：本轮问题刚落库，召回它是纯噪声且诱导重复检索；
+    // 关键词腿（currentQuestion）与语义腿（currentFollowup）都要排除。
     const conversationHits = search.hits.filter((hit) => hit.source === "conversation");
-    expect(conversationHits).toHaveLength(1);
-    expect(conversationHits[0]).toMatchObject({ sourceId: expect.any(String) });
+    expect(conversationHits).toHaveLength(2);
+    expect(conversationHits.map((hit) => hit.sourceId))
+      .toEqual(expect.arrayContaining([seededAnswer.id, seededSleep.id]));
     expect(conversationHits[0]?.page).toBeUndefined();
+
+    // 不排除当前 run 时四条会话候选都在。
+    const withoutCurrentRun = await index.search(bookId, "回顾", 8);
+    if (withoutCurrentRun.status === "ok") {
+      expect(withoutCurrentRun.hits.filter((hit) => hit.source === "conversation").map((hit) => hit.sourceId))
+        .toEqual(expect.arrayContaining([seededAnswer.id, currentQuestion.id, currentFollowup.id, seededSleep.id]));
+    }
     sessionStore.close();
   });
 

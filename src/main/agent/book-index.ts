@@ -16,6 +16,13 @@ import { chunkPageText } from "./semantic-chunker.js";
 const CJK_PATTERN = /[\u3000-\u9fff\uff00-\uffef]/;
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
 const TEXT_EXTRACTION_VERSION = "v2-structured-lines";
+/** 单次检索参与关键词腿的词数上限：查询串更长时只取前 N 个词，避免检索式无限膨胀。 */
+const MAX_SEARCH_TERMS = 8;
+/** 语义分按页文本有效长度折减的下限：短页（封面/目录页）的向量不可靠，但不能完全作废。 */
+const SEMANTIC_LENGTH_FLOOR = 0.4;
+const SEMANTIC_FULL_LENGTH = 120;
+/** 连续点导引（目录行的「…… 3」）不承载语义，按每个字符 3 个字符的长度扣减。 */
+const DOT_LEADER_RUN = /[.．·・…‥]{3,}/g;
 
 /**
  * 相对阈值截断：丢弃不足最高分 60% 的弱命中，避免「最不差的 N 个」式噪声
@@ -33,6 +40,32 @@ export function tokenizeForIndex(text: string) {
     .join("")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/**
+ * 查询串 → 检索词：按空白与中英文标点切分，去重后截断。
+ * 多词查询必须逐词检索——整串当一个短语时，中文查询（模型常写「请假 审批 年假」）
+ * 在 FTS 与 LIKE 两腿都命中 0 页，关键词腿等于没有。
+ */
+export function splitSearchTerms(query: string): string[] {
+  const terms: string[] = [];
+  for (const raw of query.split(/[\s,，、;；:：/|]+/)) {
+    const term = raw.trim();
+    if (term && !terms.includes(term)) terms.push(term);
+    if (terms.length >= MAX_SEARCH_TERMS) break;
+  }
+  return terms;
+}
+
+/**
+ * 页文本对语义分的可信度折减：点导引不计长度，短文本（封面、扉页）的向量不可靠。
+ * 目录页因此被显著降权——它按目录行罗列章节名，余弦相似度常常虚高于正文本体。
+ */
+export function pageTextSemanticFactor(text: string): number {
+  const dotLeaderChars = (text.match(DOT_LEADER_RUN) ?? []).reduce((total, run) => total + run.length, 0);
+  const effectiveLength = Math.max(0, text.length - dotLeaderChars * 3);
+  if (effectiveLength >= SEMANTIC_FULL_LENGTH) return 1;
+  return Math.max(SEMANTIC_LENGTH_FLOOR, effectiveLength / SEMANTIC_FULL_LENGTH);
 }
 
 export type BookSearchHit = {
@@ -76,6 +109,8 @@ export type BookIndexOptions = {
   readRecognizedBlocks?(bookId: string, page: number): ReadonlyArray<MineruBlock> | undefined;
   /** 会话检索最小读接口（会话表属会话存储）：懒取，组装根中会话存储晚于本模块创建。 */
   getConversationSearch?(): ((bookId: string, likePattern: string) => Array<{ id: string; body: string }>) | undefined;
+  /** 当前 run 的会话消息 id 只读接口（会话表属会话存储）：会话召回的关键词与语义两腿都排除本轮自身消息。 */
+  getRunMessageIds?(bookId: string, runId: string): string[];
 };
 
 type EmbeddingRow = {
@@ -239,13 +274,6 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   const clearPdfEmbeddingsStatement = database.prepare(
     "DELETE FROM semantic_embeddings WHERE book_id = ? AND source = 'pdf'",
   );
-  const searchStatement = database.prepare(`
-    SELECT page, text
-    FROM book_pages
-    WHERE book_id = ? AND extraction_version = ? AND text LIKE ?
-    ORDER BY page ASC
-    LIMIT 40
-  `);
   const indexedPagesBeforeStatement = database.prepare(
     "SELECT MAX(page) AS max_page, COUNT(*) AS count FROM book_pages WHERE book_id = ? AND extraction_version = ?",
   );
@@ -291,6 +319,12 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       .join("\n")
       .replace(/[^\S\n]+/g, " ")
       .trim();
+  }
+
+  /** 页文本是否来自 MinerU 识别（原生文本不足时兜底）；read_pages 的模态声明按此条件化。 */
+  function isPageRecognized(bookId: string, page: number): boolean {
+    const blocks = options.readRecognizedBlocks?.(bookId, page);
+    return Array.isArray(blocks) && blocks.length > 0;
   }
 
   function embeddingRows(bookId: string) {
@@ -539,6 +573,8 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       limit = 6,
       focus?: ReadingFocus,
       signal?: AbortSignal,
+      /** 当前 run 的会话消息不进「较早对话」召回——那是本轮问题本身，召回只会诱导重复检索。 */
+      excludeRunId?: string,
     ): Promise<BookSearchOutcome> {
       const trimmed = query.trim();
       if (!trimmed) return { status: "unavailable", note: "检索词为空。" };
@@ -566,42 +602,81 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
         if (candidate.sourceId < existing.sourceId) existing.sourceId = candidate.sourceId;
       };
 
-      // 关键词腿：FTS5 命中 + LIKE 兜底（覆盖标点分隔的中文与短语）。
-      const tokens = tokenizeForIndex(trimmed);
-      let ftsPages = new Set<number>();
-      let pages: { page: number; text: string }[] = [];
+      // 关键词腿：逐词 FTS5 命中 + 逐词 LIKE 兜底。整串当一个短语时，多词中文查询
+      // （模型常写「请假 审批 年假」）两腿都命中 0 页，关键词腿等于没有；逐词 OR
+      // 召回候选页，命中词数多的页排前（lexical 分 = 命中占比加权）。
+      const terms = splitSearchTerms(trimmed);
+      const singleTerm = terms.length <= 1;
+      const likeConditions = terms.map(() => "text LIKE ? ESCAPE '\\'").join(" OR ");
+      const termLikeStatement = database.prepare(`
+        SELECT page, text FROM book_pages
+        WHERE book_id = ? AND extraction_version = ? AND (${likeConditions})
+        ORDER BY page ASC
+        LIMIT 40
+      `);
+      const pageTextByIdStatement = database.prepare(
+        "SELECT text FROM book_pages WHERE book_id = ? AND page = ? AND extraction_version = ?",
+      );
+      const hitCountByPage = new Map<number, number>();
+      const merged = new Map<number, string>();
+      const collectLikeHits = () => {
+        for (const hit of termLikeStatement.all(bookId, TEXT_EXTRACTION_VERSION, ...terms.map((term) => likePattern(term))) as { page: number; text: string }[]) {
+          merged.set(hit.page, hit.text);
+        }
+      };
       try {
-        const fts = database.prepare(`
-          SELECT book_id, page FROM book_pages_fts
-          WHERE book_pages_fts MATCH ? AND book_id = ?
-          ORDER BY rank
-          LIMIT 40
-        `).all(`"${tokens.replace(/"/g, '""')}"`, bookId) as { book_id: string; page: number }[];
-        ftsPages = new Set(fts.filter((hit) => hit.book_id === bookId).map((hit) => hit.page));
-        const likePages = searchStatement.all(bookId, TEXT_EXTRACTION_VERSION, likePattern(trimmed)) as { page: number; text: string }[];
-        const merged = new Map<number, string>();
-        for (const hit of likePages) merged.set(hit.page, hit.text);
-        for (const hit of ftsPages) {
-          if (!merged.has(hit)) {
-            const text = database.prepare(
-              "SELECT text FROM book_pages WHERE book_id = ? AND page = ? AND extraction_version = ?",
-            ).get(bookId, hit, TEXT_EXTRACTION_VERSION) as { text: string } | undefined;
-            if (text) merged.set(hit, text.text);
+        for (const term of terms) {
+          const fts = database.prepare(`
+            SELECT page FROM book_pages_fts
+            WHERE book_pages_fts MATCH ? AND book_id = ?
+            ORDER BY rank
+            LIMIT 40
+          `).all(`"${tokenizeForIndex(term).replace(/"/g, '""')}"`, bookId) as { page: number }[];
+          for (const hit of fts) {
+            hitCountByPage.set(hit.page, (hitCountByPage.get(hit.page) ?? 0) + 1);
+            if (!merged.has(hit.page)) {
+              const text = pageTextByIdStatement.get(bookId, hit.page, TEXT_EXTRACTION_VERSION) as { text: string } | undefined;
+              if (text) merged.set(hit.page, text.text);
+            }
           }
         }
-        pages = [...merged.entries()].sort((a, b) => a[0] - b[0]).map(([page, text]) => ({ page, text }));
+        // LIKE 兜底：FTS5 对单字索引的 token 序列做的是「任意子序列」外的精确 phrase 匹配，
+        // 词与词被原文标点/换行隔开时 phrase 不命中，逐词 OR 补召回。
+        collectLikeHits();
       } catch {
-        pages = searchStatement.all(bookId, TEXT_EXTRACTION_VERSION, likePattern(trimmed)) as { page: number; text: string }[];
+        collectLikeHits();
       }
+      for (const [page, hitCount] of hitCountByPage) {
+        if (!merged.has(page)) {
+          const text = pageTextByIdStatement.get(bookId, page, TEXT_EXTRACTION_VERSION) as { text: string } | undefined;
+          if (text) merged.set(page, text.text);
+        }
+      }
+      const pages = [...merged.entries()].sort((a, b) => a[0] - b[0]).map(([page, text]) => ({ page, text }));
+      const bestHitCount = Math.max(1, ...hitCountByPage.values());
       for (const page of pages) {
-        addCandidate({ source: "pdf", sourceId: `${page.page}:0`, page: page.page, text: page.text }, ftsPages.has(page.page) ? 0.8 : 1);
+        const hitCount = hitCountByPage.get(page.page) ?? 0;
+        // lexical ∈ (0.5, 1]：FTS 命中按词覆盖占比排前；纯 LIKE 兜底的页多词 0.6、单词 1。
+        const lexical = hitCount > 0
+          ? 0.5 + 0.5 * (hitCount / bestHitCount)
+          : singleTerm ? 1 : 0.6;
+        addCandidate({ source: "pdf", sourceId: `${page.page}:0`, page: page.page, text: page.text }, lexical);
       }
 
       // 早期对话同样是候选来源；经会话存储的读接口查询，未接线时只用 PDF 候选。
+      // 当前 run 的消息（本轮问题刚落库）在关键词与语义两腿都排除——本轮问题未必包含
+      // 检索词（问「请假制度」、搜「年假」），只按 LIKE 命中过滤会从语义腿漏进来。
       const conversationSearch = options.getConversationSearch?.();
+      const runMessageIds = new Set<string>();
+      if (excludeRunId) {
+        for (const id of options.getRunMessageIds?.(bookId, excludeRunId) ?? []) runMessageIds.add(id);
+      }
       if (conversationSearch) {
-        for (const hit of conversationSearch(bookId, likePattern(trimmed))) {
-          addCandidate({ source: "conversation", sourceId: hit.id, text: hit.body }, 0.9);
+        for (const term of (singleTerm ? [trimmed] : terms)) {
+          for (const hit of conversationSearch(bookId, likePattern(term))) {
+            if (runMessageIds.has(hit.id)) continue;
+            addCandidate({ source: "conversation", sourceId: hit.id, text: hit.body }, 0.9);
+          }
         }
       }
 
@@ -624,12 +699,16 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       if (queryVector) {
         const rows = embeddingRows(bookId);
         for (const row of rows) {
+          if (row.source === "conversation" && runMessageIds.has(row.source_id)) continue;
           const vector = parseVector(row.vector_json);
           if (!vector || row.model !== provider?.model || row.dimensions !== queryVector.length) continue;
+          // 短页/目录页（点导引行堆出来的低信息密度页）向量不可靠，按有效文本长度折减。
+          const factor = row.source === "pdf" ? pageTextSemanticFactor(row.text) : 1;
           const key = `${row.source}:${row.source === "pdf" ? row.page : row.source_id}`;
           const existing = candidates.get(key);
+          const semantic = cosineSimilarity(queryVector, vector) * factor;
           if (existing) {
-            existing.semantic = Math.max(existing.semantic, cosineSimilarity(queryVector, vector));
+            existing.semantic = Math.max(existing.semantic, semantic);
           } else {
             candidates.set(key, {
               source: row.source,
@@ -637,7 +716,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
               ...(row.page === null ? {} : { page: row.page }),
               text: row.text,
               lexical: 0,
-              semantic: cosineSimilarity(queryVector, vector),
+              semantic,
             });
           }
         }
@@ -714,6 +793,11 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     /** 读取指定页码范围（含端点）的已索引整页文本；供 read_pages 工具整页阅读。 */
     readPages(bookId: string, fromPage: number, toPage: number): Array<{ page: number; text: string }> {
       return readPagesStatement.all(bookId, TEXT_EXTRACTION_VERSION, fromPage, toPage) as Array<{ page: number; text: string }>;
+    },
+
+    /** 页文本是否来自 MinerU 识别（原生文本不足时兜底）；read_pages 的模态声明按此条件化。 */
+    isPageRecognized(bookId: string, page: number): boolean {
+      return isPageRecognized(bookId, page);
     },
 
     stats(bookId: string) {

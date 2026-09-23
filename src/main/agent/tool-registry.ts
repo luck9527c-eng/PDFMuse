@@ -27,6 +27,8 @@ export type ToolExecutionContext = {
   bookId: string;
   focus?: ReadingFocus;
   signal?: AbortSignal;
+  /** 本问的 run id：检索召回「较早对话」时排除本轮自身消息（本轮问题刚落库，召回它是纯噪声）。 */
+  runId?: string;
   reportEvidence(evidence: PdfEvidence[]): void;
   bookIndex: BookIndex;
   /** 页面渲染模块：视觉工具经此取页面原图，检索模块不再承担渲染。 */
@@ -73,7 +75,9 @@ function createBookSearchTool(): RegisteredTool {
     name: "book_search",
     title: "检索本书",
     description:
-      "在阅读者当前打开的 PDF 书籍中进行关键词与语义混合检索；当问题可能涉及其他章节、需要原文页码，或需要找回较早对话时调用。返回带来源的原文摘录。",
+      "按关键词在整本书内定位相关页码（关键词与语义混合检索，返回带来源的原文摘录）。"
+      + "标准顺序：先用本工具把主题定位到页码，再用 read_pages 读取整页原文作答。"
+      + "只有检索较早对话内容时才单独使用本工具；不要用本工具替代 read_pages 的整页阅读——检索摘录只有片段，讲解和总结需要整页上下文。",
     parameters: bookSearchSchema,
     async execute(input, ctx) {
       // 参数已由 agent-loop 的 validateToolArguments 按 schema 校验；这里只做 schema 表达不了的语义收敛。
@@ -93,10 +97,11 @@ function createBookSearchTool(): RegisteredTool {
         ctx.signal?.removeEventListener("abort", onOuterAbort);
       }
 
-      const outcome = await ctx.bookIndex.search(ctx.bookId, keyword, hitLimit, ctx.focus, ctx.signal);
+      const outcome = await ctx.bookIndex.search(ctx.bookId, keyword, hitLimit, ctx.focus, ctx.signal, ctx.runId);
       if (outcome.status === "unavailable") {
         return { displaySummary: `检索「${keyword}」不可用`, contentText: outcome.note };
       }
+      const pdfHits = outcome.hits.filter((hit) => hit.source !== "conversation");
       const lines = outcome.hits.map((hit) => (
         hit.source === "conversation"
           ? `较早对话：${hit.snippet}`
@@ -111,9 +116,17 @@ function createBookSearchTool(): RegisteredTool {
         outcome.status === "partial" ? outcome.note : "",
         outcome.retrievalMode === "fts-only" ? "当前未完成向量检索，结果仅基于关键词匹配。" : "",
       ].filter(Boolean).join("\n\n");
-      const body = lines.length > 0
-        ? lines.join("\n\n")
-        : "没有在书中找到相关内容。请基于已有上下文回答，并明确说明书中未检索到。";
+      // 未命中本书页面（空命中或只召回较早对话）时把下一步写进结果：模型常在空命中后
+      // 空转续查或放弃整页阅读，这比只靠工具描述自觉更可靠。
+      const currentPage = ctx.focus?.currentPage;
+      const readPagesHint = currentPage !== undefined
+        ? `如需讲解当前小节，请改用 read_pages 直接读取第 ${currentPage} 页附近的整页原文。`
+        : "如需讲解，请改用 read_pages 读取相关章节的整页原文。";
+      const body = lines.length === 0
+        ? `没有在书中找到相关内容。请基于已有上下文回答，并明确说明书中未检索到。\n\n${readPagesHint}`
+        : pdfHits.length === 0
+          ? `${lines.join("\n\n")}\n\n（以上仅为较早对话摘录，未命中本书页面。${readPagesHint}）`
+          : lines.join("\n\n");
       const contentText = `${header}${body}`.slice(0, CONTENT_MAX_LENGTH);
       return {
         displaySummary: `已检索「${keyword}」，命中 ${outcome.hits.length} 处${outcome.retrievalMode === "hybrid" ? "（混合检索）" : ""}`,
@@ -138,7 +151,7 @@ function createReadPagesTool(): RegisteredTool {
     name: "read_pages",
     title: "读取页面",
     description:
-      "按页码列表整页读取文字（含 OCR 识别结果），一次可读多页、支持不连续页码。讲解、总结、复习某个小节或某几页内容时，优先用本工具从 Reader 当前阅读位置读取原文（章节跨页时把涉及的页码一并传入）；只有需要跨章节定位关键词或找回较早对话时才使用 book_search。",
+      "按页码列表整页读取文字，一次可读多页、支持不连续页码。讲解、总结、复习某个小节或某几页内容时优先用本工具读取原文（章节跨页时把涉及的页码一并传入）；范围未知时先用 book_search 把主题定位到页码，再回来用本工具精读。",
     parameters: readPagesSchema,
     async execute(input, ctx) {
       const { pages } = input as Static<typeof readPagesSchema>;
@@ -165,6 +178,9 @@ function createReadPagesTool(): RegisteredTool {
         };
       }
       const missing = requested.filter((page) => !textByPage.has(page));
+      // 版面失真声明只挂识别页：原生文本页没有公式 LaTeX/表格 HTML/插图占位，全量附注
+      // 既误导模型去调 read_page_image，又是纯 token 开销。
+      const ocrPages = found.filter((page) => ctx.bookIndex.isPageRecognized(ctx.bookId, page));
       let body = found.map((page) => `【第 ${page} 页】\n${textByPage.get(page)}`).join("\n\n");
       if (body.length > READ_PAGES_MAX_CHARS) {
         body = `${body.slice(0, READ_PAGES_MAX_CHARS)}\n…（内容过长已截断，可缩小页码范围后分次读取）`;
@@ -180,9 +196,14 @@ function createReadPagesTool(): RegisteredTool {
         score: 1,
       }));
       const label = found.length === 1 ? `第 ${found[0]} 页` : `第 ${found.join("、")} 页`;
+      const modalityNote = ocrPages.length > 0
+        ? (ocrPages.length < found.length
+          ? `\n\n⚠ 第 ${ocrPages.join("、")} 页文本由版面解析生成${OCR_MODALITY_NOTE_DETAIL}`
+          : `\n\n⚠ 本文本由版面解析生成${OCR_MODALITY_NOTE_DETAIL}`)
+        : "";
       return {
         displaySummary: `已读取${label}全文`,
-        contentText: `${body}${OCR_MODALITY_NOTE}`,
+        contentText: `${body}${modalityNote}`,
         evidence,
       };
     },
@@ -225,9 +246,9 @@ function createWebSearchTool(): RegisteredTool {
   };
 }
 
-/** read_pages 文本的模态声明：MinerU 块级解析已按阅读顺序重建结构，但图片内容不可见。 */
-const OCR_MODALITY_NOTE =
-  "\n\n⚠ 本文本由版面解析生成：正文与标题已按阅读顺序重建；扫描页的公式为 LaTeX 记法（如 \\frac{a}{b} 表示分式）、表格可能为 HTML 片段；插图内容不可见（仅保留占位）。凡需要核对图片、照片或原版式细节，先用 read_page_image 查看原图。";
+/** read_pages 识别页的模态声明细节：MinerU 块级解析已按阅读顺序重建结构，但图片内容不可见。 */
+const OCR_MODALITY_NOTE_DETAIL =
+  "：正文与标题已按阅读顺序重建；公式为 LaTeX 记法（如 \\frac{a}{b} 表示分式）、表格可能为 HTML 片段；插图内容不可见（仅保留占位）。凡需要核对图片、照片或原版式细节，先用 read_page_image 查看原图。";
 
 const readPageImageSchema = Type.Object({
   pages: Type.Array(Type.Integer({ minimum: 1 }), {

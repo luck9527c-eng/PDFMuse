@@ -238,4 +238,30 @@ describe("Embedding Connection Module", () => {
       code: "VALIDATION_ERROR",
     });
   });
+
+  it("嵌入测试在裸域名地址上自动补全 /v1 路径", async () => {
+    let receivedUrl: string | undefined;
+    const baseUrl = await listen(createServer((request, response) => {
+      receivedUrl = request.url;
+      if (!request.url?.startsWith("/v1/")) {
+        response.writeHead(403, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({
+          message: "HTTP node only allows access to inference API paths (/v1/embeddings)",
+          success: false,
+        }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ data: [{ embedding: [0.1, 0.2] }] }));
+    }));
+    const dataHome = await createDataHome();
+    const embedding = createEmbeddingConnectionModule(dataHome);
+
+    await expect(embedding.test({
+      baseUrl,
+      model: "embedding-model",
+      apiKey: "secret",
+    })).resolves.toMatchObject({ ok: true, dimensions: 2 });
+    expect(receivedUrl).toBe("/v1/embeddings");
+  });
 });
