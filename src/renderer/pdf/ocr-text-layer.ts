@@ -28,8 +28,8 @@ export type SpanBoxMeasurement = {
 /**
  * 把块内文字的字号拟合到块级 bbox：以 100px 基准量出单行总宽 W1，
  * 字号 f 下占高 ≈ W1·f²/(100·W)（line-height 1），令其等于盒高 H 解出
- * f=100·√(W·H/W1)。透明选字层只需贴合段落区域，不追求像素级精确；
- * 无布局（测试/隐藏页）时跳过，样式保持原状。
+ * f=100·√(W·H/W1)。拟合只服务于点击选整块时的高亮贴合（合成选区的
+ * 矩形≈块 bbox）；无布局（测试/隐藏页）时跳过，样式保持原状。
  */
 export function fitSpanFontSize(span: SpanBoxMeasurement): number | undefined {
   const boxWidth = span.offsetWidth;
@@ -76,9 +76,25 @@ export function mountRecognizedTextLayer(viewer: HTMLElement, recognizedPage?: R
     span.style.height = `${Math.max(0.5, Math.min(100, (y1 - y0) * 100))}%`;
     layer.appendChild(span);
   }
+  // 点击选整块（Reader 2026-09-23 拍板）：MinerU 4.0.2 公开输出无行级几何（Reader 亲核源码确认），
+  // 拖选在块级语义下天然残缺；点击时程序化合成整块选区，沿 selectionchange 链路复用既有
+  // popover / Selected Passage / Evidence 流程。层随重挂重建，监听不累积。
+  layer.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const span = target.closest<HTMLElement>("span");
+    if (!span || !layer.contains(span)) return;
+    const selection = window.getSelection();
+    // 用户在块内拖出的部分选区（含双击选词）予以尊重；点击另一块或空白选区时替换为整块。
+    if (selection && !selection.isCollapsed && selection.rangeCount > 0 && selection.getRangeAt(0).intersectsNode(span)) return;
+    if (!selection) return;
+    const range = document.createRange();
+    range.selectNodeContents(span);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
   page.appendChild(layer);
-  // 布局就绪后逐块拟合字号（段落多行文本按 bbox 折行铺满，整段可选中）；
-  // 测试与隐藏页无布局，fitSpanFontSize 内部自行跳过。
+  // 布局就绪后逐块拟合字号；测试与隐藏页无布局，fitSpanFontSize 内部自行跳过。
   for (const span of layer.querySelectorAll<HTMLElement>("span")) fitSpanFontSize(span);
   return true;
 }

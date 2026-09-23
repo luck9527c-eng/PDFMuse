@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { RecognizedPageText } from "../../shared/contracts";
 import { fitSpanFontSize, mountRecognizedTextLayer } from "./ocr-text-layer";
@@ -120,5 +120,79 @@ describe("fitSpanFontSize", () => {
     const span = stubBox(100, 50, 0);
     expect(fitSpanFontSize(span)).toBeUndefined();
     expect(span.style.fontSize).toBe("");
+  });
+});
+
+describe("点击选整块", () => {
+  // jsdom 的 Selection 是残缺桩（addRange 不生效），装一个受控假选区：
+  // 真实 Range 照常创建，选区状态由桩记录，处理逻辑经真实 DOM 事件驱动。
+  function installFakeSelection() {
+    let current: { range: Range } | null = null;
+    const selection = {
+      get isCollapsed() {
+        return current === null;
+      },
+      get rangeCount() {
+        return current === null ? 0 : 1;
+      },
+      getRangeAt(index: number) {
+        if (current === null || index !== 0) throw new Error("Invalid range index.");
+        return current.range;
+      },
+      removeAllRanges() {
+        current = null;
+      },
+      addRange(range: Range) {
+        current = { range };
+      },
+    };
+    vi.stubGlobal("getSelection", () => selection);
+    return selection;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function mountTwoBlocks() {
+    const recognizedPage = recognizedPageWith([
+      { type: "text", text: "第一块全文", bbox: [0.1, 0.1, 0.5, 0.2] },
+      { type: "text", text: "第二块全文", bbox: [0.55, 0.1, 0.9, 0.2] },
+    ]);
+    const viewer = document.createElement("div");
+    const page = document.createElement("div");
+    page.className = "page";
+    page.dataset.pageNumber = "2";
+    viewer.appendChild(page);
+    mountRecognizedTextLayer(viewer, recognizedPage);
+    const spans = Array.from(page.querySelectorAll<HTMLElement>(".ocr-text-layer span"));
+    return { spans };
+  }
+
+  it("点击块合成整块选区", () => {
+    const selection = installFakeSelection();
+    const { spans } = mountTwoBlocks();
+    spans[1]!.click();
+    expect(selection.isCollapsed).toBe(false);
+    expect(selection.getRangeAt(0).toString()).toBe("第二块全文");
+  });
+
+  it("块内已有拖选（选区与该块相交）时点击不覆盖用户选区", () => {
+    const selection = installFakeSelection();
+    const { spans } = mountTwoBlocks();
+    const range = document.createRange();
+    range.selectNodeContents(spans[0]!);
+    selection.addRange(range);
+    spans[0]!.click();
+    expect(selection.getRangeAt(0).toString()).toBe("第一块全文");
+  });
+
+  it("选区在另一块时点击替换为新块的整块选区", () => {
+    const selection = installFakeSelection();
+    const { spans } = mountTwoBlocks();
+    spans[0]!.click();
+    expect(selection.getRangeAt(0).toString()).toBe("第一块全文");
+    spans[1]!.click();
+    expect(selection.getRangeAt(0).toString()).toBe("第二块全文");
   });
 });
