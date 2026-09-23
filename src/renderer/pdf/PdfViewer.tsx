@@ -15,7 +15,7 @@ import {
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 import type { BookOutlineNode, OpenedPdfBook, ReadingZoomMode, RecognizedPageText, SelectedPassage } from "../../shared/contracts";
-import { normalizePageRects } from "./selection-geometry";
+import { normalizePageRects, ocrSelectionRects, unionRect } from "./selection-geometry";
 import { mountRecognizedTextLayer } from "./ocr-text-layer";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -353,8 +353,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       const text = selection.toString().trim();
       const page = Number(startPage.dataset.pageNumber);
       const pageRect = startPage.getBoundingClientRect();
-      const rects = normalizePageRects(pageRect, Array.from(range.getClientRects()));
-      const selectionRect = range.getBoundingClientRect();
+      // 扫描页选区高亮直接用 MinerU 块 bbox（Reader 2026-09-23）：拟合字形的矩形与原图行错位，
+      // 块坐标本身是准的——高亮回归"块坐标定位"；原生文字层不受影响，仍走字形矩形。
+      const ocrRects = ocrSelectionRects(startPage, range);
+      const rects = normalizePageRects(pageRect, ocrRects ?? Array.from(range.getClientRects()));
+      const selectionRect = (ocrRects && unionRect(ocrRects)) ?? range.getBoundingClientRect();
       if (!text || !Number.isSafeInteger(page) || page < 1 || rects.length === 0
         || selectionRect.width <= 0 || selectionRect.height <= 0) {
         clearSelectionPopover();
