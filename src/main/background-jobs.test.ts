@@ -60,6 +60,32 @@ describe("background jobs", () => {
     const scheduled = module.schedule({ bookId: BOOK_A, kind: "ocr", checkpoint: "ocr-order:6:12" });
     expect(scheduled).toMatchObject({ ok: true, job: { checkpoint: "ocr-order:6:12" } });  });
 
+  it("启动恢复的泵推迟到初始化之后：回调不会同步打进装配根死区", async () => {
+    // 先建库并预置一条 queued 任务，模拟上次进程被杀留下的可恢复工作。
+    const bootstrap = createBackgroundJobModule(dataHome);
+    bootstrap.close();
+    const raw = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    raw.prepare(`
+      INSERT INTO background_jobs (id, book_id, kind, priority, status, created_at, updated_at)
+      VALUES ('job-recover', ?, 'index', 10, 'queued', '2026-09-23T00:00:00.000Z', '2026-09-23T00:00:00.000Z')
+    `).run(BOOK_A);
+    raw.close();
+
+    const notified: string[] = [];
+    let executions = 0;
+    module = createBackgroundJobModule(dataHome, {
+      index: async () => { executions += 1; },
+    }, (bookId) => notified.push(bookId));
+
+    // 修复点：构造返回时恢复泵尚未运行，通知回调与执行器都没有同步触发。
+    expect(executions).toBe(0);
+    expect(notified).toEqual([]);
+    // 推迟到下一 tick 后，恢复照常完成：任务被执行、通知照发。
+    await waitFor(() => executions === 1);
+    await waitFor(() => module?.list(BOOK_A)[0]?.status === "completed");
+    expect(notified).toContain(BOOK_A);
+  });
+
   it("notifies job changes per book for push delivery", async () => {
     const notified: string[] = [];
     module = createBackgroundJobModule(

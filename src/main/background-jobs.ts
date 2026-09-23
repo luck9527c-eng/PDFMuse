@@ -240,8 +240,9 @@ export function createBackgroundJobModule(
 
   function validJobId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 128; }
 
-  // Recover queued work immediately after process startup.
-  pump();
+  // 恢复启动前排队的任务；泵必须推迟到当前 tick 之后——装配根的通知回调会读取
+  // 尚未完成初始化的模块变量，同步泵会在恢复认领的第一次通知上撞进 TDZ。
+  setTimeout(() => pump(), 0);
 
   return {
     schedule(input: ScheduleJobInput): BackgroundJobMutationResult {
