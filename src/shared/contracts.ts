@@ -261,16 +261,21 @@ export type RecognizedPageText = {
   engineVersion: string;
   createdAt: string;
 };
+/** OCR 派发优先级：交互插队、批量让位（弹性池消费）。 */
+export type OcrDispatchPriority = "interactive" | "bulk";
+
 export type OcrPageRequest = {
   bookId: string;
   page: number;
+  /** 渲染端不传，由主进程按来源标注。 */
+  priority?: OcrDispatchPriority;
 };
 export type OcrPageResult =
   | { ok: true; page: RecognizedPageText }
   | { ok: false; code: "VALIDATION_ERROR" | "UNAVAILABLE" | "FAILED" | "CANCELLED"; message: string };
 
 export type MineruBlock = { type: string; text: string; bbox: [number, number, number, number] };
-export type MineruPageRequest = { page: number; pdfPath: string };
+export type MineruPageRequest = { page: number; pdfPath: string; priority?: OcrDispatchPriority };
 export type MineruPageData = { blocks: MineruBlock[]; markdown: string };
 export type MineruWorkerResponse =
   | { id: string; ok: true; result: MineruPageData }

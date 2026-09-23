@@ -63,6 +63,29 @@ export function createRecognizedTextIngestion(dependencies: RecognizedTextIngest
         completed: Math.max(0, Number(order?.[2] ?? 0) || 0),
       };
     },
+    /**
+     * 并发识别的断点前沿：完成页集合受 checkpoint 长度上限约束无法整集编码，
+     * 依托确定性扫描顺序以"连续前缀"紧凑表达——乱序完成暂存，补齐后前沿一次推进。
+     * 前沿之前的页必然已落库，前沿之后的在途页崩溃后按缓存缺失自然重扫。
+     */
+    createOcrFrontier(base: number) {
+      const done = new Set<number>();
+      let frontier = Math.max(0, Math.floor(base) || 0);
+      return {
+        frontier(): number {
+          return frontier;
+        },
+        complete(orderIndex: number): number {
+          const page = Math.floor(orderIndex);
+          if (Number.isSafeInteger(page) && page >= frontier) done.add(page);
+          while (done.has(frontier)) {
+            done.delete(frontier);
+            frontier += 1;
+          }
+          return frontier;
+        },
+      };
+    },
   };
 }
 

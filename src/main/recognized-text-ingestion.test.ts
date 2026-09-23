@@ -77,4 +77,24 @@ describe("recognized text ingestion", () => {
     expect(ingestion.decodeOcrCheckpoint(ingestion.encodeOcrCheckpoint(3, 0))).toEqual({ focusPage: 3, completed: 0 });
     expect(ingestion.decodeOcrCheckpoint(ingestion.encodeOcrCheckpoint(1, 40))).toEqual({ focusPage: 1, completed: 40 });
   });
+
+  it("完成前沿只计连续前缀：乱序完成不推进，补齐后跳到新前沿", () => {
+    const { ingestion } = createHarness();
+    const frontier = ingestion.createOcrFrontier(2);
+    expect(frontier.frontier()).toBe(2);
+    expect(frontier.complete(3)).toBe(2);
+    expect(frontier.complete(2)).toBe(4);
+    expect(frontier.complete(0)).toBe(4);
+    expect(frontier.complete(4)).toBe(5);
+    expect(frontier.complete(1)).toBe(5);
+  });
+
+  it("完成前沿从零起步并容忍非法页序", () => {
+    const { ingestion } = createHarness();
+    const frontier = ingestion.createOcrFrontier(0);
+    expect(frontier.complete(1)).toBe(0);
+    expect(frontier.complete(0)).toBe(2);
+    expect(frontier.complete(-3)).toBe(2);
+    expect(frontier.complete(2)).toBe(3);
+  });
 });

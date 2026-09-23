@@ -94,7 +94,7 @@ export function createOcrModule(
           && cached.inputVersion === (engine.inputVersion ?? "unknown")
         ) return { ok: true, page: cached };
         try {
-          const recognized = await engine.recognizePage({ page: input.page, pdfPath: source.path }, signal);
+          const recognized = await engine.recognizePage({ page: input.page, pdfPath: source.path, priority: input.priority }, signal);
           if (signal?.aborted) return { ok: false, code: "CANCELLED", message: "OCR 已取消。" };
           const page: RecognizedPageText = {
             bookId: input.bookId,
@@ -135,6 +135,13 @@ export function createOcrModule(
         && result.model === expectedModel
         && (!expectedInputVersion || result.inputVersion === expectedInputVersion),
       );
+    },
+
+    /** 打开书籍时的后台预热：仅当该书已有识别历史（扫描书复读）才拉起 worker，纯文字书保持零 OCR 进程。 */
+    preheat(bookId: string) {
+      if (!BOOK_ID_PATTERN.test(bookId)) return;
+      const recognized = database.prepare("SELECT 1 FROM recognized_pages WHERE book_id = ? LIMIT 1").get(bookId);
+      if (recognized) engine.warmup?.();
     },
 
     /** 每书数据清理钩子：在调用方提供的连接上删除本书识别页。 */

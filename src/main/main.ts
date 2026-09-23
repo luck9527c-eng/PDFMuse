@@ -127,14 +127,16 @@ app.whenReady().then(async () => {
     const configPath = path.join(startupPreflight.dataHome, "config.json");
     const readerProfile = createReaderProfileModule(startupPreflight.dataHome);
     const appearanceSettings = createAppearanceSettingsModule(startupPreflight.dataHome);
-    const ocr = createOcrModule(startupPreflight.dataHome, createWorkerMineruEngine({
+    const mineruEngine = createWorkerMineruEngine({
       command: path.join(applicationDirectory(), "resources", "mineru-runtime", process.platform === "win32" ? "python.exe" : "python"),
       args: [path.join(applicationDirectory(), "resources", "mineru-worker", "mineru_worker.py")],
       mineruHome: path.join(applicationDirectory(), "resources", "mineru-runtime", "home"),
+      smallBackend: "torch",
       model: MINERU_MODEL,
       inputVersion: MINERU_INPUT_VERSION,
       engineVersion: MINERU_ENGINE_VERSION,
-    }), {
+    });
+    const ocr = createOcrModule(startupPreflight.dataHome, mineruEngine, {
       resolvePdfPath: (bookId) => {
         const source = library.getBookSource(bookId);
         return source ? { path: source.path, encrypted: Boolean(source.savedPassword) } : undefined;
@@ -231,16 +233,45 @@ app.whenReady().then(async () => {
         if (!book) throw new Error("当前 PDF 书籍不可用。");
         const { focusPage, completed } = ingestion.decodeOcrCheckpoint(job.checkpoint);
         const pages = prioritizedPageOrder(book.pageCount, focusPage);
-        for (let index = completed; index < pages.length; index += 1) {
-          const page = pages[index]!;
-          if (context.signal.aborted) throw new Error("OCR 任务已暂停或取消。");
-          if (!ocr.isPageCompatible(job.bookId, page, MINERU_ENGINE_VERSION, MINERU_MODEL, MINERU_INPUT_VERSION)) {
-            const result = await ocr.recognizePage({ bookId: job.bookId, page }, context.signal);
-            if (!result.ok) throw new Error(result.message);
-            await ingestion.ingestRecognizedPage(job.bookId, page, result.page.blocks, "background");
+        // 弹性池动态派页（T49）：至多 N 页在途；断点只推进连续前沿——前沿之前必然已落库，
+        // 前沿之后的在途页崩溃后按缓存缺失自然重扫，旧格式断点沿用同一编码无损续扫。
+        const limit = mineruEngine.concurrency;
+        const frontier = ingestion.createOcrFrontier(completed);
+        let written = completed;
+        let nextIndex = completed;
+        let failure: string | undefined;
+        const inFlight = new Set<Promise<void>>();
+        const pump = () => {
+          while (!failure && !context.signal.aborted && inFlight.size < limit && nextIndex < pages.length) {
+            const index = nextIndex;
+            nextIndex += 1;
+            const task = (async () => {
+              if (context.signal.aborted) return;
+              const page = pages[index]!;
+              if (!ocr.isPageCompatible(job.bookId, page, MINERU_ENGINE_VERSION, MINERU_MODEL, MINERU_INPUT_VERSION)) {
+                const result = await ocr.recognizePage({ bookId: job.bookId, page, priority: "bulk" }, context.signal);
+                if (!result.ok) {
+                  if (!context.signal.aborted) failure = result.message;
+                  return;
+                }
+                await ingestion.ingestRecognizedPage(job.bookId, page, result.page.blocks, "background");
+              }
+              const reached = frontier.complete(index);
+              if (reached > written) {
+                written = reached;
+                context.checkpoint(ingestion.encodeOcrCheckpoint(focusPage, reached), reached, book.pageCount);
+              }
+            })().finally(() => {
+              inFlight.delete(task);
+              pump();
+            });
+            inFlight.add(task);
           }
-          context.checkpoint(ingestion.encodeOcrCheckpoint(focusPage, index + 1), index + 1, book.pageCount);
-        }
+        };
+        pump();
+        while (inFlight.size > 0) await Promise.all([...inFlight]);
+        if (context.signal.aborted) throw new Error("OCR 任务已暂停或取消。");
+        if (failure) throw new Error(failure);
         if (!context.signal.aborted) ingestion.completeBookOcr(job.bookId);
       },
       outline: async (job, context) => {
@@ -328,6 +359,18 @@ app.whenReady().then(async () => {
       }
     };
     ipcMain.handle("library:list", () => library.list());
+    // 打开书籍即后台预热：仅扫描书（已有识别历史）会拉起 worker，吸收首次识别的模型加载延迟（T49）。
+    function bookIdOf(result: unknown): string | undefined {
+      if (typeof result !== "object" || result === null) return undefined;
+      const id = (result as { id?: unknown }).id;
+      return typeof id === "string" ? id : undefined;
+    }
+    const openBookAndPreheat = async (open: () => unknown) => {
+      const result = await open();
+      const bookId = bookIdOf(result);
+      if (bookId) void ocr.preheat(bookId);
+      return result;
+    };
     ipcMain.handle("library:choose", async () => {
       const result = await dialog.showOpenDialog({
         title: "打开 PDF 书籍",
@@ -336,11 +379,11 @@ app.whenReady().then(async () => {
       });
       const selectedPath = result.filePaths[0];
       if (result.canceled || !selectedPath) return null;
-      return library.openPath(selectedPath);
+      return openBookAndPreheat(() => library.openPath(selectedPath));
     });
-    ipcMain.handle("library:open-path", (_event, filePath: unknown) => library.openPath(filePath));
-    ipcMain.handle("library:open-recent", () => library.openRecent());
-    ipcMain.handle("library:open-known", (_event, bookId: unknown) => library.openKnown(bookId));
+    ipcMain.handle("library:open-path", (_event, filePath: unknown) => openBookAndPreheat(() => library.openPath(filePath)));
+    ipcMain.handle("library:open-recent", () => openBookAndPreheat(() => library.openRecent()));
+    ipcMain.handle("library:open-known", (_event, bookId: unknown) => openBookAndPreheat(() => library.openKnown(bookId)));
     ipcMain.handle(
       "library:unlock",
       (_event, challengeId: unknown, password: unknown, rememberPassword: unknown) => (
@@ -439,7 +482,8 @@ app.whenReady().then(async () => {
       if (!input || typeof input !== "object") return { ok: false, code: "VALIDATION_ERROR", message: "OCR 页面请求无效。" };
       const value = input as { bookId?: unknown };
       if (!isOwnedBook(value.bookId)) return { ok: false, code: "VALIDATION_ERROR", message: "当前 PDF 书籍不可用。" };
-      const result = await ocr.recognizePage(input as Parameters<typeof ocr.recognizePage>[0]);
+      // 交互来源由主进程标注：插队派发，整书扫描让位（T49）。
+      const result = await ocr.recognizePage({ ...(input as Parameters<typeof ocr.recognizePage>[0]), priority: "interactive" });
       if (result.ok) {
         await ingestion.ingestRecognizedPage(result.page.bookId, result.page.page, result.page.blocks, "interactive");
       }

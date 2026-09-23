@@ -57,9 +57,10 @@ function recognize(pdfPath, page) {
 }
 
 const total = Number(process.argv[3] || 39);
+const startPage = Number(process.argv[5] || 1);
 const pages = [];
 const t0 = Date.now();
-for (let page = 1; page <= total; page += 1) {
+for (let page = startPage; page <= total; page += 1) {
   const start = Date.now();
   const result = await recognize(PDF, page);
   const ms = Date.now() - start;
