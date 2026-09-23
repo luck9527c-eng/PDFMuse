@@ -91,21 +91,28 @@ describe("fitSpanFontSize", () => {
     };
   }
 
-  it("按盒面积与单行总宽解出字号：100×50 盒、单行 80000px → 25px 并恢复折行", () => {
-    const span = stubBox(100, 50, 80_000);
-    expect(fitSpanFontSize(span)).toBe(25);
-    expect(span.style.fontSize).toBe("25px");
+  it("按盒面积与单行总宽解出字号：100×100 盒、单行 10000px → 10px 并恢复折行", () => {
+    const span = stubBox(100, 100, 10_000);
+    expect(fitSpanFontSize(span)).toBe(10);
+    expect(span.style.fontSize).toBe("10px");
     expect(span.style.whiteSpace).toBe("normal");
   });
 
+  it("长段落回归（Reader 症状块）：619×119 盒、172 字单行 17200px → 约 20.7px，不再撞上限", () => {
+    const span = stubBox(619, 119, 17_200);
+    const fitted = fitSpanFontSize(span)!;
+    expect(fitted).toBeCloseTo(20.7, 1);
+    expect(fitted).toBeLessThan(64);
+  });
+
   it("字号夹在上限 64px：短文本大盒子不再放大", () => {
-    const span = stubBox(200, 50, 8_000);
+    const span = stubBox(200, 200, 500);
     expect(fitSpanFontSize(span)).toBe(64);
     expect(span.style.fontSize).toBe("64px");
   });
 
   it("字号夹在下限 6px：超长文本小盒子不再缩小", () => {
-    const span = stubBox(100, 50, 80_000_000);
+    const span = stubBox(50, 50, 1_000_000);
     expect(fitSpanFontSize(span)).toBe(6);
     expect(span.style.fontSize).toBe("6px");
   });

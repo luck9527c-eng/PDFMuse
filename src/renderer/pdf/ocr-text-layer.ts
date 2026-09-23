@@ -28,8 +28,7 @@ export type SpanBoxMeasurement = {
 /**
  * 把块内文字的字号拟合到块级 bbox：以 100px 基准量出单行总宽 W1，
  * 字号 f 下占高 ≈ W1·f²/(100·W)（line-height 1），令其等于盒高 H 解出
- * f=100·√(W·H/W1)。拟合只服务于点击选整块时的高亮贴合（合成选区的
- * 矩形≈块 bbox）；无布局（测试/隐藏页）时跳过，样式保持原状。
+ * f=√(100·W·H/W1)。透明选字层只需贴合块 bbox；无布局（测试/隐藏页）时跳过。
  */
 export function fitSpanFontSize(span: SpanBoxMeasurement): number | undefined {
   const boxWidth = span.offsetWidth;
@@ -45,7 +44,7 @@ export function fitSpanFontSize(span: SpanBoxMeasurement): number | undefined {
     span.style.whiteSpace = previousWhiteSpace;
     return undefined;
   }
-  const fitted = FIT_BASE_FONT_PX * Math.sqrt((boxWidth * boxHeight) / singleLineWidth);
+  const fitted = Math.sqrt((FIT_BASE_FONT_PX * boxWidth * boxHeight) / singleLineWidth);
   const fontSize = Math.max(FIT_MIN_FONT_PX, Math.min(FIT_MAX_FONT_PX, fitted));
   span.style.fontSize = `${fontSize}px`;
   span.style.whiteSpace = "normal";
