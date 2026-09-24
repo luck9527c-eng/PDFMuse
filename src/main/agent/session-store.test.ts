@@ -61,6 +61,28 @@ describe("session store", () => {
     expect(store.listRunMessageIds(BOOK_ID, "run-x")).toEqual([]);
   });
 
+  it("finalizeRun 同事务落运行出口行，可按会话读回；清空会话一并清除（T50）", () => {
+    store = createSessionStore(dataHome);
+    const session = store.ensureSession(BOOK_ID);
+    const message = store.appendMessage({ sessionId: session.id, runId: "run-a", role: "assistant", body: "", status: "streaming" });
+    store.finalizeRun({
+      sessionId: session.id,
+      runId: "run-a",
+      toolCalls: [],
+      message: { messageId: message.id, body: "回答", status: "complete" },
+      exit: { exitReason: "max_iterations_reached", roundsUsed: 50, roundsTotal: 50 },
+    });
+    // 缺省 exit 不写行（旧路径行为不变）。
+    store.finalizeRun({ sessionId: session.id, runId: "run-b", toolCalls: [] });
+
+    expect(store.listRunOutcomes(session.id)).toEqual([
+      { runId: "run-a", exitReason: "max_iterations_reached", roundsUsed: 50, roundsTotal: 50 },
+    ]);
+
+    store.clearConversation(BOOK_ID);
+    expect(store.listRunOutcomes(session.id)).toEqual([]);
+  });
+
   it("deleteBookData 在给定连接上清掉本书会话与消息且不影响他书", () => {
     store = createSessionStore(dataHome);
     const kept = seedConversation(OTHER_BOOK_ID);

@@ -335,6 +335,7 @@ app.whenReady().then(async () => {
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
         savePageImage: toolMedia.savePageImage,
+        loadPageImage: toolMedia.loadPageImage,
         webSearch,
       })),
       indexConversationMessage: async (bookId, message) => {

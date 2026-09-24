@@ -43,7 +43,7 @@ describe("tool registry", () => {
 
   function context(
     reportEvidence: (evidence: unknown[]) => void = () => undefined,
-    budget: PageImageBudget = { pagesDelivered: 0, calls: 0 },
+    budget: PageImageBudget = { pagesDelivered: 0, deliveredMedia: new Map() },
   ) {
     return {
       bookId,
@@ -116,62 +116,111 @@ describe("tool registry", () => {
       .find((item) => item.name === "read_page_image")!.description;
     expect(description).toContain("默认只查看 1 页");
     expect(description).toContain("定位");
-    expect(description).toContain("预算");
-    // 旧的「最多 4 页」数量邀请不得回流。
+    expect(description).toContain("额度");
+    // 旧的「最多 4 页」数量邀请与次数上限措辞不得回流。
     expect(description).not.toMatch(/最多\s*4\s*页/);
+    expect(description).toContain("没有次数限制");
   });
 
-  it("clamps read_page_image to a four-page per-question budget with echo", async () => {
+  it("clamps read_page_image to the twenty-page per-question quota with a note and echo annotation", async () => {
     const registry = createToolRegistry();
-    const budget = { pagesDelivered: 0, calls: 0 };
+    const budget = { pagesDelivered: 18, deliveredMedia: new Map<number, string>() };
     const tool = registry.buildAgentTools(() => context(undefined, budget))
       .find((item) => item.name === "read_page_image")!;
 
     const first = await tool.execute("call-budget-1", { pages: [1, 2, 3] });
     const firstText = (first.content[0] as { text: string }).text;
-    expect(first.content.filter((block) => block.type === "image")).toHaveLength(3);
-    // 票面要求回显在结果头部：模型第一眼即见预算。
-    expect(firstText.startsWith("本问图片预算：已用 3/4 页")).toBe(true);
+    expect(first.content.filter((block) => block.type === "image")).toHaveLength(2);
+    // 额度回显走注解层（T50）：逐次变化的文本不进指纹哈希，也不直接出现在基础文本里。
+    expect(firstText).not.toContain("本问图片预算");
+    expect((first.details as { annotations?: string[] }).annotations).toEqual(["本问图片预算：已用 20/20 页。"]);
+    // 只剩 2 页：钳制交付页 1、2，页 3 不渲染、不进证据。
+    expect(firstText).toContain("额度只剩 2 页");
+    expect(firstText).toContain("第 3 页未附上");
+    const details = first.details as { evidence?: Array<{ page: number }> };
+    expect(details.evidence?.map((item) => item.page)).toEqual([1, 2]);
 
-    // 第二次请求 2 页，但预算只剩 1 页：钳制到页 2，页 3 不渲染、不进证据。
-    const second = await tool.execute("call-budget-2", { pages: [2, 3] });
+    // 额度用满后的新请求：软提示不再出图，模型可改用文字工具继续。
+    const second = await tool.execute("call-budget-2", { pages: [4] });
+    expect(second.content.filter((block) => block.type === "image")).toHaveLength(0);
     const secondText = (second.content[0] as { text: string }).text;
-    const secondImages = second.content.filter((block) => block.type === "image");
-    expect(secondImages).toHaveLength(1);
-    expect(secondText).toContain("预算只剩 1 页");
-    expect(secondText).toContain("第 3 页未附上");
-    expect(secondText).toContain("本问图片预算：已用 4/4 页");
-    const details = second.details as { evidence?: Array<{ page: number }> };
-    expect(details.evidence?.map((item) => item.page)).toEqual([2]);
+    expect(secondText).toContain("图片额度已用完（20 页）");
+    expect(secondText).toContain("不要再调用 read_page_image，用文字工具继续");
+    expect((second.details as { evidence?: unknown }).evidence).toBeUndefined();
   });
 
-  it("blocks the third read_page_image call of the same question", async () => {
+  it("reuses same-question delivered pages without re-rendering and without spending quota", async () => {
+    const toolMedia = createToolMedia(dataHome);
     const registry = createToolRegistry();
-    const budget = { pagesDelivered: 0, calls: 0 };
-    const tool = registry.buildAgentTools(() => context(undefined, budget))
-      .find((item) => item.name === "read_page_image")!;
-    await tool.execute("call-cap-a", { pages: [1] });
-    await tool.execute("call-cap-b", { pages: [2] });
+    const budget = { pagesDelivered: 0, deliveredMedia: new Map<number, string>() };
+    let renders = 0;
+    const countingContext = () => ({
+      ...context(undefined, budget),
+      savePageImage: toolMedia.savePageImage,
+      loadPageImage: toolMedia.loadPageImage,
+      renderPageImage: async (id: string, page: number, scale: number) => {
+        renders += 1;
+        return pageRenderer.renderPage(id, page, scale);
+      },
+    });
+    const tool = registry.buildAgentTools(countingContext).find((item) => item.name === "read_page_image")!;
+    const first = await tool.execute("call-reuse-1", { pages: [1] });
+    const firstBytes = (first.content.find((block) => block.type === "image") as { data: string }).data;
+    expect(renders).toBe(1);
 
-    const third = await tool.execute("call-cap-c", { pages: [3] });
-    expect(third.content.filter((block) => block.type === "image")).toHaveLength(0);
-    const text = (third.content[0] as { text: string }).text;
-    expect(text).toContain("上限");
-    expect(text).toContain("2 次");
-    expect((third.details as { evidence?: unknown }).evidence).toBeUndefined();
+    // 同问同页复用：字节恒同、不重复渲染、不扣页数额度。
+    const second = await tool.execute("call-reuse-2", { pages: [1] });
+    expect(renders).toBe(1);
+    const secondBytes = (second.content.find((block) => block.type === "image") as { data: string }).data;
+    expect(secondBytes).toBe(firstBytes);
+    expect(budget.pagesDelivered).toBe(1);
+    const secondDetails = second.details as { media?: Array<{ page: number; path: string }> };
+    expect(secondDetails.media?.[0]?.path).toBe((first.details as { media?: Array<{ page: number; path: string }> }).media?.[0]?.path);
   });
 
-  it("keeps image budgets separate across questions", async () => {
+  it("keeps image quotas separate across questions", async () => {
     const registry = createToolRegistry();
     const toolOf = (budget: PageImageBudget) => registry.buildAgentTools(() => context(undefined, budget))
       .find((item) => item.name === "read_page_image")!;
-    await toolOf({ pagesDelivered: 0, calls: 0 }).execute("call-q1", { pages: [1, 2] });
+    await toolOf({ pagesDelivered: 0, deliveredMedia: new Map() }).execute("call-q1", { pages: [1, 2] });
 
-    // 新的一问：预算与次数都重置。
-    const second = await toolOf({ pagesDelivered: 0, calls: 0 }).execute("call-q2", { pages: [3] });
-    const text = (second.content[0] as { text: string }).text;
+    // 新的一问：页数额度与复用键都随运行重建（agent-host 每问新建预算对象）。
+    const secondBudget = { pagesDelivered: 0, deliveredMedia: new Map<number, string>() };
+    const second = await toolOf(secondBudget).execute("call-q2", { pages: [3] });
     expect(second.content.filter((block) => block.type === "image")).toHaveLength(1);
-    expect(text).toContain("本问图片预算：已用 1/4 页");
+    expect((second.details as { annotations?: string[] }).annotations).toEqual(["本问图片预算：已用 1/20 页。"]);
+  });
+
+  it("continues reading truncated pages with the offset parameter", async () => {
+    const registry = createToolRegistry();
+    const tool = registry.buildAgentTools(context).find((item) => item.name === "read_pages")!;
+    const first = await tool.execute("call-offset-1", { pages: [1] });
+    const firstText = (first.content[0] as { text: string }).text;
+
+    // 续读：从 offset 3 起读同一批页码，正文是同一全文的切片并附完成注记。
+    const second = await tool.execute("call-offset-2", { pages: [1], offset: 3 });
+    const secondText = (second.content[0] as { text: string }).text;
+    expect(secondText.startsWith(firstText.slice(3))).toBe(true);
+    expect(secondText).toContain("已读完整");
+
+    // offset 超过全文长度：明确说明没有更多内容。
+    const beyond = await tool.execute("call-offset-3", { pages: [1], offset: firstText.length + 10 });
+    const beyondText = (beyond.content[0] as { text: string }).text;
+    expect(beyondText).toContain("没有更多内容");
+  });
+
+  it("returns a soft timeout result when a tool call exceeds the unified limit", async () => {
+    const registry = createToolRegistry({ toolTimeoutMs: 40 });
+    const hangingSearch = { search: () => new Promise(() => undefined) };
+    const tool = registry.buildAgentTools(() => ({ ...context(), webSearch: hangingSearch as never }))
+      .find((item) => item.name === "web_search")!;
+    const result = await tool.execute("call-timeout-1", { query: "挂死搜索" });
+    const text = (result.content[0] as { text: string }).text;
+    // 420 秒软超时文案（注入时限按比例呈现）：软错误结果，模型可继续，不抛错。
+    expect(text).toContain("工具调用超时");
+    expect(text).toContain("本次调用已中断");
+    expect(text).toContain("换参数缩小范围");
+    expect((result.details as { timeout?: boolean }).timeout).toBe(true);
   });
 
   it("returns web results with provider notes via web_search", async () => {

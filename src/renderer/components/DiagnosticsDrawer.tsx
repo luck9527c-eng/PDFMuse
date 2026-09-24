@@ -1,7 +1,7 @@
 import { Bug, X } from "lucide-react";
 import { useEffect } from "react";
 
-import type { RunDiagnostics, RunDiagnosticsRequest } from "../../shared/contracts";
+import type { AgentRunExitReason, RunDiagnostics, RunDiagnosticsRequest } from "../../shared/contracts";
 
 const ROLE_LABELS: Record<RunDiagnosticsRequest["role"], string> = {
   main: "主轮",
@@ -14,6 +14,18 @@ const STATUS_LABELS: Record<RunDiagnostics["status"], string> = {
   complete: "已完成",
   error: "出错",
   cancelled: "已停止",
+};
+
+/** 结束原因（T50 Exit Reason）：回答为何停止、为何缺一块，从运行出口可查证。 */
+const EXIT_REASON_LABELS: Record<AgentRunExitReason, string> = {
+  completed: "正常完成",
+  max_iterations_reached: "达到最大轮数后收尾",
+  loop_detected: "重复循环被制止后收尾",
+  wall_clock_timeout: "达到时间上限后收尾",
+  interrupted_by_user: "被 Reader 中断",
+  all_retries_exhausted_no_response: "收尾尝试用尽，未获回答",
+  error: "出错",
+  unknown: "未知",
 };
 
 function Collapsible({ title, meta, text }: { title: string; meta?: string; text: string }) {
@@ -90,6 +102,14 @@ export function DiagnosticsDrawer({
                 {totalTokens ? ` · tokens 共 ${totalTokens}` : ""}
               </small>
             </div>
+            {run.exitReason && (
+              <div className="diag-line">
+                <span className="diag-badge">{EXIT_REASON_LABELS[run.exitReason]}</span>
+                {run.roundsUsed !== undefined && run.roundsTotal !== undefined && (
+                  <small>运行预算 {run.roundsUsed}/{run.roundsTotal} 轮</small>
+                )}
+              </div>
+            )}
           </section>
 
           <section className="diag-section" aria-label="模型调用">
@@ -107,7 +127,10 @@ export function DiagnosticsDrawer({
                 <article className="diag-tool" key={toolCall.callId}>
                   <header>
                     <strong>{toolCall.name}</strong>
-                    <small>{toolCall.durationMs}ms{toolCall.evidence?.length ? ` · ${toolCall.evidence.length} 条证据` : ""}</small>
+                    <small>
+                      {toolCall.blocked ? "· 已达上限，未执行 " : ""}
+                      {toolCall.durationMs}ms{toolCall.evidence?.length ? ` · ${toolCall.evidence.length} 条证据` : ""}
+                    </small>
                   </header>
                   <Collapsible title="参数" text={JSON.stringify(toolCall.parameters, null, 2)} />
                   {toolCall.resultText && <Collapsible title="返回结果" text={toolCall.resultText} />}

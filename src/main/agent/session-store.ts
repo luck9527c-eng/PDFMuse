@@ -7,6 +7,7 @@ import type {
   ConversationEvidence,
   ConversationMessage,
   ReadingFocus,
+  RunExitInfo,
 } from "../../shared/contracts.js";
 
 type SessionRow = {
@@ -155,6 +156,14 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
       is_error INTEGER NOT NULL CHECK (is_error IN (0, 1)),
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS agent_runs (
+      run_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+      exit_reason TEXT NOT NULL,
+      rounds_used INTEGER NOT NULL,
+      rounds_total INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS agent_messages_session_order
       ON agent_messages(session_id, created_at, id);
     CREATE INDEX IF NOT EXISTS agent_tool_calls_run_order
@@ -209,7 +218,16 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
       id, session_id, run_id, seq, call_id, tool_name, title, arguments_json, result_text, media_path, status, is_error, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const upsertRunStatement = database.prepare(`
+    INSERT INTO agent_runs (run_id, session_id, exit_reason, rounds_used, rounds_total, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(run_id) DO UPDATE SET
+      exit_reason = excluded.exit_reason,
+      rounds_used = excluded.rounds_used,
+      rounds_total = excluded.rounds_total
+  `);
   const clearToolCallsStatement = database.prepare("DELETE FROM agent_tool_calls WHERE session_id = ?");
+  const clearRunsStatement = database.prepare("DELETE FROM agent_runs WHERE session_id = ?");
   const updateMessageStatement = database.prepare(`
     UPDATE agent_messages
     SET body = ?, status = ?, error_message = ?, evidence_json = COALESCE(?, evidence_json), updated_at = ?
@@ -305,6 +323,7 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
       if (!session) return;
       database.exec("BEGIN IMMEDIATE");
       try {
+        clearRunsStatement.run(session.id);
         clearToolCallsStatement.run(session.id);
         clearMessagesStatement.run(session.id);
         resetSessionStateStatement.run(now(), session.id);
@@ -328,6 +347,9 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
 
     /** 每书数据清理钩子：在调用方提供的连接上删除本书会话与消息（消息先删以满足外键）。 */
     deleteBookData(bookId: string, connection: DatabaseSync) {
+      connection.prepare(
+        "DELETE FROM agent_runs WHERE session_id IN (SELECT id FROM agent_sessions WHERE book_id = ?)",
+      ).run(bookId);
       connection.prepare(
         "DELETE FROM agent_tool_calls WHERE session_id IN (SELECT id FROM agent_sessions WHERE book_id = ?)",
       ).run(bookId);
@@ -383,10 +405,11 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
     },
 
     /**
-     * run 级收尾（T44）：单一事务内完成本 run 工具行的批量 INSERT 与（若有）assistant 消息的收尾 UPDATE。
-     * 工具行以入参数组顺序写入 seq（1 起），读取排序一律 `(created_at, seq)`——批量共享同一 created_at，
-     * UUID 主键不能作序。崩溃等未达终态的 run 不会调到本接口，工具行一行不留（与「失败 run 排除回放」口径一致）。
-     * 返回值表示消息是否收尾成功（所有权校验失败或未提供消息时为 false，工具行照常写入）。
+     * run 级收尾（T44/T50）：单一事务内完成本 run 工具行的批量 INSERT、（若有）assistant 消息的
+     * 收尾 UPDATE 与运行出口行（Exit Reason + 圈数）的写入。工具行以入参数组顺序写入 seq（1 起），
+     * 读取排序一律 `(created_at, seq)`。崩溃等未达终态的 run 不会调到本接口，工具行一行不留
+     * （与「失败 run 排除回放」口径一致）。返回值表示消息是否收尾成功（所有权校验失败或未提供
+     * 消息时为 false，工具行与出口行照常写入）。
      */
     finalizeRun(input: {
       sessionId: string;
@@ -399,6 +422,8 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
         errorMessage?: string;
         evidence?: ConversationEvidence[];
       };
+      /** 运行出口（T50）：结束原因与已用/总圈数；缺省不写 agent_runs 行。 */
+      exit?: RunExitInfo;
     }): boolean {
       const timestamp = now();
       database.exec("BEGIN IMMEDIATE");
@@ -439,6 +464,16 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
             timestamp,
           );
         }
+        if (input.exit) {
+          upsertRunStatement.run(
+            input.runId,
+            input.sessionId,
+            input.exit.exitReason,
+            input.exit.roundsUsed,
+            input.exit.roundsTotal,
+            timestamp,
+          );
+        }
         database.exec("COMMIT");
         return messageFinalized;
       } catch (error) {
@@ -473,6 +508,24 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
         status: row.status,
         isError: row.is_error === 1,
         ...(row.media_path ? { mediaPath: row.media_path } : {}),
+      }));
+    },
+
+    /** 运行出口读接口（T50）：每次运行的结束原因与已用/总圈数，按落库时间倒序。 */
+    listRunOutcomes(sessionId: string): Array<RunExitInfo & { runId: string }> {
+      return (database.prepare(`
+        SELECT run_id, exit_reason, rounds_used, rounds_total
+        FROM agent_runs WHERE session_id = ? ORDER BY created_at DESC
+      `).all(sessionId) as Array<{
+        run_id: string;
+        exit_reason: RunExitInfo["exitReason"];
+        rounds_used: number;
+        rounds_total: number;
+      }>).map((row) => ({
+        runId: row.run_id,
+        exitReason: row.exit_reason,
+        roundsUsed: row.rounds_used,
+        roundsTotal: row.rounds_total,
       }));
     },
 

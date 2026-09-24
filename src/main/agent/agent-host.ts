@@ -8,19 +8,27 @@ import type {
   ConversationEvidence,
   ConversationMessage,
   ReadingFocus,
+  RunExitInfo,
   StartAgentRunInput,
   StartAgentRunResult,
 } from "../../shared/contracts.js";
 import { CONVERSATION_EVIDENCE_MAX, DEFAULT_MODEL_CONTEXT_WINDOW, MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES, MAX_AGENT_IMAGE_TOTAL_BYTES } from "../../shared/contracts.js";
+import { argsKeyOf, type ToolPayload } from "./loop-detector.js";
+import {
+  createRunGuards,
+  FINAL_EXHAUSTED_MESSAGE,
+  type RunGuards,
+  type RunGuardsOptions,
+} from "./run-guards.js";
 import {
   assistantText,
+  assistantReplayMessage,
   buildQuestionContent,
   buildReplayMessages,
   buildSystemPrompt,
   computeElisionDeduction,
   estimatingImageLoader,
   historyToLlmMessages,
-  parseMediaRefs,
   resolveRetainedRunIds,
   synthesizeToolPairMessagesForSummary,
   toSessionEntries,
@@ -28,7 +36,7 @@ import {
   type ReplayImageLoader,
 } from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, parseContextWindowError, toLlmModel, type ContextWindowError, type ResolvedModelConnection } from "./model-runtime.js";
-import type { PageImageBudget } from "./tool-registry.js";
+import { MAX_WEB_SEARCH_CALLS, type PageImageBudget, type ToolExecutionOutcome } from "./tool-registry.js";
 import {
   Agent,
   compact,
@@ -92,7 +100,8 @@ export type AgentHostOptions = {
     status: string;
   }): Promise<void> | void;
   emit(event: AgentStreamEvent): void;
-  runTimeoutMs?: number;
+  /** 运行守卫注入（T50 测试）：Run Budget 总额、时限兜底与软收尾时限的生产默认值见 run-guards 常量。 */
+  guardOptions?: RunGuardsOptions;
   /** OpenClaw compaction trigger and retention can be lowered in tests or constrained deployments. */
   compactionContextWindow?: number;
   compactionSettings?: Partial<CompactionSettings>;
@@ -106,10 +115,6 @@ export type AgentHostOptions = {
 
 const QUESTION_MAX_LENGTH = 8_000;
 const PASSAGE_MAX_LENGTH = 20_000;
-/** 每轮运行的 book_search 调用上限：防止检索散射时无限续轮。 */
-const MAX_BOOK_SEARCH_CALLS = 3;
-/** 每轮运行的 web_search 调用上限：事实型问题通常一次足够。 */
-const MAX_WEB_SEARCH_CALLS = 2;
 /** 压缩冷却递增档（ADR 0010）：压缩后仍接近阈值时按会话进入冷却，防止每问白打一次摘要调用。 */
 const COMPACTION_COOLDOWN_STEPS_MS = [60_000, 300_000, 900_000];
 /** 摘要请求硬超时（T43）：挂死的摘要调用不得占住会话 lane；到点中断并按失败处理（fail-open）。 */
@@ -194,7 +199,6 @@ type ActiveRun = {
   sessionId: string;
   agent: Agent;
   cancelledByUser: boolean;
-  timedOut: boolean;
 };
 
 type AssistantFailure = { status: "error" | "cancelled"; message?: string };
@@ -203,7 +207,6 @@ type AssistantFailure = { status: "error" | "cancelled"; message?: string };
 
 export function createAgentHost(options: AgentHostOptions) {
   const store: SessionStore = options.store ?? createSessionStore(options.dataHome);
-  const runTimeoutMs = options.runTimeoutMs ?? 120_000;
   // 压缩阈值基准：显式注入优先（测试），否则每轮按模型连接的 contextWindow 现算（T36）。
   const injectedContextWindow = options.compactionContextWindow;
   const compactionSettings: CompactionSettings = {
@@ -520,6 +523,22 @@ export function createAgentHost(options: AgentHostOptions) {
     collector.pushTimeline("run-start", "运行开始");
     diagnosticsStore.record(bookId, collector.run);
 
+    // 运行守卫（T50）：Run Budget、指纹窗口、软收尾序列、总时长/静默双计时器——随问归零。
+    // onInterrupt 中断在飞模型调用（静默挂死/时限兜底）；守卫事件进诊断时间线。
+    const guards: RunGuards = createRunGuards({
+      ...options.guardOptions,
+      onInterrupt: () => {
+        const run = activeRuns.get(runId);
+        if (!run) return;
+        guards.noteGuardInterrupt();
+        run.agent.abort("guard-interrupt");
+      },
+      onGuardEvent: (detail) => {
+        collector.pushTimeline("guard", detail);
+        diagnosticsStore.record(bookId, collector.run);
+      },
+    });
+
     // Reader 问题先落盘：失败或中断时问题和阅读焦点不丢失。
     const fullHistory = store.listMessages(sessionId);
     // T44：本 run 的工具调用全保真轨迹；声明提前——压缩估算与回放装配都要消费。
@@ -558,7 +577,10 @@ export function createAgentHost(options: AgentHostOptions) {
           history,
           rowsForCompaction,
           connection,
-          wrapStreamFnWithDiagnostics(() => makeStreamFn(connection), () => "compaction", collector, options.emit, startCallClock),
+          wrapStreamFnWithDiagnostics(() => makeStreamFn(connection), () => "compaction", collector, options.emit, () => {
+            startCallClock();
+            guards.noteActivity();
+          }),
           { ...overrides, systemPrompt, questionContent, signal },
         );
       } finally {
@@ -641,118 +663,154 @@ export function createAgentHost(options: AgentHostOptions) {
       bookId: input.bookId,
       focus: focusWithContext,
       reportEvidence,
-      // 每问新建：预算随运行生命周期，下一问自动重置。
-      pageBudget: { pagesDelivered: 0, calls: 0 },
+      // 每问新建：页数额度与复用键随运行生命周期，下一问自动重置（次数上限已删除）。
+      pageBudget: { pagesDelivered: 0, deliveredMedia: new Map() },
       runId,
     }) ?? [];
 
-    // 工具包装：捕获参数、结果与耗时进运行诊断；检索类工具设每轮上限防散射打捞。
-    let bookSearchCalls = 0;
+    // 工具包装（T50）：捕获参数、结果与耗时进运行诊断；软收尾短拒、联网子额度、
+    // 单飞收敛、指纹窗口判定（Result Stub / 警告 / 循环锤）与注解合成都在这一层。
     let webSearchCalls = 0;
+    // 并行批同（工具, 参数）single-flight：收敛一次执行，兄弟按到达次序占链位（e=1 全文、e=2 stub）。
+    const singleFlight = new Map<string, Promise<AgentToolResult<unknown>>>();
     // 全保真行已在 executeRun 前段声明（toolCalls），经 recordToolCall 追加。
     const recordToolCall = (row: Omit<PersistedToolCall, "runId">) => {
       toolCalls.push({ runId, ...row });
+    };
+    // 注解后补：预警/到顶/收尾文案在下一圈模型调用顶追加到对应库行（模型所见即所存）。
+    const appendRowText = (callId: string, appended: string) => {
+      const row = toolCalls.find((item) => item.callId === callId);
+      if (row) row.resultText = row.resultText ? `${row.resultText}\n\n${appended}` : appended;
     };
     const diagnosticsTools = tools.map((tool): AgentTool => ({
       ...tool,
       async execute(toolCallId, params, signal, onUpdate) {
         collector.pushTimeline("tool-start", tool.name);
-        if (tool.name === "book_search") {
-          bookSearchCalls += 1;
-          if (bookSearchCalls > MAX_BOOK_SEARCH_CALLS) {
-            const blockedText = `book_search 已达到本轮上限（${MAX_BOOK_SEARCH_CALLS} 次）。请基于已检索到的内容回答；若信息不足，请向 Reader 明确说明。`;
-            recordToolCall({
-              callId: toolCallId,
-              toolName: tool.name,
-              title: tool.label ?? tool.name,
-              argumentsJson: JSON.stringify(params),
-              resultText: blockedText,
-              status: "rejected",
-              isError: true,
-            });
-            const toolCall: RunDiagnosticsToolCall = {
-              callId: toolCallId,
-              name: tool.name,
-              parameters: params,
-              resultText: blockedText,
-              durationMs: 0,
-            };
-            collector.recordTool(toolCall);
-            collector.pushTimeline("tool-end", `${tool.name} · 已达上限，拒绝执行`);
-            options.emit({ stream: "diagnostics", kind: "tool", runId, sessionId, toolCall });
-            return { content: [{ type: "text", text: blockedText }], details: undefined };
-          }
-        }
-        if (tool.name === "web_search") {
-          webSearchCalls += 1;
-          if (webSearchCalls > MAX_WEB_SEARCH_CALLS) {
-            const blockedText = `web_search 已达到本轮上限（${MAX_WEB_SEARCH_CALLS} 次）。请基于已获得的网络资料回答，并标注来源。`;
-            recordToolCall({
-              callId: toolCallId,
-              toolName: tool.name,
-              title: tool.label ?? tool.name,
-              argumentsJson: JSON.stringify(params),
-              resultText: blockedText,
-              status: "rejected",
-              isError: true,
-            });
-            const toolCall: RunDiagnosticsToolCall = {
-              callId: toolCallId,
-              name: tool.name,
-              parameters: params,
-              resultText: blockedText,
-              durationMs: 0,
-            };
-            collector.recordTool(toolCall);
-            collector.pushTimeline("tool-end", `${tool.name} · 已达上限，拒绝执行`);
-            options.emit({ stream: "diagnostics", kind: "tool", runId, sessionId, toolCall });
-            return { content: [{ type: "text", text: blockedText }], details: undefined };
-          }
-        }
+        guards.noteToolFlightStart();
         const startedAt = Date.now();
-        let result: AgentToolResult<unknown>;
-        try {
-          result = await tool.execute(toolCallId, params, signal, onUpdate);
-        } catch (error) {
-          // 执行出错：落 error 行后原样上抛，由 agent 循环合成错误工具结果。
+        // 短拒构造：被拒行（rejected + is_error）+ 诊断 blocked 标记 + 面向模型的单文本块结果。
+        const rejectWith = (text: string): AgentToolResult<unknown> => {
           recordToolCall({
             callId: toolCallId,
             toolName: tool.name,
             title: tool.label ?? tool.name,
             argumentsJson: JSON.stringify(params),
-            resultText: error instanceof Error ? error.message : String(error),
-            status: "error",
+            resultText: text,
+            status: "rejected",
             isError: true,
           });
-          throw error;
-        }
-        const firstText = result.content.find((block): block is Extract<typeof block, { type: "text" }> => block.type === "text");
-        const mediaPath = toolMediaPathJson(result.details);
-        const imagePages = parseMediaRefs(mediaPath).map((ref) => ref.page);
-        recordToolCall({
-          callId: toolCallId,
-          toolName: tool.name,
-          title: tool.label ?? tool.name,
-          argumentsJson: JSON.stringify(params),
-          // 图片行按 spec 1.1 落固定附图说明（live 文案含一次性预算回显，不入库）。
-          resultText: imagePages.length > 0 ? `已附上第 ${imagePages.join("、")} 页原图` : firstText?.text ?? "",
-          status: "executed",
-          isError: false,
-          ...(mediaPath ? { mediaPath } : {}),
-        });
-        const toolCall: RunDiagnosticsToolCall = {
-          callId: toolCallId,
-          name: tool.name,
-          parameters: params,
-          resultText: truncateToolResult(firstText?.text),
-          evidence: (result.details as { evidence?: ConversationEvidence[] } | undefined)?.evidence,
-          durationMs: Date.now() - startedAt,
+          const toolCall: RunDiagnosticsToolCall = {
+            callId: toolCallId,
+            name: tool.name,
+            parameters: params,
+            resultText: truncateToolResult(text),
+            durationMs: Date.now() - startedAt,
+            blocked: true,
+          };
+          collector.recordTool(toolCall);
+          collector.pushTimeline("tool-end", `${tool.name} · 已达上限，拒绝执行`);
+          options.emit({ stream: "diagnostics", kind: "tool", runId, sessionId, toolCall });
+          return { content: [{ type: "text", text }], details: undefined };
         };
-        collector.recordTool(toolCall);
-        collector.pushTimeline("tool-end", `${tool.name} · ${toolCall.durationMs}ms`);
-        options.emit({ stream: "diagnostics", kind: "tool", runId, sessionId, toolCall });
-        diagnosticsStore.record(bookId, collector.run);
-        return result;
+        try {
+          // 软收尾期间工具全关：一律短拒「已达上限」。
+          const gate = guards.checkToolCall();
+          if (gate.reject) return rejectWith(gate.reject);
+          // 联网搜索子额度：执行即扣（模块缓存命中也扣——预算层不窥探工具内部，额度兼任反打转压力）。
+          if (tool.name === "web_search") {
+            webSearchCalls += 1;
+            if (webSearchCalls > MAX_WEB_SEARCH_CALLS) {
+              return rejectWith(`联网额度已用完（${MAX_WEB_SEARCH_CALLS} 次），不要再调用 web_search，用已有材料和书内工具继续。`);
+            }
+          }
+          const flightKey = `${tool.name}:${argsKeyOf(params)}`;
+          const existingFlight = singleFlight.get(flightKey);
+          const execution = existingFlight ?? tool.execute(toolCallId, params, signal, onUpdate);
+          if (!existingFlight) singleFlight.set(flightKey, execution);
+          const cleanupFlight = () => {
+            if (singleFlight.get(flightKey) === execution) singleFlight.delete(flightKey);
+          };
+          let result: AgentToolResult<unknown>;
+          try {
+            result = await execution;
+          } catch (error) {
+            // 执行出错：落 error 行后原样上抛，由 agent 循环合成错误工具结果（单飞兄弟各自落行）。
+            cleanupFlight();
+            recordToolCall({
+              callId: toolCallId,
+              toolName: tool.name,
+              title: tool.label ?? tool.name,
+              argumentsJson: JSON.stringify(params),
+              resultText: error instanceof Error ? error.message : String(error),
+              status: "error",
+              isError: true,
+            });
+            throw error;
+          }
+          cleanupFlight();
+
+          const outcome = (result.details ?? {}) as Partial<ToolExecutionOutcome>;
+          const firstTextBlock = result.content.find((block): block is Extract<typeof block, { type: "text" }> => block.type === "text");
+          const firstText = firstTextBlock?.text ?? "";
+          const imageBlocks = result.content.filter((block): block is Extract<typeof block, { type: "image" }> => block.type === "image");
+          const mediaPath = toolMediaPathJson(result.details);
+          const recordExecuted = (text: string, isError: boolean) => {
+            recordToolCall({
+              callId: toolCallId,
+              toolName: tool.name,
+              title: tool.label ?? tool.name,
+              argumentsJson: JSON.stringify(params),
+              // 模型所见即所存：落库 = 最终合成文本（全文/stub + 注解）。
+              resultText: text,
+              status: "executed",
+              isError,
+              ...(mediaPath ? { mediaPath } : {}),
+            });
+            const toolCall: RunDiagnosticsToolCall = {
+              callId: toolCallId,
+              name: tool.name,
+              parameters: params,
+              resultText: truncateToolResult(text),
+              evidence: outcome.evidence,
+              durationMs: Date.now() - startedAt,
+            };
+            collector.recordTool(toolCall);
+            collector.pushTimeline("tool-end", `${tool.name} · ${toolCall.durationMs}ms`);
+            options.emit({ stream: "diagnostics", kind: "tool", runId, sessionId, toolCall });
+            diagnosticsStore.record(bookId, collector.run);
+          };
+          // 420 秒软超时：软错误结果原样送达（error/超时不进指纹窗口、永不替换）。
+          if (outcome.timeout) {
+            recordExecuted(firstText, true);
+            return result;
+          }
+          // 执行即重跑：结果到手后撞指纹窗口决定交付形态——「byte-identical」是校验过的事实。
+          const payload: ToolPayload = { text: firstText, images: imageBlocks.map((block) => block.data) };
+          const verdict = guards.recordExecution({ callId: toolCallId, toolName: tool.name, params, payload });
+          if (verdict.finalizeText) {
+            // 循环检测锤：只锤再次落入检出链；收尾文案作被拒调用的结果送达。
+            return rejectWith(verdict.finalizeText);
+          }
+          const annotations = outcome.annotations ?? [];
+          const deliveredText = verdict.delivery === "stub"
+            ? `${verdict.stubText ?? ""}${verdict.warningText ? `\n\n${verdict.warningText}` : ""}`
+            : `${firstText}${verdict.warningText ? `\n\n${verdict.warningText}` : ""}`;
+          // 注解（额度回显）头部合成：注解层不进指纹哈希，但模型所见与落库逐字一致。
+          const composed = annotations.length > 0 ? `${annotations.join("\n")}\n${deliveredText}` : deliveredText;
+          if (verdict.delivery === "stub") {
+            // Result Stub 换掉全部内容块（含图片）；evidence 与媒体引用按真实执行保留在 details。
+            recordExecuted(composed, false);
+            return { content: [{ type: "text", text: composed }], details: result.details };
+          }
+          recordExecuted(composed, false);
+          if (composed !== firstText && firstTextBlock) {
+            const content = result.content.map((block) => (block === firstTextBlock ? { ...block, text: composed } : block));
+            return { ...result, content };
+          }
+          return result;
+        } finally {
+          guards.noteToolFlightEnd();
+        }
       },
     }));
 
@@ -769,6 +827,17 @@ export function createAgentHost(options: AgentHostOptions) {
       options.emit,
       startCallClock,
     );
+    // 循环顶唯一扣减点（T50 Run Budget）：每圈干活之前先查后扣；到顶/触发进软收尾
+    // （最终调用不扣预算）；预警/到顶/收尾文案搭上一批最后一条工具结果送达（库行同步追加）。
+    const guardedStreamFn: StreamFn = async (model, context, streamOptions) => {
+      const decision = guards.beginModelCall(context);
+      if (!decision.proceed) {
+        // 软收尾两次最终调用用尽：拒绝继续调用模型（宿主按 finalExhausted 覆写收尾文案）。
+        throw new Error("soft-final calls exhausted");
+      }
+      if (decision.annotation) appendRowText(decision.annotation.callId, decision.annotation.appended);
+      return agentStreamFn(model, decision.context, streamOptions);
+    };
 
     let assistantMessageId: string | undefined;
     let assistantBody = "";
@@ -780,6 +849,10 @@ export function createAgentHost(options: AgentHostOptions) {
     let lastAnswerInput = 0;
     // 撞窗自愈：本轮是否发生了可识别的超窗错误及其携带的真实窗口数。
     let overWindow: ContextWindowError | undefined;
+    // 模型侧错误的用户可见文案：软收尾用尽时统一交代「未能给出最终回答」。
+    const modelFailureMessage = (raw: string | undefined, fallback: string) => (
+      guards.isFinalExhausted() ? FINAL_EXHAUSTED_MESSAGE : raw ?? fallback
+    );
 
     async function runTurn(turnMessages: Message[]) {
       const agent = new Agent({
@@ -791,19 +864,13 @@ export function createAgentHost(options: AgentHostOptions) {
           messages: turnMessages.slice(0, -1),
           tools: diagnosticsTools,
         },
-        streamFn: agentStreamFn,
+        streamFn: guardedStreamFn,
         // 会话 id 透传给 provider 适配器（会话亲和头 / prompt_cache_key），支持缓存前缀复用。
         sessionId,
       });
 
-      const run: ActiveRun = { sessionId, agent, cancelledByUser: false, timedOut: false };
+      const run: ActiveRun = { sessionId, agent, cancelledByUser: false };
       activeRuns.set(runId, run);
-
-      const timeout = setTimeout(() => {
-        if (!activeRuns.has(runId)) return;
-        run.timedOut = true;
-        agent.abort("timeout");
-      }, runTimeoutMs);
 
       agent.subscribe((event: AgentEvent) => {
         switch (event.type) {
@@ -825,6 +892,8 @@ export function createAgentHost(options: AgentHostOptions) {
             const streamEvent = event.assistantMessageEvent;
             if (streamEvent.type === "text_delta" && streamEvent.delta) {
               assistantBody += streamEvent.delta;
+              // 流式增量是静默计时器的「事件」。
+              guards.noteActivity();
               options.emit({ stream: "assistant", runId, sessionId, delta: streamEvent.delta });
             }
             break;
@@ -859,13 +928,15 @@ export function createAgentHost(options: AgentHostOptions) {
               if (event.message.stopReason === "error") {
                 overWindow = parseContextWindowError(event.message.errorMessage);
                 const normalized = normalizeModelError(event.message);
-                assistantFailure = { status: "error", message: normalized?.message ?? event.message.errorMessage };
+                assistantFailure = { status: "error", message: modelFailureMessage(normalized?.message, event.message.errorMessage ?? "") };
               } else if (event.message.stopReason === "aborted") {
-                assistantFailure = run.timedOut
-                  ? { status: "error", message: "模型响应超时，请稍后重试。" }
-                  : run.cancelledByUser
-                    ? { status: "cancelled" }
-                    : { status: "error", message: "回答已中断。" };
+                if (guards.consumeGuardInterrupt()) {
+                  // 守卫中断（静默挂死/时限兜底）：不按失败处理，软收尾驱动接管。
+                } else if (run.cancelledByUser) {
+                  assistantFailure = { status: "cancelled" };
+                } else {
+                  assistantFailure = { status: "error", message: "回答已中断。" };
+                }
               }
             }
             break;
@@ -873,6 +944,8 @@ export function createAgentHost(options: AgentHostOptions) {
             options.emit({ stream: "tool", phase: "start", runId, callId: event.toolCallId, name: event.toolName });
             break;
           case "tool_execution_update":
+            // 工具进度是静默计时器的「事件」。
+            guards.noteActivity();
             options.emit({ stream: "tool", phase: "update", runId, callId: event.toolCallId, name: event.toolName });
             break;
           case "tool_execution_end":
@@ -883,27 +956,31 @@ export function createAgentHost(options: AgentHostOptions) {
         }
       });
 
+      guards.noteModelFlightStart();
       try {
         await agent.prompt(turnMessages[turnMessages.length - 1]!);
       } catch (error) {
         const thrownMessage = error instanceof Error ? error.message : String(error);
         overWindow = parseContextWindowError(thrownMessage);
         const normalized = normalizeModelError({ stopReason: "error", errorMessage: thrownMessage });
-        assistantFailure = {
-          status: "error",
-          message: normalized?.message ?? "回答生成失败，请重试。",
-        };
+        assistantFailure = { status: "error", message: modelFailureMessage(normalized?.message, "回答生成失败，请重试。") };
       } finally {
-        clearTimeout(timeout);
+        guards.noteModelFlightEnd();
         activeRuns.delete(runId);
       }
     }
 
     options.emit({ stream: "lifecycle", phase: "start", runId, sessionId });
     await runTurn(llmMessages);
+    // 纯文本回答落地即封盘：此后任何守卫不再触发（出口按已答收）。
+    const markAnswered = () => {
+      if (!assistantFailure && assistantBody.trim()) guards.markAnswered();
+    };
+    markAnswered();
 
     // 撞窗自愈（ADR 0010）：采纳 provider 报告的真实窗口（进程级全局生效，不写回用户配置），
     // 强制压缩（绕过阈值与冷却）后当轮重答一次；再失败按普通错误收尾。
+    // 自愈落地即清空指纹窗口（T50 扩展 ADR 0010）：重拼后原文不在，重取按 e=1 全文。
     // 两轮之间不在 activeRuns 中，取消意图落在 cancelledBeforeStart，重答前后各消费一次。
     if (assistantFailure?.status === "error" && overWindow) {
       if (overWindow.reportedWindow) effectiveWindowOverride = overWindow.reportedWindow;
@@ -912,6 +989,7 @@ export function createAgentHost(options: AgentHostOptions) {
       overWindow = undefined;
       assistantBodyStart = assistantBody.length;
       const healed = await runCompaction({ force: true });
+      guards.clearWindow();
       if (!cancelledBeforeStart.delete(runId)) {
         // 自愈重答的回放可能含当前 run 的读者消息（重载后的历史），工具行用合并列表。
         const healedMessages = await historyToLlmMessages(healed.history, [...historyToolCalls, ...toolCalls], {
@@ -924,11 +1002,41 @@ export function createAgentHost(options: AgentHostOptions) {
         });
         if (healedMessages[healedMessages.length - 1]) {
           await runTurn(healedMessages);
+          markAnswered();
         }
       } else {
         assistantFailure = { status: "cancelled" };
       }
     }
+
+    // 软收尾驱动（T50）：主循环因守卫中断而提前结束时（挂死调用被中断），另起收尾回合
+    // 给模型作答机会——收尾文案以「系统提示」用户消息送达；到顶/锤子在循环内自然流转的
+    // 软收尾不会进这里。每回合至少消耗一次最终调用，宽限与 2 分钟单调用静默由守卫兜底。
+    while (!assistantFailure && guards.shouldAttemptFinalCall()) {
+      const finalizePairs = toolCalls.length > 0
+        ? await synthesizeToolPairMessagesForSummary(toolCalls)
+        : [];
+      const partialAssistant = assistantBody.trim() ? [assistantReplayMessage(assistantBody.trim())] : [];
+      const finalizeMessages: Message[] = [
+        ...llmMessages.slice(0, -1),
+        llmMessages[llmMessages.length - 1]!,
+        ...finalizePairs,
+        ...partialAssistant,
+        { role: "user", content: guards.finalizeCopyForExtraTurn(), timestamp: Date.now() },
+      ];
+      await runTurn(finalizeMessages);
+      markAnswered();
+    }
+
+    // 软收尾最终调用全部花完仍无回答（含被静默兜底中断的尝试）：按错误收尾并交代原因。
+    if (!assistantFailure && guards.finalCallsExhausted()) {
+      assistantFailure = { status: "error", message: FINAL_EXHAUSTED_MESSAGE };
+    }
+
+    // 运行出口（T50 Exit Reason）：结束原因与已用/总圈数随运行记录落库并随终态事件透出。
+    const exit = guards.finish(assistantFailure?.status === "error" || assistantFailure?.status === "cancelled"
+      ? { status: assistantFailure.status }
+      : undefined);
 
     // T44：run 级收尾——工具行与消息收尾同一事务；首请求即失败（无 assistant 消息）也落工具行，
     // 修复旧 finalizeMessage 路径下工具行无声丢失的收尾漏洞。
@@ -939,7 +1047,7 @@ export function createAgentHost(options: AgentHostOptions) {
       errorMessage: assistantFailure?.message,
       evidence: collectEvidence(),
     } : undefined;
-    const finalized = store.finalizeRun({ sessionId, runId, toolCalls, message });
+    const finalized = store.finalizeRun({ sessionId, runId, toolCalls, message, exit });
     if (finalized && message) {
       if (!assistantFailure && lastAnswerInput > 0) {
         store.saveSessionAnchor(sessionId, lastAnswerInput, connection.model, message.messageId);
@@ -962,15 +1070,18 @@ export function createAgentHost(options: AgentHostOptions) {
       });
     }
 
-    collector.finish(assistantFailure?.status === "error" ? "error" : assistantFailure?.status === "cancelled" ? "cancelled" : "complete");
+    collector.finish(
+      assistantFailure?.status === "error" ? "error" : assistantFailure?.status === "cancelled" ? "cancelled" : "complete",
+      exit,
+    );
     diagnosticsStore.record(bookId, collector.run);
 
     if (assistantFailure?.status === "error") {
-      options.emit({ stream: "lifecycle", phase: "error", runId, sessionId });
+      options.emit({ stream: "lifecycle", phase: "error", runId, sessionId, exit });
     } else if (assistantFailure?.status === "cancelled") {
-      options.emit({ stream: "lifecycle", phase: "cancelled", runId, sessionId });
+      options.emit({ stream: "lifecycle", phase: "cancelled", runId, sessionId, exit });
     } else {
-      options.emit({ stream: "lifecycle", phase: "end", runId, sessionId });
+      options.emit({ stream: "lifecycle", phase: "end", runId, sessionId, exit });
     }
   }
 

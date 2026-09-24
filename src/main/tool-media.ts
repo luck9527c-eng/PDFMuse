@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 /**
@@ -17,12 +17,22 @@ export function createToolMedia(dataHome: string) {
     return { relativePath: `${bookId}/${fileName}` };
   }
 
+  /** 同问复用（T50）按相对路径读回媒体字节；缺失返回 null（调用方回退重新渲染）。 */
+  async function loadPageImage(relativePath: string): Promise<string | null> {
+    try {
+      return (await readFile(path.join(mediaRoot, relativePath))).toString("base64");
+    } catch {
+      return null;
+    }
+  }
+
   async function deleteBookData(bookId: string): Promise<void> {
     await rm(path.join(mediaRoot, bookId), { recursive: true, force: true });
   }
 
   return {
     savePageImage,
+    loadPageImage,
     deleteBookData,
   };
 }

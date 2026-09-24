@@ -252,7 +252,8 @@ export type CurrentTurnInput = {
   elision?: ElisionProjection;
 };
 
-function assistantReplayMessage(body: string): AssistantMessage {
+/** 回放用 assistant 消息（占位元数据）；agent-host 的软收尾回合复用同一形状。 */
+export function assistantReplayMessage(body: string): AssistantMessage {
   return {
     role: "assistant",
     content: [{ type: "text", text: body }],

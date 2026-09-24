@@ -17,10 +17,10 @@ export type PdfEvidence = {
 };
 
 export type PageImageBudget = {
-  /** 本问内已成功交付的原图页数（渲染失败不扣）。 */
+  /** 本问内实际渲染交付的原图页数（渲染失败与复用命中不扣；次数上限已删除）。 */
   pagesDelivered: number;
-  /** 本问内 read_page_image 的调用次数（含被拒的尝试）。 */
-  calls: number;
+  /** 本问已交付页 → 媒体相对路径：同问同页复用既有媒体文件，字节恒同、不重复渲染。 */
+  deliveredMedia: Map<number, string>;
 };
 
 export type ToolExecutionContext = {
@@ -33,10 +33,12 @@ export type ToolExecutionContext = {
   bookIndex: BookIndex;
   /** 页面渲染模块：视觉工具经此取页面原图，检索模块不再承担渲染。 */
   renderPageImage(bookId: string, page: number, scale: number): Promise<RenderedPageImage>;
-  /** 每问图片预算（agent-host 每问新建、跨调用共享）：页数与次数钳制在工具层执行。 */
+  /** 每问图片预算（agent-host 每问新建、跨调用共享）：页数额度钳制与同问复用在工具层执行。 */
   pageBudget: PageImageBudget;
   /** 原图转存 book 媒体目录（T44）：live 与回放共享同一份文件字节，会话库只存相对路径。 */
   savePageImage(bookId: string, page: number, pngBase64: string): Promise<{ relativePath: string }>;
+  /** 同问复用时按相对路径读回媒体文件字节；缺失返回 null（回退重新渲染）。 */
+  loadPageImage?(relativePath: string): Promise<string | null>;
   webSearch?: WebSearchModule;
 };
 
@@ -48,6 +50,13 @@ export type ToolExecutionOutcome = {
   images?: Array<{ page: number; mimeType: "image/png"; data: string }>;
   /** 已转存媒体目录的原图引用（T44）；随 details 到达 agent-host 的落库层。 */
   media?: Array<{ page: number; path: string }>;
+  /**
+   * 注解行（T50 三层管线的注解层）：额度回显等逐次变化的文本。不进指纹哈希，
+   * 由 agent-host 在交付形态（全文 | Result Stub）确定后合成进最终文本——模型所见即所存。
+   */
+  annotations?: string[];
+  /** 单次工具 420 秒软超时命中：软错误结果，模型可继续；不进指纹窗口。 */
+  timeout?: boolean;
 };
 
 type RegisteredTool = {
@@ -59,9 +68,12 @@ type RegisteredTool = {
 };
 
 const QUERY_MAX_LENGTH = 200;
-const TOOL_TIMEOUT_MS = 60_000;
+/** 每问联网搜索子额度（T50 Tool Quota，与 Run Budget 独立计数）：执行即扣，缓存命中也扣。 */
+export const MAX_WEB_SEARCH_CALLS = 3;
+/** 单次工具调用统一软超时（T50）：罩住建索引与实际检索；到点返回软错误结果，模型可继续。 */
+const TOOL_EXECUTION_TIMEOUT_MS = 420_000;
 const CONTENT_MAX_LENGTH = 8_000;
-/** read_pages 的总文本上限：整页阅读需要比碎片检索更大的预算。 */
+/** read_pages 的总文本上限：整页阅读需要比碎片检索更大的预算；超出按 offset 续读。 */
 const READ_PAGES_MAX_CHARS = 20_000;
 
 const bookSearchSchema = Type.Object({
@@ -77,6 +89,7 @@ function createBookSearchTool(): RegisteredTool {
     description:
       "按关键词在整本书内定位相关页码（关键词与语义混合检索，返回带来源的原文摘录）。"
       + "标准顺序：先用本工具把主题定位到页码，再用 read_pages 读取整页原文作答。"
+      + "本工具没有每问次数限制，多主题的复杂问题可以从不同角度反复检索，把全书相关处查完。"
       + "只有检索较早对话内容时才单独使用本工具；不要用本工具替代 read_pages 的整页阅读——检索摘录只有片段，讲解和总结需要整页上下文。",
     parameters: bookSearchSchema,
     async execute(input, ctx) {
@@ -86,16 +99,7 @@ function createBookSearchTool(): RegisteredTool {
       if (!keyword) throw new Error("检索词不能只包含空白字符。");
       const hitLimit = limit ?? 6;
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), TOOL_TIMEOUT_MS);
-      const onOuterAbort = () => controller.abort();
-      ctx.signal?.addEventListener("abort", onOuterAbort);
-      try {
-        await ctx.bookIndex.ensureIndexed(ctx.bookId, () => ctx.bookIndex.loadBookByBookId(ctx.bookId), controller.signal);
-      } finally {
-        clearTimeout(timeout);
-        ctx.signal?.removeEventListener("abort", onOuterAbort);
-      }
+      await ctx.bookIndex.ensureIndexed(ctx.bookId, () => ctx.bookIndex.loadBookByBookId(ctx.bookId), ctx.signal);
 
       const outcome = await ctx.bookIndex.search(ctx.bookId, keyword, hitLimit, ctx.focus, ctx.signal, ctx.runId);
       if (outcome.status === "unavailable") {
@@ -143,6 +147,10 @@ const readPagesSchema = Type.Object({
     maxItems: 8,
     description: "要读取的 PDF 页码列表，最多 8 页；可传入不连续的页码（章节跨页或跳页时）",
   }),
+  offset: Type.Optional(Type.Integer({
+    minimum: 0,
+    description: "续读起始字符偏移：上次结果被截断时，按其末尾提示的 offset 与相同页码继续读取被省略的部分",
+  })),
 });
 
 /** read_pages：按页码列表整页读取已索引全文（含 OCR），小节讲解/总结/复习类问题的首选。 */
@@ -151,22 +159,16 @@ function createReadPagesTool(): RegisteredTool {
     name: "read_pages",
     title: "读取页面",
     description:
-      "按页码列表整页读取文字，一次可读多页、支持不连续页码。讲解、总结、复习某个小节或某几页内容时优先用本工具读取原文（章节跨页时把涉及的页码一并传入）；范围未知时先用 book_search 把主题定位到页码，再回来用本工具精读。",
+      "按页码列表整页读取文字，一次可读多页、支持不连续页码、没有每问次数限制。"
+      + "讲解、总结、复习某个小节或某几页内容时优先用本工具读取原文（章节跨页时把涉及的页码一并传入）；范围未知时先用 book_search 把主题定位到页码，再回来用本工具精读。"
+      + `单次最多返回 ${READ_PAGES_MAX_CHARS.toLocaleString("en-US")} 字符：同一批页码的全文超限时从头部截断，结果末尾会给出续读 offset，用相同页码带上该 offset 即可继续读取，直到提示已读完全文。`,
     parameters: readPagesSchema,
     async execute(input, ctx) {
-      const { pages } = input as Static<typeof readPagesSchema>;
+      const { pages, offset } = input as Static<typeof readPagesSchema>;
       const requested = [...new Set(pages)].sort((left, right) => left - right);
+      const start = Math.max(0, offset ?? 0);
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), TOOL_TIMEOUT_MS);
-      const onOuterAbort = () => controller.abort();
-      ctx.signal?.addEventListener("abort", onOuterAbort);
-      try {
-        await ctx.bookIndex.ensureIndexed(ctx.bookId, () => ctx.bookIndex.loadBookByBookId(ctx.bookId), controller.signal);
-      } finally {
-        clearTimeout(timeout);
-        ctx.signal?.removeEventListener("abort", onOuterAbort);
-      }
+      await ctx.bookIndex.ensureIndexed(ctx.bookId, () => ctx.bookIndex.loadBookByBookId(ctx.bookId), ctx.signal);
 
       const rows = ctx.bookIndex.readPages(ctx.bookId, requested[0]!, requested[requested.length - 1]!);
       const textByPage = new Map(rows.map((row) => [row.page, row.text]));
@@ -181,9 +183,18 @@ function createReadPagesTool(): RegisteredTool {
       // 版面失真声明只挂识别页：原生文本页没有公式 LaTeX/表格 HTML/插图占位，全量附注
       // 既误导模型去调 read_page_image，又是纯 token 开销。
       const ocrPages = found.filter((page) => ctx.bookIndex.isPageRecognized(ctx.bookId, page));
-      let body = found.map((page) => `【第 ${page} 页】\n${textByPage.get(page)}`).join("\n\n");
+      const fullText = found.map((page) => `【第 ${page} 页】\n${textByPage.get(page)}`).join("\n\n");
+      let body = start > 0 ? fullText.slice(start) : fullText;
       if (body.length > READ_PAGES_MAX_CHARS) {
-        body = `${body.slice(0, READ_PAGES_MAX_CHARS)}\n…（内容过长已截断，可缩小页码范围后分次读取）`;
+        const nextOffset = start + READ_PAGES_MAX_CHARS;
+        const readThrough = start > 0
+          ? `本次从 offset ${start} 读到 ${nextOffset}，尚有 ${fullText.length - nextOffset} 字符未读；如需继续，用相同页码并以 offset=${nextOffset} 续读。`
+          : `本次读取第 0–${nextOffset} 字符，尚有 ${fullText.length - nextOffset} 字符未读；如需继续，用相同页码并以 offset=${nextOffset} 续读。`;
+        body = `${body.slice(0, READ_PAGES_MAX_CHARS)}\n…（内容过长已截断。${readThrough}）`;
+      } else if (start >= fullText.length) {
+        body = `（offset ${start} 已达到或超过本批页码全文长度（${fullText.length} 字符），没有更多内容。）`;
+      } else if (start > 0) {
+        body = `${body}\n（本批页码全文已读完整，共 ${fullText.length} 字符。）`;
       }
       if (missing.length > 0) {
         body += `\n\n（注意：第 ${missing.join("、")} 页不在索引中，未读取到文本。）`;
@@ -220,7 +231,7 @@ function createWebSearchTool(): RegisteredTool {
     name: "web_search",
     title: "联网搜索",
     description:
-      "联网搜索网络资料。当书内检索不足以回答、或问题涉及书外事实（作者生平、出版背景、外部概念对照、时事）时使用。回答中引用网络内容时必须附上来源链接，并明确说明这不是本书内容。",
+      `联网搜索网络资料（每问最多 ${MAX_WEB_SEARCH_CALLS} 次，额度独立于书内工具）。当书内检索不足以回答、或问题涉及书外事实（作者生平、出版背景、外部概念对照、时事）时使用。回答中引用网络内容时必须附上来源链接，并明确说明这不是本书内容。`,
     parameters: webSearchSchema,
     async execute(input, ctx) {
       if (!ctx.webSearch) {
@@ -258,9 +269,8 @@ const readPageImageSchema = Type.Object({
   }),
 });
 
-/** 每问（run）图片预算：总页数与调用次数。成本天花板与旧「单请求 4 页」持平。 */
-export const MAX_PAGE_IMAGE_CALLS = 2;
-export const MAX_PAGE_IMAGE_PAGES = 4;
+/** 每问（run）图片页额度：次数上限已删除（T50），只留页数用量。 */
+export const MAX_PAGE_IMAGE_PAGES = 20;
 
 /** provider 图片硬限制（T44）：仅超限时降采样重渲，常规尺寸不重编码（公式清晰度优先）。 */
 const IMAGE_HARD_LIMIT_EDGE_PX = 8_000;
@@ -281,7 +291,7 @@ async function renderWithinHardLimits(ctx: ToolExecutionContext, page: number): 
   throw new Error("页面原图超出尺寸硬限制，降采样后仍超限。");
 }
 
-/** read_page_image：渲染页面原图发给模型，精确查看公式、表格与结构。每问受页预算与次数钳制。 */
+/** read_page_image：渲染页面原图发给模型，精确查看公式、表格与结构。每问受页数额度钳制（无次数上限）。 */
 function createReadPageImageTool(): RegisteredTool {
   return {
     name: "read_page_image",
@@ -289,25 +299,33 @@ function createReadPageImageTool(): RegisteredTool {
     description:
       "渲染指定页的原图并随结果直接发送，用于精确查看 OCR 文本无法保留的内容：数学公式（分数、根号、上下标）、表格结构、图表。"
       + "先用 book_search、read_pages 或上一轮回答引用的原文把范围定位到具体页码后再调用本工具；默认只查看 1 页，确需相邻页对照或跨页内容时才增加。"
-      + `本问内图片查看受预算约束（共 ${MAX_PAGE_IMAGE_PAGES} 页、最多 ${MAX_PAGE_IMAGE_CALLS} 次），超出部分会被拒绝，请把预算花在最需要的页上。`,
+      + `本问内图片查看按页数计量（共 ${MAX_PAGE_IMAGE_PAGES} 页，已看过的页重复查看不消耗额度），没有次数限制；额度用完后本工具不再出图，请把额度花在最需要的页上。`,
     parameters: readPageImageSchema,
     async execute(input, ctx) {
       const { pages } = input as Static<typeof readPageImageSchema>;
       const budget = ctx.pageBudget;
-      budget.calls += 1;
-      if (budget.calls > MAX_PAGE_IMAGE_CALLS) {
-        return {
-          displaySummary: "图片查看次数已达上限",
-          contentText: `本问内查看原图的次数已达上限（${MAX_PAGE_IMAGE_CALLS} 次）。请基于已查看的页面作答；若确有关键页未核对，请向 Reader 说明。`,
-        };
-      }
-      const remaining = Math.max(0, MAX_PAGE_IMAGE_PAGES - budget.pagesDelivered);
       const requested = [...new Set(pages)].sort((left, right) => left - right);
-      const allowed = requested.slice(0, remaining);
-      const overBudget = requested.slice(remaining);
       const images: NonNullable<ToolExecutionOutcome["images"]> = [];
       const media: NonNullable<ToolExecutionOutcome["media"]> = [];
       const failed: number[] = [];
+      const overBudget: number[] = [];
+      // 复用优先：本问已交付页读回既有媒体字节（不重复渲染、不扣额度）；文件缺失回退新渲染。
+      for (const page of requested) {
+        const existing = budget.deliveredMedia.get(page);
+        if (!existing) continue;
+        const data = (await ctx.loadPageImage?.(existing)) ?? null;
+        if (data) {
+          images.push({ page, mimeType: "image/png", data });
+          media.push({ page, path: existing });
+        } else {
+          budget.deliveredMedia.delete(page);
+        }
+      }
+      // 新页渲染：按剩余页数额度钳制，超出的页不渲染并附注。
+      const remainingAtRequest = Math.max(0, MAX_PAGE_IMAGE_PAGES - budget.pagesDelivered);
+      const freshRequested = requested.filter((page) => !budget.deliveredMedia.has(page) && !images.some((image) => image.page === page));
+      const allowed = freshRequested.slice(0, remainingAtRequest);
+      overBudget.push(...freshRequested.slice(allowed.length));
       for (const page of allowed) {
         try {
           const rendered = await renderWithinHardLimits(ctx, page);
@@ -315,19 +333,23 @@ function createReadPageImageTool(): RegisteredTool {
           const saved = await ctx.savePageImage(ctx.bookId, page, rendered.imageData);
           images.push({ page, mimeType: "image/png", data: rendered.imageData });
           media.push({ page, path: saved.relativePath });
+          budget.deliveredMedia.set(page, saved.relativePath);
+          budget.pagesDelivered += 1;
         } catch {
           // 单页渲染或落盘失败继续其余页，失败页不扣预算、在结果中说明。
           failed.push(page);
         }
       }
-      budget.pagesDelivered += images.length;
       if (images.length === 0) {
-        return failed.length > 0
-          ? { displaySummary: "原图渲染失败", contentText: "无法渲染所选页面，请检查页码是否在本书范围内。" }
-          : {
-              displaySummary: "图片预算已用完",
-              contentText: `本问图片预算已用完（${MAX_PAGE_IMAGE_PAGES} 页）。请基于已查看的页面作答。`,
-            };
+        const quotaLeft = MAX_PAGE_IMAGE_PAGES - budget.pagesDelivered;
+        return quotaLeft <= 0
+          ? {
+              displaySummary: "图片额度已用完",
+              contentText: `图片额度已用完（${MAX_PAGE_IMAGE_PAGES} 页），不要再调用 read_page_image，用文字工具继续。`,
+            }
+          : failed.length > 0
+            ? { displaySummary: "原图渲染失败", contentText: "无法渲染所选页面，请检查页码是否在本书范围内。" }
+            : { displaySummary: "没有可交付的页面", contentText: "请求的页面均未能查看，请检查页码后重试。" };
       }
       const label = images.map((image) => image.page).join("、");
       const evidence: PdfEvidence[] = images.map((image) => ({
@@ -337,23 +359,53 @@ function createReadPageImageTool(): RegisteredTool {
         trust: "trusted",
         score: 1,
       }));
-      const budgetNote = overBudget.length > 0
-        ? `（本问预算只剩 ${remaining} 页：第 ${overBudget.join("、")} 页未附上。）`
+      const quotaNote = overBudget.length > 0
+        ? `（本问图片额度只剩 ${remainingAtRequest} 页：第 ${overBudget.join("、")} 页未附上。）`
         : "";
-      const echo = `本问图片预算：已用 ${budget.pagesDelivered}/${MAX_PAGE_IMAGE_PAGES} 页。`;
       return {
-        displaySummary: `已附上第 ${label} 页原图${overBudget.length > 0 ? "（预算已满）" : ""}`,
-        contentText: `${echo}\n以下是第 ${label} 页的原图，请以此为准阅读公式与结构。${failed.length > 0 ? `（第 ${failed.join("、")} 页渲染失败未附上。）` : ""}${budgetNote}`,
+        displaySummary: `已附上第 ${label} 页原图${overBudget.length > 0 ? "（额度已满）" : ""}`,
+        contentText: `以下是第 ${label} 页的原图，请以此为准阅读公式与结构。${failed.length > 0 ? `（第 ${failed.join("、")} 页渲染失败未附上。）` : ""}${quotaNote}`,
         evidence,
         images,
         media,
+        // 额度回显走注解层（T50）：逐次变化的文本不进指纹哈希，由 agent-host 后置合成。
+        annotations: [`本问图片预算：已用 ${budget.pagesDelivered}/${MAX_PAGE_IMAGE_PAGES} 页。`],
       };
     },
   };
 }
 
-export function createToolRegistry() {
+export function createToolRegistry(options: { toolTimeoutMs?: number } = {}) {
+  const toolTimeoutMs = options.toolTimeoutMs ?? TOOL_EXECUTION_TIMEOUT_MS;
   const tools: RegisteredTool[] = [createBookSearchTool(), createReadPagesTool(), createReadPageImageTool(), createWebSearchTool()];
+
+  /**
+   * 单次工具 420 秒软超时（T50）：到点不抛错，返回软错误结果让模型换路继续；
+   * 底层执行仍在跑，其迟到结果被丢弃、迟到异常被吞掉（调用方已拿到超时结果）。
+   */
+  function withSoftTimeout(tool: RegisteredTool, promise: Promise<ToolExecutionOutcome>): Promise<ToolExecutionOutcome> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        resolve({
+          displaySummary: `${tool.title}超时`,
+          contentText: `工具调用超时（${Math.round(toolTimeoutMs / 1000)} 秒无结果），本次调用已中断。换参数缩小范围、换工具，或用手头的结果作答。`,
+          timeout: true,
+        });
+      }, toolTimeoutMs);
+      promise.then(
+        (outcome) => {
+          clearTimeout(timer);
+          resolve(outcome);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+      // 超时结果已交付后，底层执行的迟到失败不再是本调用的错误。
+      promise.catch(() => undefined);
+    });
+  }
 
   function toAgentTool(tool: RegisteredTool, contextFactory: () => ToolExecutionContext): AgentTool {
     return {
@@ -373,7 +425,7 @@ export function createToolRegistry() {
           progress: { text: `${tool.title}执行中...`, visibility: "channel", privacy: "public" },
           details: undefined,
         });
-        const outcome = await tool.execute(params, withSignal);
+        const outcome = await withSoftTimeout(tool, tool.execute(params, withSignal));
         const result: AgentToolResult<ToolExecutionOutcome> = {
           content: [
             { type: "text", text: outcome.contentText },

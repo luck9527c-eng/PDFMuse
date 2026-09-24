@@ -5,6 +5,7 @@ import type {
   RunDiagnosticsTimelineEntry,
   RunDiagnosticsToolCall,
   RunDiagnosticsUsage,
+  RunExitInfo,
 } from "../../shared/contracts.js";
 import type { Message, StreamFn } from "./openclaw-core.js";
 
@@ -77,7 +78,7 @@ export function createRunCollector(input: {
   completeRequest(callIndex: number, durationMs: number, usage?: RunDiagnosticsUsage): void;
   recordTool(toolCall: RunDiagnosticsToolCall): void;
   pushTimeline(kind: RunDiagnosticsTimelineEntry["kind"], detail: string): void;
-  finish(status: RunDiagnostics["status"]): void;
+  finish(status: RunDiagnostics["status"], exit?: RunExitInfo): void;
 } {
   const run: RunDiagnostics = {
     runId: input.runId,
@@ -121,9 +122,14 @@ export function createRunCollector(input: {
     pushTimeline(kind, detail) {
       run.timeline.push({ at: new Date().toISOString(), kind, detail });
     },
-    finish(status) {
+    finish(status, exit) {
       run.status = status;
       run.totalDurationMs = Date.now() - startedAtMs;
+      if (exit) {
+        run.exitReason = exit.exitReason;
+        run.roundsUsed = exit.roundsUsed;
+        run.roundsTotal = exit.roundsTotal;
+      }
       run.timeline.push({ at: new Date().toISOString(), kind: "run-end", detail: `${status} · 共 ${run.totalDurationMs}ms（含本地处理）` });
     },
   };

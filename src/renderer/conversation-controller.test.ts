@@ -125,4 +125,24 @@ describe("conversation controller", () => {
     expect(controller.isBusy()).toBe(false);
     unsubscribe();
   });
+
+  it("merges the run exit reason and rounds from terminal lifecycle events into diagnostics (T50)", () => {
+    const controller = createConversationController();
+    controller.dispatch({ type: "run-started", runId: RUN_ID, sessionId: SESSION_ID, question: "预算问题" });
+    controller.dispatch({
+      type: "agent-event",
+      event: {
+        stream: "lifecycle",
+        phase: "end",
+        runId: RUN_ID,
+        sessionId: SESSION_ID,
+        exit: { exitReason: "max_iterations_reached", roundsUsed: 50, roundsTotal: 50 },
+      },
+    });
+
+    const run = controller.getState().diagnostics[RUN_ID];
+    expect(run?.exitReason).toBe("max_iterations_reached");
+    expect(run?.roundsUsed).toBe(50);
+    expect(run?.roundsTotal).toBe(50);
+  });
 });

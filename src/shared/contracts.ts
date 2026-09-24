@@ -388,6 +388,8 @@ export type AgentStreamEvent =
       phase: "start" | "finishing" | "end" | "cancelled" | "error";
       runId: string;
       sessionId: string;
+      /** 终态附带运行出口（T50 Exit Reason）：结束原因与已用/总圈数随事件透出。 */
+      exit?: RunExitInfo;
     }
   | {
       stream: "assistant";
@@ -460,9 +462,29 @@ export type RunDiagnosticsToolCall = {
   resultText?: string;
   evidence?: ConversationEvidence[];
   durationMs: number;
+  /** 被闸门拦下（已达上限/循环锤）：区分工具没有结果与被拒绝执行。 */
+  blocked?: boolean;
 };
 
-/** 诊断：一次运行的完整记录；仅存在于内存环形缓冲，不落盘。 */
+/** 一问结束方式的分类（T50 Exit Reason），随运行记录落库并经共享契约透出。 */
+export type AgentRunExitReason =
+  | "completed"
+  | "max_iterations_reached"
+  | "loop_detected"
+  | "wall_clock_timeout"
+  | "interrupted_by_user"
+  | "all_retries_exhausted_no_response"
+  | "error"
+  | "unknown";
+
+export type RunExitInfo = {
+  exitReason: AgentRunExitReason;
+  /** 已用圈数（模型调用迭代，含其工具批；软收尾调用不扣）。 */
+  roundsUsed: number;
+  roundsTotal: number;
+};
+
+/** 诊断：一次运行的完整记录；仅存在于内存环形缓冲，不落盘（出口与圈数另落 agent_runs 表）。 */
 export type RunDiagnostics = {
   runId: string;
   sessionId: string;
@@ -473,11 +495,14 @@ export type RunDiagnostics = {
   toolCalls: RunDiagnosticsToolCall[];
   timeline: RunDiagnosticsTimelineEntry[];
   totalDurationMs?: number;
+  exitReason?: AgentRunExitReason;
+  roundsUsed?: number;
+  roundsTotal?: number;
 };
 
 export type RunDiagnosticsTimelineEntry = {
   at: string;
-  kind: "run-start" | "request" | "request-complete" | "tool-start" | "tool-end" | "run-end";
+  kind: "run-start" | "request" | "request-complete" | "tool-start" | "tool-end" | "guard" | "run-end";
   detail: string;
 };
 

@@ -1283,7 +1283,7 @@ describe("agent host", () => {
     library.close();
   });
 
-  it("blocks book_search beyond the per-run cap and still answers", async () => {
+  it("keeps book_search uncapped across a run and lets the budget govern (T50)", async () => {
     const library = createLibraryModule(dataHome);
     const bookIndex = createBookIndex(dataHome);
     const pageRenderer = createPageRenderer((id) => bookIndex.loadBookByBookId(id));
@@ -1298,8 +1298,8 @@ describe("agent host", () => {
       requests.push(request);
       const stream = new AssistantMessageEventStream();
       void Promise.resolve().then(() => {
-        if (requests.length <= 4) {
-          // 连续四次请求检索；第四次应被上限拦截。
+        if (requests.length <= 5) {
+          // 连续五次检索（旧上限是 3 次）；T50 起书内检索不再有每问次数上限。
           const toolCallMessage = assistantMessage("", "toolUse");
           const callId = `call-cap-${requests.length}`;
           toolCallMessage.content = [{ type: "toolCall", id: callId, name: "book_search", arguments: { query: `Chapter ${requests.length}` } }];
@@ -1309,7 +1309,7 @@ describe("agent host", () => {
           return;
         }
         stream.push({ type: "start", partial: assistantMessage("") });
-        stream.push({ type: "done", reason: "stop", message: assistantMessage("基于已有结果回答。") });
+        stream.push({ type: "done", reason: "stop", message: assistantMessage("基于全部检索结果回答。") });
       });
       return stream;
     };
@@ -1333,11 +1333,15 @@ describe("agent host", () => {
     const diagnostics = host.listDiagnostics(fixtureBookId);
     const run = diagnostics.at(-1)!;
     const searchCalls = run.toolCalls.filter((toolCall) => toolCall.name === "book_search");
-    expect(searchCalls).toHaveLength(4);
-    expect(searchCalls[3]!.resultText).toContain("上限");
-    expect(run.requests).toHaveLength(5);
+    // 五次全部真实执行，没有任何一次被「上限」拦截。
+    expect(searchCalls).toHaveLength(5);
+    for (const call of searchCalls) {
+      expect(call.blocked).toBeUndefined();
+      expect(call.resultText ?? "").not.toContain("上限");
+    }
+    expect(run.requests).toHaveLength(6);
     const conversation = host.getConversation(fixtureBookId);
-    expect(conversation.at(-1)?.body).toBe("基于已有结果回答。");
+    expect(conversation.at(-1)?.body).toBe("基于全部检索结果回答。");
 
     bookIndex.close();
     library.close();
@@ -1547,24 +1551,37 @@ describe("agent host", () => {
     ]);
   });
 
-  it("marks the assistant message as error on timeout", async () => {
+  it("soft-finalizes a hung provider via the idle guard and lands on all_retries_exhausted (T50)", async () => {
+    // 挂死的模型流：从不吐增量；守卫中断（abort 信号）时以 aborted 收尾让循环返回。
     const fake = createFakeStreamFn(({ push, request }) => {
-      push({ type: "start", partial: assistantMessage("") });
-      push({ type: "text_delta", contentIndex: 0, delta: "开头" });
       request.options?.signal?.addEventListener("abort", () => {
-        push({ type: "error", reason: "aborted", error: assistantMessage("开头", "aborted") });
+        push({ type: "error", reason: "aborted", error: assistantMessage("", "aborted") });
       });
     });
-    buildHost({ createStreamFn: () => fake.streamFn, runTimeoutMs: 60 });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      guardOptions: { idleLimitMs: 60, softFinalCallIdleMs: 80, softFinalGraceMs: 5_000 },
+    });
 
-    const result = await startRun("会超时的问题");
+    const result = await startRun("会挂死的问题");
     expect(result.ok).toBe(true);
-    await waitFor(() => lifecyclePhase(events).includes("error"), 3_000);
+    await waitFor(() => lifecyclePhase(events).includes("error"), 5_000);
+
+    // 主调用 + 两次收尾调用（各自被 2 分钟静默兜底中断），此后不再尝试。
+    expect(fake.requests).toHaveLength(3);
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    const runRows = database.prepare("SELECT exit_reason FROM agent_runs").all() as Array<{ exit_reason: string }>;
+    database.close();
+    expect(runRows).toEqual([{ exit_reason: "all_retries_exhausted_no_response" }]);
 
     const conversation = host.getConversation(BOOK_ID);
     expect(conversation[1]?.status).toBe("error");
-    expect(conversation[1]?.errorMessage).toContain("超时");
-    expect(conversation[1]?.body).toBe("开头");
+    expect(conversation[1]?.errorMessage).toContain("未能按要求给出最终回答");
+    // 收尾回合以「系统提示」用户消息送达收尾指令（挂死场景没有工具结果可搭）。
+    const finalizeRequest = JSON.stringify(fake.requests[1]!.context.messages);
+    expect(finalizeRequest).toContain("系统提示");
+    expect(finalizeRequest).toContain("视为停滞");
+    expect(finalizeRequest).toContain("不要再调用任何工具");
   });
 
   it("normalizes authentication failures from the model stream", async () => {
@@ -1777,16 +1794,16 @@ describe("agent host", () => {
     library.close();
   });
 
-  it("persists the full tool-call trail of a run at finalize (T44)", async () => {
-    // 自定义同名 book_search 工具：走 wrapper 的上限计数与落库路径，结果可控。
-    // 单次运行内连续 4 轮工具调用：前三次执行，第四次被拒，随后模型基于拒绝说明收尾。
+  it("persists the full tool-call trail and run exit at finalize (T44/T50)", async () => {
+    // 自定义同名 book_search 工具：走 wrapper 的落库路径，结果可控。
+    // 单次运行内连续 4 轮工具调用：全部真实执行（书内检索无每问上限），随后模型收尾。
     let turns = 0;
     const fake = createFakeStreamFn(({ push }) => {
       turns += 1;
       if (turns > 4) {
         push({ type: "start", partial: assistantMessage("") });
-        push({ type: "text_delta", contentIndex: 0, delta: "上限回答" });
-        push({ type: "done", reason: "stop", message: assistantMessage("上限回答") });
+        push({ type: "text_delta", contentIndex: 0, delta: "工具轨迹回答" });
+        push({ type: "done", reason: "stop", message: assistantMessage("工具轨迹回答") });
         return;
       }
       const toolCallMessage = assistantMessage("", "toolUse");
@@ -1817,23 +1834,27 @@ describe("agent host", () => {
       }],
     });
 
-    await startRun("工具轨迹问题");
+    const result = await startRun("工具轨迹问题");
+    expect(result.ok).toBe(true);
     await waitFor(() => lifecyclePhase(events).includes("end"));
 
     const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
     const rows = database.prepare(
       "SELECT run_id, seq, call_id, tool_name, title, arguments_json, result_text, status, is_error FROM agent_tool_calls ORDER BY created_at, seq",
     ).all() as Array<Record<string, unknown>>;
+    const runRows = database.prepare(
+      "SELECT run_id, exit_reason, rounds_used, rounds_total FROM agent_runs",
+    ).all() as Array<Record<string, unknown>>;
     database.close();
 
+    // 四次全部执行（次数上限已删除）；正常收尾的运行出口行 completed + 圈数 5/50。
     expect(rows).toHaveLength(4);
     expect(rows.map((row) => [row.status, row.is_error])).toEqual([
       ["executed", 0],
       ["executed", 0],
       ["executed", 0],
-      ["rejected", 1],
+      ["executed", 0],
     ]);
-    expect(rows[3]?.result_text).toContain("已达到本轮上限");
     expect(rows[0]).toMatchObject({
       call_id: "call-1",
       tool_name: "book_search",
@@ -1841,6 +1862,9 @@ describe("agent host", () => {
       arguments_json: '{"query":"测试 1"}',
       result_text: "检索结果 1",
     });
+    expect(runRows).toEqual([
+      { run_id: result.ok ? result.runId : "", exit_reason: "completed", rounds_used: 5, rounds_total: 50 },
+    ]);
   });
 
   it("persists an error row when a tool throws and still answers (T44)", async () => {
@@ -1895,5 +1919,577 @@ describe("agent host", () => {
       is_error: 1,
     }]);
     expect(host.getConversation(BOOK_ID).at(-1)?.status).toBe("complete");
+  });
+
+  /** 构造「每圈都发起一次工具调用」的假流；工具圈数用尽后改为纯文本收尾。 */
+  function toolLoopScript(options: {
+    toolName: string;
+    argumentsFor: (call: number) => Record<string, unknown>;
+    toolCircles: number;
+    /** 收尾调用（软收尾期）仍尝试工具调用的次数；缺省收尾即答。 */
+    finalToolTries?: number;
+    answer: string;
+  }) {
+    let calls = 0;
+    return createFakeStreamFn(({ push }) => {
+      calls += 1;
+      const finalTries = options.finalToolTries ?? 0;
+      if (calls <= options.toolCircles + finalTries) {
+        const callId = `call-loop-${calls}`;
+        const arguments_ = options.argumentsFor(calls);
+        const toolCallMessage = assistantMessage("", "toolUse");
+        toolCallMessage.content = [{ type: "toolCall", id: callId, name: options.toolName, arguments: arguments_ }];
+        push({ type: "start", partial: toolCallMessage });
+        push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: callId, name: options.toolName, arguments: arguments_ }, partial: toolCallMessage });
+        push({ type: "done", reason: "toolUse", message: toolCallMessage });
+        return;
+      }
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "text_delta", contentIndex: 0, delta: options.answer });
+      push({ type: "done", reason: "stop", message: assistantMessage(options.answer) });
+    });
+  }
+
+  function readRunRows() {
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"), { readOnly: true });
+    const toolRows = database.prepare(
+      "SELECT call_id, result_text, status, is_error FROM agent_tool_calls ORDER BY created_at, seq",
+    ).all() as Array<Record<string, unknown>>;
+    const runRows = database.prepare(
+      "SELECT exit_reason, rounds_used, rounds_total FROM agent_runs",
+    ).all() as Array<Record<string, unknown>>;
+    database.close();
+    return { toolRows, runRows };
+  }
+
+  it("deducts one circle per model call and soft-finalizes at the budget ceiling (T50)", async () => {
+    // 注入预算 4 圈：4 圈工具续轮后到顶 → 收尾文案搭第 4 批结果送达 → 最终调用不再扣预算；
+    // 收尾第 1 次仍尝试工具 → 短拒「已达上限」；第 2 次强化文案后给出收尾回答。
+    const fake = toolLoopScript({
+      toolName: "probe",
+      argumentsFor: (call) => ({ n: call }),
+      toolCircles: 4,
+      finalToolTries: 1,
+      answer: "预算到顶后的收尾回答",
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      guardOptions: { budgetTotal: 4 },
+      buildTools: () => [{
+        name: "probe",
+        label: "探测",
+        description: "",
+        parameters: Type.Object({ n: Type.Integer() }),
+        async execute(toolCallId: string, params: unknown) {
+          void toolCallId;
+          const n = (params as { n: number }).n;
+          return { content: [{ type: "text" as const, text: `探测结果 ${n}` }], details: undefined };
+        },
+      }],
+    });
+
+    const result = await startRun("预算到顶问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    // 模型总调用 = 4 圈 + 2 次收尾；第 7 次永不被发起（不变量：扣减只发生在循环顶）。
+    expect(fake.requests).toHaveLength(6);
+    const { toolRows, runRows } = readRunRows();
+    expect(runRows).toEqual([{ exit_reason: "max_iterations_reached", rounds_used: 4, rounds_total: 4 }]);
+    // 4 次执行 + 1 次软收尾短拒。
+    expect(toolRows.map((row) => row.status)).toEqual(["executed", "executed", "executed", "executed", "rejected"]);
+    expect(String(toolRows[4]?.result_text)).toContain("已达上限");
+    // 到顶文案搭第 4 批工具结果送达（第 5 次调用上下文），第 2 次收尾强化文案随短拒行（第 6 次）。
+    const fifth = JSON.stringify(fake.requests[4]!.context.messages);
+    expect(fifth).toContain("你已经达到最大轮数了");
+    const sixth = JSON.stringify(fake.requests[5]!.context.messages);
+    expect(sixth).toContain("这是第 2 次要求收尾");
+    // 模型所见即所存：注解逐字并入对应工具行。
+    expect(String(toolRows[3]?.result_text)).toContain("你已经达到最大轮数了");
+    expect(String(toolRows[4]?.result_text)).toContain("这是第 2 次要求收尾");
+    expect(host.getConversation(BOOK_ID).at(-1)?.body).toBe("预算到顶后的收尾回答");
+  });
+
+  it("lands on all_retries_exhausted when both final calls refuse to answer (T50)", async () => {
+    const fake = toolLoopScript({
+      toolName: "probe",
+      argumentsFor: (call) => ({ n: call }),
+      toolCircles: 3,
+      finalToolTries: 2,
+      answer: "不该出现的回答",
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      guardOptions: { budgetTotal: 3 },
+      buildTools: () => [{
+        name: "probe",
+        label: "探测",
+        description: "",
+        parameters: Type.Object({ n: Type.Integer() }),
+        async execute(toolCallId: string, params: unknown) {
+          void toolCallId;
+          const n = (params as { n: number }).n;
+          return { content: [{ type: "text" as const, text: `探测结果 ${n}` }], details: undefined };
+        },
+      }],
+    });
+
+    await startRun("拒绝收尾的问题");
+    await waitFor(() => lifecyclePhase(events).includes("error"), 8_000);
+
+    // 3 圈 + 2 次收尾，此后拒绝继续调用模型。
+    expect(fake.requests).toHaveLength(5);
+    const { runRows } = readRunRows();
+    expect(runRows).toEqual([{ exit_reason: "all_retries_exhausted_no_response", rounds_used: 3, rounds_total: 3 }]);
+    const conversation = host.getConversation(BOOK_ID);
+    expect(conversation.at(-1)?.status).toBe("error");
+    expect(conversation.at(-1)?.errorMessage).toContain("未能按要求给出最终回答");
+  });
+
+  it("appends the 90% budget warning to the batch's last tool result, stored verbatim (T50)", async () => {
+    // 47 圈工具续轮（预警从 45/50 起）；第 46 次调用的上下文携带 45/50 预警。
+    const fake = toolLoopScript({
+      toolName: "probe",
+      argumentsFor: (call) => ({ n: call }),
+      toolCircles: 46,
+      answer: "预警之后的回答",
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      buildTools: () => [{
+        name: "probe",
+        label: "探测",
+        description: "",
+        parameters: Type.Object({ n: Type.Integer() }),
+        async execute(toolCallId: string, params: unknown) {
+          void toolCallId;
+          const n = (params as { n: number }).n;
+          return { content: [{ type: "text" as const, text: `探测结果 ${n}` }], details: undefined };
+        },
+      }],
+    });
+
+    const result = await startRun("预警问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 20_000);
+
+    // 第 46 次请求（45 圈扣满预警阈值）搭上 45/50 预警（计数保鲜）。
+    const warningRequest = JSON.stringify(fake.requests[44]!.context.messages);
+    expect(warningRequest).toContain("你已使用 45/50 轮");
+    expect(warningRequest).toContain("不要因为这个提示就停下来");
+    // 模型所见即所存：预警逐字并入该请求末尾工具结果对应的工具行（call 44）。
+    const { toolRows, runRows } = readRunRows();
+    const warnedRow = String(toolRows[43]?.result_text);
+    expect(warnedRow).toContain("探测结果 44");
+    expect(warnedRow).toContain("你已使用 45/50 轮");
+    expect(runRows).toEqual([{ exit_reason: "completed", rounds_used: 47, rounds_total: 50 }]);
+  });
+
+  it("hammers param-loop repeats into loop_detected with stubs and warnings before the strike (T50)", async () => {
+    // 同参同果（载荷 ≥512）：e=1 全文 → e=2 静默 stub → e=3 stub+警告 → e=4 强制收尾。
+    const sameResult = "一样的长结果。".repeat(120);
+    const fake = toolLoopScript({
+      toolName: "probe",
+      argumentsFor: () => ({ n: 1 }),
+      toolCircles: 4,
+      answer: "被锤之后的收尾回答",
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      buildTools: () => [{
+        name: "probe",
+        label: "探测",
+        description: "",
+        parameters: Type.Object({ n: Type.Integer() }),
+        async execute() {
+          return { content: [{ type: "text" as const, text: sameResult }], details: undefined };
+        },
+      }],
+    });
+
+    const result = await startRun("原地打转问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    // 第 3 次请求携带第 2 次调用的 stub（指针指向 e=1 全文那次）；e=1 原文本身合法在场。
+    const third = JSON.stringify(fake.requests[2]!.context.messages);
+    expect(third).toContain("byte-identical");
+    expect(third).toContain("tool_call_id call-loop-1");
+    // 第 4 次请求：第 3 次调用的 stub + 警告（文案 4）。
+    const fourth = JSON.stringify(fake.requests[3]!.context.messages);
+    expect(fourth).toContain("第 3 次一模一样的调用");
+    // 第 4 次执行被锤：被拒行携带文案 5；第 5 次（收尾）模型作答。
+    const { toolRows, runRows } = readRunRows();
+    expect(toolRows.map((row) => row.status)).toEqual(["executed", "executed", "executed", "rejected"]);
+    expect(String(toolRows[1]?.result_text)).toContain("byte-identical");
+    expect(String(toolRows[2]?.result_text)).toContain("第 3 次一模一样的调用");
+    expect(String(toolRows[3]?.result_text)).toContain("第 4 次重复同一调用");
+    expect(runRows).toEqual([{ exit_reason: "loop_detected", rounds_used: 4, rounds_total: 50 }]);
+    // 诊断里被拒调用带「已达上限」标记。
+    const diagnostics = host.listDiagnostics(BOOK_ID);
+    expect(diagnostics.at(-1)?.toolCalls.at(-1)?.blocked).toBe(true);
+    expect(host.getConversation(BOOK_ID).at(-1)?.body).toBe("被锤之后的收尾回答");
+  });
+
+  it("force-finalizes result-loop repeats at e=3 when different args return identical big results (T50)", async () => {
+    const sameResult = "工具给不出新信息。".repeat(120);
+    const fake = toolLoopScript({
+      toolName: "probe",
+      argumentsFor: (call) => ({ n: call }),
+      toolCircles: 3,
+      answer: "空转之后的收尾回答",
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      buildTools: () => [{
+        name: "probe",
+        label: "探测",
+        description: "",
+        parameters: Type.Object({ n: Type.Integer() }),
+        async execute() {
+          return { content: [{ type: "text" as const, text: sameResult }], details: undefined };
+        },
+      }],
+    });
+
+    const result = await startRun("空转刷量问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    // 第 3 次请求携带第 2 次调用的结果循环 stub（异参同果指针）。
+    const third = JSON.stringify(fake.requests[2]!.context.messages);
+    expect(third).toContain("even with different arguments");
+    expect(third).toContain("The tool has no more to give");
+    const { toolRows, runRows } = readRunRows();
+    expect(String(toolRows[2]?.result_text)).toContain("拿不到新信息");
+    expect(toolRows[2]?.status).toBe("rejected");
+    expect(runRows).toEqual([{ exit_reason: "loop_detected", rounds_used: 3, rounds_total: 50 }]);
+  });
+
+  it("does not nag a confirming repeat: same args with fresh results stay full text (T50)", async () => {
+    // 同参异果 → 拿到新信息，开新链全文交付；确认性重复不被念叨。
+    const fake = toolLoopScript({
+      toolName: "probe",
+      argumentsFor: () => ({ n: 1 }),
+      toolCircles: 3,
+      answer: "确认重复之后的回答",
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      buildTools: () => [{
+        name: "probe",
+        label: "探测",
+        description: "",
+        parameters: Type.Object({ n: Type.Integer() }),
+        async execute() {
+          return { content: [{ type: "text" as const, text: `第 ${fake.requests.length} 次的新结果 ${"内容".repeat(300)}` }], details: undefined };
+        },
+      }],
+    });
+
+    const result = await startRun("确认性问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    const { toolRows, runRows } = readRunRows();
+    expect(toolRows.map((row) => row.status)).toEqual(["executed", "executed", "executed"]);
+    for (const row of toolRows) {
+      expect(String(row.result_text)).not.toContain("byte-identical");
+    }
+    expect(runRows).toEqual([{ exit_reason: "completed", rounds_used: 4, rounds_total: 50 }]);
+  });
+
+  it("soft-blocks web_search beyond three calls per question while book tools keep working (T50)", async () => {
+    // 三次 web_search 用满额度后，第 4 次被软拒；书内工具照常可用。
+    const script: Array<{ tool: string; query: string }> = [
+      { tool: "web_search", query: "甲" },
+      { tool: "web_search", query: "乙" },
+      { tool: "web_search", query: "丙" },
+      { tool: "web_search", query: "丁" },
+      { tool: "book_probe", query: "书内" },
+    ];
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      if (calls <= script.length) {
+        const step = script[calls - 1]!;
+        const callId = `call-web-${calls}`;
+        const toolCallMessage = assistantMessage("", "toolUse");
+        toolCallMessage.content = [{ type: "toolCall", id: callId, name: step.tool, arguments: { query: step.query } }];
+        push({ type: "start", partial: toolCallMessage });
+        push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: callId, name: step.tool, arguments: { query: step.query } }, partial: toolCallMessage });
+        push({ type: "done", reason: "toolUse", message: toolCallMessage });
+        return;
+      }
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("额度混合回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      buildTools: () => [
+        {
+          name: "web_search",
+          label: "联网搜索",
+          description: "",
+          parameters: Type.Object({ query: Type.String() }),
+          async execute(toolCallId: string, params: unknown) {
+            void toolCallId;
+            const query = (params as { query: string }).query;
+            return { content: [{ type: "text" as const, text: `网络结果 ${query} ${"资料".repeat(300)}` }], details: undefined };
+          },
+        },
+        {
+          name: "book_probe",
+          label: "书内探测",
+          description: "",
+          parameters: Type.Object({ query: Type.String() }),
+          async execute(toolCallId: string, params: unknown) {
+            void toolCallId;
+            const query = (params as { query: string }).query;
+            return { content: [{ type: "text" as const, text: `书内结果 ${query} ${"内容".repeat(300)}` }], details: undefined };
+          },
+        },
+      ],
+    });
+
+    const result = await startRun("联网额度问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    const { toolRows } = readRunRows();
+    expect(toolRows.map((row) => row.status)).toEqual(["executed", "executed", "executed", "rejected", "executed"]);
+    expect(String(toolRows[3]?.result_text)).toContain("联网额度已用完（3 次）");
+    expect(String(toolRows[3]?.result_text)).toContain("不要再调用 web_search");
+    // 联网额度用满后书内工具照常可用（不同工具，不落入检出链）。
+    expect(String(toolRows[4]?.result_text)).toContain("书内结果 书内");
+    // 诊断里被拒的联网调用带「已达上限」标记。
+    const diagnostics = host.listDiagnostics(BOOK_ID);
+    const blocked = diagnostics.at(-1)?.toolCalls.find((toolCall) => toolCall.blocked);
+    expect(blocked?.resultText).toContain("联网额度已用完");
+  });
+
+  it("clears the fingerprint window on over-window self-heal so repeats re-fetch in full (T50)", async () => {
+    const bigResult = `可复取的长结果 ${"原文".repeat(300)}`;
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      if (calls === 1) {
+        const callId = "call-heal-1";
+        const toolCallMessage = assistantMessage("", "toolUse");
+        toolCallMessage.content = [{ type: "toolCall", id: callId, name: "probe", arguments: { n: 1 } }];
+        push({ type: "start", partial: toolCallMessage });
+        push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: callId, name: "probe", arguments: { n: 1 } }, partial: toolCallMessage });
+        push({ type: "done", reason: "toolUse", message: toolCallMessage });
+        return;
+      }
+      if (calls === 2) {
+        // 第二圈报超窗错误：触发撞窗自愈（强制压缩 + 清窗 + 重答一次）。
+        push({ type: "start", partial: assistantMessage("") });
+        push({ type: "error", reason: "error", error: assistantMessage("", "error", "maximum context length is 2048 tokens, however you requested 4096") });
+        return;
+      }
+      if (calls === 3) {
+        // 自愈重答轮：同参再次调用（若窗口未清空，这里会得到 e=2 的 stub）。
+        const callId = "call-heal-2";
+        const toolCallMessage = assistantMessage("", "toolUse");
+        toolCallMessage.content = [{ type: "toolCall", id: callId, name: "probe", arguments: { n: 1 } }];
+        push({ type: "start", partial: toolCallMessage });
+        push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: callId, name: "probe", arguments: { n: 1 } }, partial: toolCallMessage });
+        push({ type: "done", reason: "toolUse", message: toolCallMessage });
+        return;
+      }
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "text_delta", contentIndex: 0, delta: "自愈后的回答" });
+      push({ type: "done", reason: "stop", message: assistantMessage("自愈后的回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      buildTools: () => [{
+        name: "probe",
+        label: "探测",
+        description: "",
+        parameters: Type.Object({ n: Type.Integer() }),
+        async execute() {
+          return { content: [{ type: "text" as const, text: bigResult }], details: undefined };
+        },
+      }],
+    });
+
+    const result = await startRun("自愈清窗问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    // 自愈落地清窗：重答轮的同参同果调用按 e=1 全文重取（不被 stub 替换）。
+    const { toolRows } = readRunRows();
+    expect(toolRows).toHaveLength(2);
+    expect(String(toolRows[1]?.result_text)).toContain(bigResult.slice(0, 10));
+    expect(String(toolRows[1]?.result_text)).not.toContain("byte-identical");
+  });
+
+  it("soft-finalizes through the wall-clock guard and exits wall_clock_timeout (T50)", async () => {
+    // 总时长兜底在工具在飞时触发（工具豁免静默、不豁免总时长）：下一圈顶收尾。
+    const requests: CapturedRequest[] = [];
+    let calls = 0;
+    const streamFn = async (model: Model, context: Context, options?: SimpleStreamOptions) => {
+      const request: CapturedRequest = { model, context, options };
+      requests.push(request);
+      calls += 1;
+      const stream = new AssistantMessageEventStream();
+      void Promise.resolve().then(() => {
+        if (calls === 1) {
+          const callId = "call-wall-1";
+          const toolCallMessage = assistantMessage("", "toolUse");
+          toolCallMessage.content = [{ type: "toolCall", id: callId, name: "slow_probe", arguments: {} }];
+          stream.push({ type: "start", partial: toolCallMessage });
+          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: callId, name: "slow_probe", arguments: {} }, partial: toolCallMessage });
+          stream.push({ type: "done", reason: "toolUse", message: toolCallMessage });
+          return;
+        }
+        stream.push({ type: "start", partial: assistantMessage("") });
+        stream.push({ type: "done", reason: "stop", message: assistantMessage("时限收尾回答") });
+      });
+      return stream;
+    };
+    buildHost({
+      createStreamFn: () => streamFn,
+      guardOptions: { wallClockLimitMs: 80 },
+      buildTools: () => [{
+        name: "slow_probe",
+        label: "慢探测",
+        description: "",
+        parameters: Type.Object({}),
+        // 工具飞行 150ms：总时长（80ms）在飞行中触发，静默计时豁免。
+        async execute() {
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          return { content: [{ type: "text" as const, text: `慢结果 ${"内容".repeat(300)}` }], details: undefined };
+        },
+      }],
+    });
+
+    const result = await startRun("时限兜底问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    expect(requests).toHaveLength(2);
+    // 时限文案随第一批工具结果送达第 2 次（收尾）调用。
+    const second = JSON.stringify(requests[1]!.context.messages);
+    expect(second).toContain("已达时间上限 20 分钟");
+    expect(second).toContain("不要再调用任何工具");
+    const { toolRows, runRows } = readRunRows();
+    expect(String(toolRows[0]?.result_text)).toContain("已达时间上限 20 分钟");
+    expect(runRows).toEqual([{ exit_reason: "wall_clock_timeout", rounds_used: 1, rounds_total: 50 }]);
+    expect(host.getConversation(BOOK_ID).at(-1)?.body).toBe("时限收尾回答");
+  });
+
+  it("does not trip the idle guard while tools are in flight (T50)", async () => {
+    // 工具飞行 150ms > 静默阈值 60ms：豁免静默计时，运行照常完成。
+    const fake = createFakeStreamFn(({ push }) => {
+      if (fake.requests.length === 1) {
+        const callId = "call-idle-1";
+        const toolCallMessage = assistantMessage("", "toolUse");
+        toolCallMessage.content = [{ type: "toolCall", id: callId, name: "slow_probe", arguments: {} }];
+        push({ type: "start", partial: toolCallMessage });
+        push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: callId, name: "slow_probe", arguments: {} }, partial: toolCallMessage });
+        push({ type: "done", reason: "toolUse", message: toolCallMessage });
+        return;
+      }
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage("静默豁免回答") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      guardOptions: { idleLimitMs: 60 },
+      buildTools: () => [{
+        name: "slow_probe",
+        label: "慢探测",
+        description: "",
+        parameters: Type.Object({}),
+        async execute() {
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          return { content: [{ type: "text" as const, text: `慢结果 ${"内容".repeat(300)}` }], details: undefined };
+        },
+      }],
+    });
+
+    const result = await startRun("静默豁免问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    expect(fake.requests).toHaveLength(2);
+    const { runRows } = readRunRows();
+    expect(runRows).toEqual([{ exit_reason: "completed", rounds_used: 2, rounds_total: 50 }]);
+    expect(host.getConversation(BOOK_ID).at(-1)?.body).toBe("静默豁免回答");
+  });
+
+  it("resets budget, quotas and timers for each new question (T50)", async () => {
+    // 第一问耗尽 2 圈预算并被收尾拦截；第二问满血复活。
+    const answers = ["第一问收尾", "第二问回答"];
+    let run = 0;
+    let calls = 0;
+    const fake = createFakeStreamFn(({ push }) => {
+      calls += 1;
+      if (run === 0 && calls <= 3) {
+        const callId = `call-r1-${calls}`;
+        const toolCallMessage = assistantMessage("", "toolUse");
+        toolCallMessage.content = [{ type: "toolCall", id: callId, name: "probe", arguments: { n: calls } }];
+        push({ type: "start", partial: toolCallMessage });
+        push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: callId, name: "probe", arguments: { n: calls } }, partial: toolCallMessage });
+        push({ type: "done", reason: "toolUse", message: toolCallMessage });
+        return;
+      }
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "done", reason: "stop", message: assistantMessage(answers[run] ?? "") });
+    });
+    buildHost({
+      createStreamFn: () => fake.streamFn,
+      guardOptions: { budgetTotal: 2 },
+      buildTools: () => [{
+        name: "probe",
+        label: "探测",
+        description: "",
+        parameters: Type.Object({ n: Type.Integer() }),
+        async execute(toolCallId: string, params: unknown) {
+          void toolCallId;
+          const n = (params as { n: number }).n;
+          return { content: [{ type: "text" as const, text: `结果 ${n} ${"内容".repeat(300)}` }], details: undefined };
+        },
+      }],
+    });
+
+    const first = await startRun("第一问");
+    expect(first.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+    run = 1;
+    calls = 0;
+    events = [];
+    const second = await startRun("第二问");
+    expect(second.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    const { runRows } = readRunRows();
+    expect(runRows).toEqual([
+      { exit_reason: "max_iterations_reached", rounds_used: 2, rounds_total: 2 },
+      { exit_reason: "completed", rounds_used: 1, rounds_total: 2 },
+    ]);
+  });
+
+  it("records interrupted_by_user when the reader cancels mid-run (T50)", async () => {
+    const fake = createFakeStreamFn(({ push, request }) => {
+      push({ type: "start", partial: assistantMessage("") });
+      push({ type: "text_delta", contentIndex: 0, delta: "回答中" });
+      request.options?.signal?.addEventListener("abort", () => {
+        push({ type: "error", reason: "aborted", error: assistantMessage("回答中", "aborted") });
+      });
+    });
+    buildHost({ createStreamFn: () => fake.streamFn });
+
+    const result = await startRun("会被打断的问题");
+    expect(result.ok).toBe(true);
+    await waitFor(() => events.some((event) => event.stream === "assistant"));
+    host.cancel(result.ok ? result.runId : "");
+    await waitFor(() => lifecyclePhase(events).includes("cancelled"));
+
+    const { runRows } = readRunRows();
+    expect(runRows).toEqual([{ exit_reason: "interrupted_by_user", rounds_used: 1, rounds_total: 50 }]);
   });
 });

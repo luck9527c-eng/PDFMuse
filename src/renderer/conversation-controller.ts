@@ -71,6 +71,20 @@ function mergeDiagnosticsEvent(state: ConversationControllerState, event: Extrac
   return next;
 }
 
+/** 终态事件携带的运行出口（T50 Exit Reason）合入诊断记录：结束原因与已用/总圈数。 */
+function mergeExitInfo(state: ConversationControllerState, runId: string, exit: NonNullable<Extract<AgentStreamEvent, { stream: "lifecycle" }>["exit"]>): Record<string, RunDiagnostics> {
+  const current = { ...(state.diagnostics[runId] ?? emptyDiagnostics(runId)) };
+  return {
+    ...state.diagnostics,
+    [runId]: {
+      ...current,
+      exitReason: exit.exitReason,
+      roundsUsed: exit.roundsUsed,
+      roundsTotal: exit.roundsTotal,
+    },
+  };
+}
+
 export type ConversationAction =
   | { type: "agent-event"; event: AgentStreamEvent }
   | { type: "run-started"; runId: string; sessionId: string; question: string; passage?: { page: number; text: string; rects: unknown } }
@@ -105,6 +119,11 @@ export function createConversationController() {
     if (event.stream === "diagnostics") {
       commit({ diagnostics: mergeDiagnosticsEvent(state, event) });
       return undefined;
+    }
+    // 终态出口信息（T50）：无论流式态是否匹配都合入诊断记录（抽屉展示结束原因与圈数）。
+    if (event.stream === "lifecycle" && event.exit
+      && (event.phase === "end" || event.phase === "error" || event.phase === "cancelled")) {
+      commit({ diagnostics: mergeExitInfo(state, event.runId, event.exit) });
     }
     if (state.streaming?.runId !== event.runId) return undefined;
     if (event.stream === "assistant") {
