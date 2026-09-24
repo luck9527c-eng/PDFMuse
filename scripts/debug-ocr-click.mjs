@@ -163,12 +163,15 @@ try {
     };
   })())`, );
   const facts = JSON.parse(after);
-  console.log(`[loop] 点击后：命中块序号=${facts.afterIdx}（瞄准块序号=${facts.aimIdx}） 选区长度=${facts.selectionLength}（瞄准块全文长度=${facts.aimTextLength}） 选区所属块=${facts.selectionSpanText?.slice(0, 24) ?? "无"}`);
+  const highlightCount = await evaluate(wsUrl, `document.querySelectorAll('[data-pdfmuse-block-highlight]').length`);
+  facts.highlightCount = highlightCount;
+  console.log(`[loop] 点击后：命中块序号=${facts.afterIdx}（瞄准块序号=${facts.aimIdx}） 选区长度=${facts.selectionLength}（瞄准块全文长度=${facts.aimTextLength}） 选区所属块=${facts.selectionSpanText?.slice(0, 24) ?? "无"} bbox高亮框=${highlightCount}`);
 
   const verdicts = [];
   verdicts.push({ name: "RED1 命中错块", red: facts.elementFromPointText !== aim.text, detail: `elementFromPoint=${facts.elementFromPointText?.slice(0, 20) ?? "null"}` });
   verdicts.push({ name: "RED2 选区错块/多块", red: facts.selectionSpanText !== aim.text || facts.selectionLength !== facts.aimTextLength, detail: `选区所属块=${facts.selectionSpanText?.slice(0, 20) ?? "null"} 长度=${facts.selectionLength}/${facts.aimTextLength}` });
   verdicts.push({ name: "RED3 拟合文字溢出盒子", red: aim.overflow !== "hidden" || aim.scrollH > aim.clientH * 1.5, detail: `scrollH=${aim.scrollH} clientH=${aim.clientH} overflow=${aim.overflow}（hidden 时溢出被裁在盒内，不再污染相邻块）` });
+  verdicts.push({ name: "RED4 块 bbox 高亮框未绘制", red: highlightCount !== 1, detail: `页面内 bbox 高亮框数量=${highlightCount}（应为 1）` });
   let failed = false;
   for (const verdict of verdicts) {
     console.log(`[loop] ${verdict.red ? "RED " : "PASS"} ${verdict.name} — ${verdict.detail}`);

@@ -15,7 +15,7 @@ import {
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 import type { BookOutlineNode, OpenedPdfBook, ReadingZoomMode, RecognizedPageText, SelectedPassage } from "../../shared/contracts";
-import { normalizePageRects, ocrAnchorRect } from "./selection-geometry";
+import { normalizePageRects, ocrAnchorRect, type Rectangle } from "./selection-geometry";
 import { mountRecognizedTextLayer } from "./ocr-text-layer";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -312,7 +312,26 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
 
     let scrollFrame = 0;
     let selectionVisible = false;
+    // 扫描页块选中的高亮：实心 bbox 框（MinerU 可视化样式），替代拟合文字的 ::selection 条带。
+    const clearOcrBlockHighlight = () => {
+      viewerElement.querySelectorAll("[data-pdfmuse-block-highlight]").forEach((node) => node.remove());
+    };
+    const showOcrBlockHighlight = (pageEl: HTMLElement, rect: Rectangle) => {
+      clearOcrBlockHighlight();
+      const pageRect = pageEl.getBoundingClientRect();
+      if (pageRect.width <= 0 || pageRect.height <= 0) return;
+      const clampPct = (value: number) => Math.max(0, Math.min(100, value));
+      const div = document.createElement("div");
+      div.dataset.pdfmuseBlockHighlight = "true";
+      div.className = "ocr-block-highlight";
+      div.style.left = `${clampPct(((rect.left - pageRect.left) / pageRect.width) * 100)}%`;
+      div.style.top = `${clampPct(((rect.top - pageRect.top) / pageRect.height) * 100)}%`;
+      div.style.width = `${clampPct((rect.width / pageRect.width) * 100)}%`;
+      div.style.height = `${clampPct((rect.height / pageRect.height) * 100)}%`;
+      pageEl.appendChild(div);
+    };
     const clearSelectionPopover = () => {
+      clearOcrBlockHighlight();
       if (!selectionVisible) return;
       selectionVisible = false;
       onSelectionChange();
@@ -358,6 +377,8 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       const ocrRect = ocrAnchorRect(startPage, range);
       const rects = normalizePageRects(pageRect, ocrRect ? [ocrRect] : Array.from(range.getClientRects()));
       const selectionRect = ocrRect ?? range.getBoundingClientRect();
+      if (ocrRect) showOcrBlockHighlight(startPage, ocrRect);
+      else clearOcrBlockHighlight();
       if (!text || !Number.isSafeInteger(page) || page < 1 || rects.length === 0
         || selectionRect.width <= 0 || selectionRect.height <= 0) {
         clearSelectionPopover();
@@ -497,6 +518,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       cancelAnimationFrame(scrollFrame);
       document.removeEventListener("selectionchange", scheduleSelectionReport);
       cancelAnimationFrame(selectionFrame);
+      clearOcrBlockHighlight();
       if (selectionVisible) onSelectionChange();
       container.removeEventListener("wheel", handleWheel);
       cancelAnimationFrame(wheelFrame);
