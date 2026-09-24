@@ -63,9 +63,13 @@ export function mountRecognizedTextLayer(viewer: HTMLElement, recognizedPage?: R
   layer.setAttribute("aria-label", `第 ${recognizedPage.page} 页识别文字`);
   for (const block of recognizedPage.blocks) {
     const [x0, y0, x1, y1] = block.bbox;
-    if (![x0, y0, x1, y1].every((value) => Number.isFinite(value)) || !block.text.trim()) continue;
+    if (![x0, y0, x1, y1].every((value) => Number.isFinite(value))) continue;
+    // 插图块：image_analysis=False 时 content 为空，但版面 bbox 准确——
+    // 以占位文本参与选中（Reader 划给 AI 后可经 read_page_image 查看原图）。
+    const isPlaceholderImage = block.type === "image" && !block.text.trim();
+    if (!block.text.trim() && !isPlaceholderImage) continue;
     const span = document.createElement("span");
-    span.textContent = block.text;
+    span.textContent = isPlaceholderImage ? "［插图］" : block.text;
     span.title = blockTypeLabel(block);
     span.dataset.ocrType = block.type;
     // 块级 bbox 为 0-1 归一化坐标，直接换算为页面百分比定位；选中即整块，公式块拿到 LaTeX 原文。

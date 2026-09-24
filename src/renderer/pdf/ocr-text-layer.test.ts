@@ -61,7 +61,7 @@ describe("OCR text layer", () => {
     expect(spans[1]?.textContent).toBe("y = \\left| x \\right|");
   });
 
-  it("skips empty-text blocks and non-finite bounding boxes", () => {
+  it("跳过空白与非有限坐标块；插图块以占位文本参与选中", () => {
     const recognizedPage = recognizedPageWith([
       { type: "image", text: "", bbox: [0.1, 0.1, 0.9, 0.9] },
       { type: "text", text: "   ", bbox: [0.1, 0.1, 0.9, 0.2] },
@@ -76,8 +76,9 @@ describe("OCR text layer", () => {
 
     mountRecognizedTextLayer(viewer, recognizedPage);
     const spans = Array.from(page.querySelectorAll<HTMLElement>(".ocr-text-layer span"));
-    expect(spans).toHaveLength(1);
-    expect(spans[0]?.textContent).toBe("正常文本");
+    expect(spans.map((span) => span.textContent)).toEqual(["［插图］", "正常文本"]);
+    expect(spans[0]?.dataset.ocrType).toBe("image");
+    expect(spans[0]?.title).toBe("插图");
   });
 });
 
