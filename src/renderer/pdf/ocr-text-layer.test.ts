@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { RecognizedPageText } from "../../shared/contracts";
 import { fitSpanFontSize, mountRecognizedTextLayer } from "./ocr-text-layer";
-import { ocrAnchorBlock } from "./selection-geometry";
+import { ocrAnchorRect } from "./selection-geometry";
 
 function recognizedPageWith(blocks: RecognizedPageText["blocks"]): RecognizedPageText {
   return {
@@ -57,8 +57,6 @@ describe("OCR text layer", () => {
     expect(spans).toHaveLength(3);
     expect(spans.map((span) => span.dataset.ocrType)).toEqual(["text", "equation", "header"]);
     expect(spans.map((span) => span.title)).toEqual(["文本", "公式（LaTeX）", "页眉"]);
-    // 块 bbox 盖章（T53）：块级原图对照经此取归一化裁剪坐标。
-    expect(spans[0]?.dataset.ocrBbox).toBe(JSON.stringify([0.1, 0.2, 0.5, 0.26]));
     // 公式块以 LaTeX 原文参与选中，划选提问拿到的是可复述的公式而不是乱码。
     expect(spans[1]?.textContent).toBe("y = \\left| x \\right|");
   });
@@ -208,21 +206,17 @@ describe("点击选整块", () => {
   });
 });
 
-describe("OCR 块选区锚点（高亮与原图对照都只取选区起点所在块）", () => {
-  type StubRect = { left: number; top: number; right: number; bottom: number; width: number; height: number };
-  function stubOcrPage(blocks: Array<null | { rect: StubRect; bbox: [number, number, number, number] }>) {
+describe("OCR 块选区矩形（高亮只取选区起点所在块）", () => {
+  function stubOcrPage(rects: Array<null | { left: number; top: number; right: number; bottom: number; width: number; height: number }>) {
     const page = document.createElement("div");
     const layer = document.createElement("div");
     layer.className = "ocr-text-layer";
     page.appendChild(layer);
-    const spans = blocks.map((block) => {
+    const spans = rects.map((rect) => {
       const span = document.createElement("span");
       span.textContent = "块文本";
       layer.appendChild(span);
-      if (block) {
-        span.dataset.ocrBbox = JSON.stringify(block.bbox);
-        vi.spyOn(span, "getBoundingClientRect").mockReturnValue(block.rect as DOMRect);
-      }
+      if (rect) vi.spyOn(span, "getBoundingClientRect").mockReturnValue(rect as DOMRect);
       return span;
     });
     return { page, spans };
@@ -232,34 +226,28 @@ describe("OCR 块选区锚点（高亮与原图对照都只取选区起点所在
     return { startContainer: container } as unknown as Range;
   }
 
-  const first = { rect: { left: 10, top: 20, right: 110, bottom: 50, width: 100, height: 30 }, bbox: [0.1, 0.1, 0.5, 0.2] as [number, number, number, number] };
-  const second = { rect: { left: 12, top: 60, right: 112, bottom: 90, width: 100, height: 30 }, bbox: [0.55, 0.1, 0.9, 0.2] as [number, number, number, number] };
-
-  it("选区起点所在块返回其视口矩形与盖章 bbox（元素容器）", () => {
+  it("选区起点所在块返回其 bbox 矩形（元素容器）", () => {
+    const first = { left: 10, top: 20, right: 110, bottom: 50, width: 100, height: 30 };
+    const second = { left: 12, top: 60, right: 112, bottom: 90, width: 100, height: 30 };
     const { page, spans } = stubOcrPage([first, second]);
-    expect(ocrAnchorBlock(page, fakeRangeAt(spans[1]!))).toEqual({ rect: second.rect, bbox: second.bbox });
+    expect(ocrAnchorRect(page, fakeRangeAt(spans[1]!))).toEqual(second);
   });
 
   it("起点是块内文本节点时经父元素归到该块", () => {
+    const first = { left: 10, top: 20, right: 110, bottom: 50, width: 100, height: 30 };
+    const second = { left: 12, top: 60, right: 112, bottom: 90, width: 100, height: 30 };
     const { page, spans } = stubOcrPage([first, second]);
-    expect(ocrAnchorBlock(page, fakeRangeAt(spans[1]!.firstChild))).toEqual({ rect: second.rect, bbox: second.bbox });
+    expect(ocrAnchorRect(page, fakeRangeAt(spans[1]!.firstChild))).toEqual(second);
   });
 
   it("起点不在 OCR 层内时返回 null（原生文字层回落字形矩形）", () => {
+    const first = { left: 10, top: 20, right: 110, bottom: 50, width: 100, height: 30 };
     const { page } = stubOcrPage([first]);
-    expect(ocrAnchorBlock(page, fakeRangeAt(page))).toBeNull();
+    expect(ocrAnchorRect(page, fakeRangeAt(page))).toBeNull();
   });
 
   it("页面没有 OCR 文字层时返回 null", () => {
     const page = document.createElement("div");
-    expect(ocrAnchorBlock(page, fakeRangeAt(page))).toBeNull();
-  });
-
-  it("bbox 盖章缺失或损坏时按非 OCR 块回落", () => {
-    const { page, spans } = stubOcrPage([first, second]);
-    delete spans[1]!.dataset.ocrBbox;
-    expect(ocrAnchorBlock(page, fakeRangeAt(spans[1]!))).toBeNull();
-    spans[1]!.dataset.ocrBbox = "{damaged";
-    expect(ocrAnchorBlock(page, fakeRangeAt(spans[1]!))).toBeNull();
+    expect(ocrAnchorRect(page, fakeRangeAt(page))).toBeNull();
   });
 });
