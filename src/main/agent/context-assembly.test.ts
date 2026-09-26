@@ -19,7 +19,7 @@ function message(role: "reader" | "assistant", runId: string, body: string, stat
 
 function row(partial: Partial<PersistedToolCall> & { runId: string; callId: string }): PersistedToolCall {
   return {
-    toolName: "book_search",
+    toolName: "search_book",
     title: "检索本书",
     argumentsJson: "{}",
     resultText: "结果",
@@ -30,6 +30,29 @@ function row(partial: Partial<PersistedToolCall> & { runId: string; callId: stri
 }
 
 describe("context assembly replay", () => {
+  it("maps legacy tool names in stored rows to current names during synthesis (T51)", async () => {
+    const history = [message("reader", "r1", "旧问题"), message("assistant", "r1", "旧回答")];
+    const toolCalls: PersistedToolCall[] = [
+      row({ runId: "r1", callId: "c-old-1", toolName: "book_search", title: "检索本书" }),
+      row({ runId: "r1", callId: "c-old-2", toolName: "read_page_image", title: "查看页面原图" }),
+      row({ runId: "r1", callId: "c-old-3", toolName: "web_search", title: "联网搜索" }),
+    ];
+
+    const messages = await buildReplayMessages({ history, toolCalls, loadImage: estimatingImageLoader });
+
+    // 库行不改写；回放合成出的 toolCall/toolResult 一律用现名，模型看到的是当前工具集。
+    const withCalls = messages[1] as AssistantMessage;
+    expect(withCalls.content.map((block) => (block.type === "toolCall" ? block.name : null))).toEqual([
+      "search_book",
+      "view_page",
+      "search_web",
+    ]);
+    for (const item of messages.slice(2, 5)) {
+      expect((item as ToolResultMessage).toolName).not.toMatch(/book_search|read_page_image|web_search/);
+    }
+    expect(JSON.stringify(messages)).not.toContain("book_search");
+  });
+
   it("synthesizes merged tool pairs and filters failed runs (T45)", async () => {
     const history = [
       message("reader", "r1", "第一问"),
@@ -43,7 +66,7 @@ describe("context assembly replay", () => {
       {
         runId: "r1",
         callId: "c1",
-        toolName: "book_search",
+        toolName: "search_book",
         title: "检索本书",
         argumentsJson: '{"query":"x"}',
         resultText: "命中原文",
@@ -52,7 +75,7 @@ describe("context assembly replay", () => {
         mediaPath: JSON.stringify([{ page: 1, path: "book/p1.png" }, { page: 2, path: "book/p2.png" }]),
       },
       { runId: "r1", callId: "c2", toolName: "read_pages", title: "读取页面", argumentsJson: "{}", resultText: "拒绝文本", status: "rejected", isError: true },
-      { runId: "r2", callId: "c3", toolName: "book_search", title: "检索本书", argumentsJson: "{}", resultText: "失败 run 的行", status: "executed", isError: false },
+      { runId: "r2", callId: "c3", toolName: "search_book", title: "检索本书", argumentsJson: "{}", resultText: "失败 run 的行", status: "executed", isError: false },
     ];
     // 第一张图可读、第二张缺失：同一条 toolResult 内图块与占位文本并存。
     const loader: ReplayImageLoader = async (path) => (path.endsWith("p1.png") ? "aW1n" : null);
@@ -79,7 +102,7 @@ describe("context assembly replay", () => {
     expect(executed.isError).toBe(false);
     // 缺一即整条降级为 4 节占位模板（审查修复：不再部分附图 + 变体注记）。
     expect(executed.content).toEqual([
-      { type: "text", text: "第 1、2 页原图已省略，如需查看可调用 read_page_image 重新获取。" },
+      { type: "text", text: "第 1、2 页原图已省略，如需查看可调用 view_page 重新获取。" },
     ]);
 
     const rejected = messages[3] as ToolResultMessage;

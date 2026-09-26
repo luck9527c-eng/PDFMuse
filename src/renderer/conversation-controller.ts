@@ -28,8 +28,12 @@ const INITIAL_STATE: ConversationControllerState = {
 };
 
 const TOOL_TITLES: Record<string, string> = {
-  book_search: "检索本书",
+  search_book: "检索本书",
   read_pages: "读取页面",
+  view_page: "查看页面原图",
+  search_web: "联网搜索",
+  // T51 改名前的旧名：跨版本在途运行的状态条仍可渲染中文标题。
+  book_search: "检索本书",
   read_page_image: "查看页面原图",
   web_search: "联网搜索",
 };

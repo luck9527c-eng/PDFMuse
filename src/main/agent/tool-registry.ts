@@ -46,7 +46,7 @@ export type ToolExecutionOutcome = {
   displaySummary: string;
   contentText: string;
   evidence?: PdfEvidence[];
-  /** 随结果发送给模型的页面原图（base64 PNG）；read_page_image 使用。 */
+  /** 随结果发送给模型的页面原图（base64 PNG）；view_page 使用。 */
   images?: Array<{ page: number; mimeType: "image/png"; data: string }>;
   /** 已转存媒体目录的原图引用（T44）；随 details 到达 agent-host 的落库层。 */
   media?: Array<{ page: number; path: string }>;
@@ -69,32 +69,32 @@ type RegisteredTool = {
 
 const QUERY_MAX_LENGTH = 200;
 /** 每问联网搜索子额度（T50 Tool Quota，与 Run Budget 独立计数）：执行即扣，缓存命中也扣。 */
-export const MAX_WEB_SEARCH_CALLS = 3;
+export const MAX_SEARCH_WEB_CALLS = 3;
 /** 单次工具调用统一软超时（T50）：罩住建索引与实际检索；到点返回软错误结果，模型可继续。 */
 const TOOL_EXECUTION_TIMEOUT_MS = 420_000;
 const CONTENT_MAX_LENGTH = 8_000;
 /** read_pages 的总文本上限：整页阅读需要比碎片检索更大的预算；超出按 offset 续读。 */
 const READ_PAGES_MAX_CHARS = 20_000;
 
-const bookSearchSchema = Type.Object({
+const searchBookSchema = Type.Object({
   query: Type.String({ minLength: 1, maxLength: QUERY_MAX_LENGTH, description: "要在当前 PDF 书籍中检索的关键词或短语" }),
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, description: "返回的命中数量上限，默认 6" })),
 });
 
-/** book_search：整本书混合检索，返回带来源的 PDF 摘录或较早会话候选。 */
-function createBookSearchTool(): RegisteredTool {
+/** search_book：整本书混合检索，返回带来源的 PDF 摘录或较早会话候选。 */
+function createSearchBookTool(): RegisteredTool {
   return {
-    name: "book_search",
+    name: "search_book",
     title: "检索本书",
     description:
       "按关键词在整本书内定位相关页码（关键词与语义混合检索，返回带来源的原文摘录）。"
       + "标准顺序：先用本工具把主题定位到页码，再用 read_pages 读取整页原文作答。"
       + "本工具没有每问次数限制，多主题的复杂问题可以从不同角度反复检索，把全书相关处查完。"
       + "只有检索较早对话内容时才单独使用本工具；不要用本工具替代 read_pages 的整页阅读——检索摘录只有片段，讲解和总结需要整页上下文。",
-    parameters: bookSearchSchema,
+    parameters: searchBookSchema,
     async execute(input, ctx) {
       // 参数已由 agent-loop 的 validateToolArguments 按 schema 校验；这里只做 schema 表达不了的语义收敛。
-      const { query, limit } = input as Static<typeof bookSearchSchema>;
+      const { query, limit } = input as Static<typeof searchBookSchema>;
       const keyword = query.trim();
       if (!keyword) throw new Error("检索词不能只包含空白字符。");
       const hitLimit = limit ?? 6;
@@ -160,7 +160,7 @@ function createReadPagesTool(): RegisteredTool {
     title: "读取页面",
     description:
       "按页码列表整页读取文字，一次可读多页、支持不连续页码、没有每问次数限制。"
-      + "讲解、总结、复习某个小节或某几页内容时优先用本工具读取原文（章节跨页时把涉及的页码一并传入）；范围未知时先用 book_search 把主题定位到页码，再回来用本工具精读。"
+      + "讲解、总结、复习某个小节或某几页内容时优先用本工具读取原文（章节跨页时把涉及的页码一并传入）；范围未知时先用 search_book 把主题定位到页码，再回来用本工具精读。"
       + `单次最多返回 ${READ_PAGES_MAX_CHARS.toLocaleString("en-US")} 字符：同一批页码的全文超限时从头部截断，结果末尾会给出续读 offset，用相同页码带上该 offset 即可继续读取，直到提示已读完全文。`,
     parameters: readPagesSchema,
     async execute(input, ctx) {
@@ -176,12 +176,12 @@ function createReadPagesTool(): RegisteredTool {
       if (found.length === 0) {
         return {
           displaySummary: `第 ${requested[0]} 页附近没有可读文本`,
-          contentText: "该页码范围尚未建立文字索引（可能仍在后台处理），请改用 book_search 检索。",
+          contentText: "该页码范围尚未建立文字索引（可能仍在后台处理），请改用 search_book 检索。",
         };
       }
       const missing = requested.filter((page) => !textByPage.has(page));
       // 版面失真声明只挂识别页：原生文本页没有公式 LaTeX/表格 HTML/插图占位，全量附注
-      // 既误导模型去调 read_page_image，又是纯 token 开销。
+      // 既误导模型去调 view_page，又是纯 token 开销。
       const ocrPages = found.filter((page) => ctx.bookIndex.isPageRecognized(ctx.bookId, page));
       const fullText = found.map((page) => `【第 ${page} 页】\n${textByPage.get(page)}`).join("\n\n");
       let body = start > 0 ? fullText.slice(start) : fullText;
@@ -221,23 +221,23 @@ function createReadPagesTool(): RegisteredTool {
   };
 }
 
-const webSearchSchema = Type.Object({
+const searchWebSchema = Type.Object({
   query: Type.String({ minLength: 1, maxLength: 200, description: "联网搜索的关键词或问题" }),
 });
 
-/** web_search：书内信息不足或问题涉及书外事实时联网搜索；结果必须在回答中用链接标注来源。 */
-function createWebSearchTool(): RegisteredTool {
+/** search_web：书内信息不足或问题涉及书外事实时联网搜索；结果必须在回答中用链接标注来源。 */
+function createSearchWebTool(): RegisteredTool {
   return {
-    name: "web_search",
+    name: "search_web",
     title: "联网搜索",
     description:
-      `联网搜索网络资料（每问最多 ${MAX_WEB_SEARCH_CALLS} 次，额度独立于书内工具）。当书内检索不足以回答、或问题涉及书外事实（作者生平、出版背景、外部概念对照、时事）时使用。回答中引用网络内容时必须附上来源链接，并明确说明这不是本书内容。`,
-    parameters: webSearchSchema,
+      `联网搜索网络资料（每问最多 ${MAX_SEARCH_WEB_CALLS} 次，额度独立于书内工具）。当书内检索不足以回答、或问题涉及书外事实（作者生平、出版背景、外部概念对照、时事）时使用。回答中引用网络内容时必须附上来源链接，并明确说明这不是本书内容。`,
+    parameters: searchWebSchema,
     async execute(input, ctx) {
       if (!ctx.webSearch) {
         return { displaySummary: "联网搜索不可用", contentText: "当前没有可用的联网搜索模块。" };
       }
-      const { query } = input as Static<typeof webSearchSchema>;
+      const { query } = input as Static<typeof searchWebSchema>;
       const keyword = query.trim();
       if (!keyword) throw new Error("搜索词不能只包含空白字符。");
       const outcome = await ctx.webSearch.search(keyword, ctx.signal);
@@ -259,9 +259,9 @@ function createWebSearchTool(): RegisteredTool {
 
 /** read_pages 识别页的模态声明细节：MinerU 块级解析已按阅读顺序重建结构，但图片内容不可见。 */
 const OCR_MODALITY_NOTE_DETAIL =
-  "：正文与标题已按阅读顺序重建；公式为 LaTeX 记法（如 \\frac{a}{b} 表示分式）、表格可能为 HTML 片段；插图内容不可见（仅保留占位）。凡需要核对图片、照片或原版式细节，先用 read_page_image 查看原图。";
+  "：正文与标题已按阅读顺序重建；公式为 LaTeX 记法（如 \\frac{a}{b} 表示分式）、表格可能为 HTML 片段；插图内容不可见（仅保留占位）。凡需要核对图片、照片或原版式细节，先用 view_page 查看原图。";
 
-const readPageImageSchema = Type.Object({
+const viewPageSchema = Type.Object({
   pages: Type.Array(Type.Integer({ minimum: 1 }), {
     minItems: 1,
     maxItems: 4,
@@ -291,18 +291,18 @@ async function renderWithinHardLimits(ctx: ToolExecutionContext, page: number): 
   throw new Error("页面原图超出尺寸硬限制，降采样后仍超限。");
 }
 
-/** read_page_image：渲染页面原图发给模型，精确查看公式、表格与结构。每问受页数额度钳制（无次数上限）。 */
-function createReadPageImageTool(): RegisteredTool {
+/** view_page：渲染页面原图发给模型，精确查看公式、表格与结构。每问受页数额度钳制（无次数上限）。 */
+function createViewPageTool(): RegisteredTool {
   return {
-    name: "read_page_image",
+    name: "view_page",
     title: "查看页面原图",
     description:
       "渲染指定页的原图并随结果直接发送，用于精确查看 OCR 文本无法保留的内容：数学公式（分数、根号、上下标）、表格结构、图表。"
-      + "先用 book_search、read_pages 或上一轮回答引用的原文把范围定位到具体页码后再调用本工具；默认只查看 1 页，确需相邻页对照或跨页内容时才增加。"
+      + "先用 search_book、read_pages 或上一轮回答引用的原文把范围定位到具体页码后再调用本工具；默认只查看 1 页，确需相邻页对照或跨页内容时才增加。"
       + `本问内图片查看按页数计量（共 ${MAX_PAGE_IMAGE_PAGES} 页，已看过的页重复查看不消耗额度），没有次数限制；额度用完后本工具不再出图，请把额度花在最需要的页上。`,
-    parameters: readPageImageSchema,
+    parameters: viewPageSchema,
     async execute(input, ctx) {
-      const { pages } = input as Static<typeof readPageImageSchema>;
+      const { pages } = input as Static<typeof viewPageSchema>;
       const budget = ctx.pageBudget;
       const requested = [...new Set(pages)].sort((left, right) => left - right);
       const images: NonNullable<ToolExecutionOutcome["images"]> = [];
@@ -345,7 +345,7 @@ function createReadPageImageTool(): RegisteredTool {
         return quotaLeft <= 0
           ? {
               displaySummary: "图片额度已用完",
-              contentText: `图片额度已用完（${MAX_PAGE_IMAGE_PAGES} 页），不要再调用 read_page_image，用文字工具继续。`,
+              contentText: `图片额度已用完（${MAX_PAGE_IMAGE_PAGES} 页），不要再调用 view_page，用文字工具继续。`,
             }
           : failed.length > 0
             ? { displaySummary: "原图渲染失败", contentText: "无法渲染所选页面，请检查页码是否在本书范围内。" }
@@ -377,7 +377,7 @@ function createReadPageImageTool(): RegisteredTool {
 
 export function createToolRegistry(options: { toolTimeoutMs?: number } = {}) {
   const toolTimeoutMs = options.toolTimeoutMs ?? TOOL_EXECUTION_TIMEOUT_MS;
-  const tools: RegisteredTool[] = [createBookSearchTool(), createReadPagesTool(), createReadPageImageTool(), createWebSearchTool()];
+  const tools: RegisteredTool[] = [createSearchBookTool(), createReadPagesTool(), createViewPageTool(), createSearchWebTool()];
 
   /**
    * 单次工具 420 秒软超时（T50）：到点不抛错，返回软错误结果让模型换路继续；

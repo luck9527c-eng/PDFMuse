@@ -57,7 +57,7 @@ describe("tool registry", () => {
 
   it("exposes the four reading and search tools", () => {
     const registry = createToolRegistry();
-    expect(registry.toolNames()).toEqual(["book_search", "read_pages", "read_page_image", "web_search"]);
+    expect(registry.toolNames()).toEqual(["search_book", "read_pages", "view_page", "search_web"]);
   });
 
   it("attaches the OCR modality note only to recognized pages", async () => {
@@ -67,20 +67,20 @@ describe("tool registry", () => {
     const nativeResult = await tool.execute("call-note-0", { pages: [1] });
     const nativeText = (nativeResult.content[0] as { text: string }).text;
     expect(nativeText).not.toContain("版面解析生成");
-    expect(nativeText).not.toContain("read_page_image");
+    expect(nativeText).not.toContain("view_page");
 
     // 有 Recognized Text 块的页按识别来源挂模态声明。
     recognizedPagesByPage.set(`${bookId}:2`, [{ type: "text", text: "扫描页识别文本", bbox: [0, 0, 1, 1] }]);
     bookIndex.indexRecognizedPage(bookId, 2, [{ text: "扫描页识别文本" }]);
     const ocrResult = await tool.execute("call-note-1", { pages: [2] });
     const ocrText = (ocrResult.content[0] as { text: string }).text;
-    expect(ocrText).toContain("read_page_image");
+    expect(ocrText).toContain("view_page");
     expect(ocrText).toContain("版面解析生成");
   });
 
-  it("returns rendered page images as image content blocks via read_page_image", async () => {
+  it("returns rendered page images as image content blocks via view_page", async () => {
     const registry = createToolRegistry();
-    const tool = registry.buildAgentTools(context).find((item) => item.name === "read_page_image")!;
+    const tool = registry.buildAgentTools(context).find((item) => item.name === "view_page")!;
     const result = await tool.execute("call-image-1", { pages: [1, 1, 2] });
     const blocks = result.content as Array<{ type: string; data?: string }>;
     expect(blocks[0]?.type).toBe("text");
@@ -96,7 +96,7 @@ describe("tool registry", () => {
     const toolMedia = createToolMedia(dataHome);
     const registry = createToolRegistry();
     const tool = registry.buildAgentTools(() => ({ ...context(), savePageImage: toolMedia.savePageImage }))
-      .find((item) => item.name === "read_page_image")!;
+      .find((item) => item.name === "view_page")!;
     const result = await tool.execute("call-media-1", { pages: [1, 2] });
 
     const details = result.details as { media?: Array<{ page: number; path: string }> };
@@ -110,10 +110,10 @@ describe("tool registry", () => {
     expect(content.filter((block) => block.type === "image")).toHaveLength(2);
   });
 
-  it("steers read_page_image to locate first and default one page", () => {
+  it("steers view_page to locate first and default one page", () => {
     const registry = createToolRegistry();
     const description = registry.buildAgentTools(context)
-      .find((item) => item.name === "read_page_image")!.description;
+      .find((item) => item.name === "view_page")!.description;
     expect(description).toContain("默认只查看 1 页");
     expect(description).toContain("定位");
     expect(description).toContain("额度");
@@ -122,11 +122,11 @@ describe("tool registry", () => {
     expect(description).toContain("没有次数限制");
   });
 
-  it("clamps read_page_image to the twenty-page per-question quota with a note and echo annotation", async () => {
+  it("clamps view_page to the twenty-page per-question quota with a note and echo annotation", async () => {
     const registry = createToolRegistry();
     const budget = { pagesDelivered: 18, deliveredMedia: new Map<number, string>() };
     const tool = registry.buildAgentTools(() => context(undefined, budget))
-      .find((item) => item.name === "read_page_image")!;
+      .find((item) => item.name === "view_page")!;
 
     const first = await tool.execute("call-budget-1", { pages: [1, 2, 3] });
     const firstText = (first.content[0] as { text: string }).text;
@@ -145,7 +145,7 @@ describe("tool registry", () => {
     expect(second.content.filter((block) => block.type === "image")).toHaveLength(0);
     const secondText = (second.content[0] as { text: string }).text;
     expect(secondText).toContain("图片额度已用完（20 页）");
-    expect(secondText).toContain("不要再调用 read_page_image，用文字工具继续");
+    expect(secondText).toContain("不要再调用 view_page，用文字工具继续");
     expect((second.details as { evidence?: unknown }).evidence).toBeUndefined();
   });
 
@@ -163,7 +163,7 @@ describe("tool registry", () => {
         return pageRenderer.renderPage(id, page, scale);
       },
     });
-    const tool = registry.buildAgentTools(countingContext).find((item) => item.name === "read_page_image")!;
+    const tool = registry.buildAgentTools(countingContext).find((item) => item.name === "view_page")!;
     const first = await tool.execute("call-reuse-1", { pages: [1] });
     const firstBytes = (first.content.find((block) => block.type === "image") as { data: string }).data;
     expect(renders).toBe(1);
@@ -181,7 +181,7 @@ describe("tool registry", () => {
   it("keeps image quotas separate across questions", async () => {
     const registry = createToolRegistry();
     const toolOf = (budget: PageImageBudget) => registry.buildAgentTools(() => context(undefined, budget))
-      .find((item) => item.name === "read_page_image")!;
+      .find((item) => item.name === "view_page")!;
     await toolOf({ pagesDelivered: 0, deliveredMedia: new Map() }).execute("call-q1", { pages: [1, 2] });
 
     // 新的一问：页数额度与复用键都随运行重建（agent-host 每问新建预算对象）。
@@ -213,7 +213,7 @@ describe("tool registry", () => {
     const registry = createToolRegistry({ toolTimeoutMs: 40 });
     const hangingSearch = { search: () => new Promise(() => undefined) };
     const tool = registry.buildAgentTools(() => ({ ...context(), webSearch: hangingSearch as never }))
-      .find((item) => item.name === "web_search")!;
+      .find((item) => item.name === "search_web")!;
     const result = await tool.execute("call-timeout-1", { query: "挂死搜索" });
     const text = (result.content[0] as { text: string }).text;
     // 420 秒软超时文案（注入时限按比例呈现）：软错误结果，模型可继续，不抛错。
@@ -223,7 +223,7 @@ describe("tool registry", () => {
     expect((result.details as { timeout?: boolean }).timeout).toBe(true);
   });
 
-  it("returns web results with provider notes via web_search", async () => {
+  it("returns web results with provider notes via search_web", async () => {
     const registry = createToolRegistry();
     const fakeSearch = {
       search: async (query: string) => ({
@@ -234,7 +234,7 @@ describe("tool registry", () => {
         ],
       }),
     };
-    const tool = registry.buildAgentTools(() => ({ ...context(), webSearch: fakeSearch })).find((item) => item.name === "web_search")!;
+    const tool = registry.buildAgentTools(() => ({ ...context(), webSearch: fakeSearch })).find((item) => item.name === "search_web")!;
     const result = await tool.execute("call-web-1", { query: "计算机组成原理 作者" });
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain("https://example.com/author");
@@ -265,10 +265,10 @@ describe("tool registry", () => {
     expect(details.displaySummary).toContain("第 1、3 页");
   });
 
-  it("executes book_search with indexing, evidence and a model-facing summary", async () => {
+  it("executes search_book with indexing, evidence and a model-facing summary", async () => {
     const registry = createToolRegistry();
     const tool = registry.buildAgentTools(context)[0]!;
-    expect(tool.name).toBe("book_search");
+    expect(tool.name).toBe("search_book");
     expect(tool.label).toBe("检索本书");
     expect(tool.parameters).toBeTruthy();
 

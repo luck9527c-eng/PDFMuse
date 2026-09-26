@@ -57,7 +57,7 @@ export function parseMediaRefs(mediaPath: string | undefined): Array<{ page: num
 /** 占位文案只依赖行自身字段（spec 4）：同库状态同字节，图片行附重取指引。 */
 export function elisionPlaceholderText(row: PersistedToolCall): string {
   const pages = parseMediaRefs(row.mediaPath).map((ref) => ref.page);
-  if (pages.length > 0) return `第 ${pages.join("、")} 页原图已省略，如需查看可调用 read_page_image 重新获取。`;
+  if (pages.length > 0) return `第 ${pages.join("、")} 页原图已省略，如需查看可调用 view_page 重新获取。`;
   return `此前 ${row.title} 结果约 ${row.resultText.length} 字符，已省略`;
 }
 
@@ -291,6 +291,20 @@ async function toolResultContent(row: PersistedToolCall, loadImage: ReplayImageL
 }
 
 /**
+ * 旧工具名 → 现名（T51 改名）：历史库行不改写，回放/摘要合成时映射为现名，
+ * 模型看到的历史工具调用始终是当前工具集的名字。
+ */
+const LEGACY_TOOL_NAME_ALIASES: Record<string, string> = {
+  book_search: "search_book",
+  read_page_image: "view_page",
+  web_search: "search_web",
+};
+
+export function toCurrentToolName(name: string): string {
+  return LEGACY_TOOL_NAME_ALIASES[name] ?? name;
+}
+
+/**
  * 一次完整 run 的工具行合成为 provider 合法的配对：全部 toolCall 块合并进同一条
  * assistant 消息（Anthropic 不接受连续 assistant 轮次），后跟各自的 toolResult
  * （anthropic 适配器会把连续 toolResult 合并为单轮用户消息）。
@@ -301,7 +315,7 @@ async function synthesizeToolPairMessages(rows: PersistedToolCall[], loadImage: 
     content: rows.map((row) => ({
       type: "toolCall" as const,
       id: row.callId,
-      name: row.toolName,
+      name: toCurrentToolName(row.toolName),
       arguments: safeParseArguments(row.argumentsJson),
     })),
     api: "pdfmuse-history",
@@ -318,7 +332,7 @@ async function synthesizeToolPairMessages(rows: PersistedToolCall[], loadImage: 
       messages.push({
         role: "toolResult",
         toolCallId: row.callId,
-        toolName: row.toolName,
+        toolName: toCurrentToolName(row.toolName),
         content: [{ type: "text", text: elisionPlaceholderText(row) }],
         isError: row.isError,
         timestamp: 0,
@@ -328,7 +342,7 @@ async function synthesizeToolPairMessages(rows: PersistedToolCall[], loadImage: 
     messages.push({
       role: "toolResult",
       toolCallId: row.callId,
-      toolName: row.toolName,
+      toolName: toCurrentToolName(row.toolName),
       content: await toolResultContent(row, loadImage),
       isError: row.isError,
       timestamp: 0,

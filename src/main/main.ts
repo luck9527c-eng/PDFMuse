@@ -295,7 +295,7 @@ app.whenReady().then(async () => {
     library.registerBookDataCleaner(bookOutline.deleteBookData);
     library.registerBookDataCleaner(ocr.deleteBookData);
     library.registerBookDataCleaner(backgroundJobs.deleteBookData);
-    // T44：read_page_image 原图媒体目录（<dataHome>/media/<bookId>），删除书籍数据时整目录移除。
+    // T44：view_page 原图媒体目录（<dataHome>/media/<bookId>），删除书籍数据时整目录移除。
     const toolMedia = createToolMedia(startupPreflight.dataHome);
     library.registerBookDataCleaner(toolMedia.deleteBookData);
     void readAppConfig(configPath)

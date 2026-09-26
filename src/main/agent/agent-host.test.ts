@@ -993,7 +993,7 @@ describe("agent host", () => {
     sessionStore.finalizeRun({
       sessionId: session.id,
       runId: "old-0",
-      toolCalls: [{ runId: "old-0", callId: "small", toolName: "book_search", title: "检索本书", argumentsJson: "{}", resultText: "小结果原文", status: "executed", isError: false }],
+      toolCalls: [{ runId: "old-0", callId: "small", toolName: "search_book", title: "检索本书", argumentsJson: "{}", resultText: "小结果原文", status: "executed", isError: false }],
     });
     // 最新 run：大工具行在保留尾内（末轮强制完整），按全量计入估算。
     sessionStore.appendMessage({ sessionId: session.id, runId: "old-1", role: "reader", body: "旧问题一", status: "complete" });
@@ -1227,9 +1227,9 @@ describe("agent host", () => {
       void Promise.resolve().then(() => {
         if (requests.length === 1) {
           const toolCallMessage = assistantMessage("", "toolUse");
-          toolCallMessage.content = [{ type: "toolCall", id: "call-diag-1", name: "book_search", arguments: { query: "Chapter One" } }];
+          toolCallMessage.content = [{ type: "toolCall", id: "call-diag-1", name: "search_book", arguments: { query: "Chapter One" } }];
           stream.push({ type: "start", partial: toolCallMessage });
-          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-diag-1", name: "book_search", arguments: { query: "Chapter One" } }, partial: toolCallMessage });
+          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-diag-1", name: "search_book", arguments: { query: "Chapter One" } }, partial: toolCallMessage });
           stream.push({ type: "done", reason: "toolUse", message: toolCallMessage });
           return;
         }
@@ -1263,12 +1263,12 @@ describe("agent host", () => {
     expect(run.requests[0]!.role).toBe("main");
     expect(run.requests[1]!.role).toBe("tool-turn");
     expect(run.requests[0]!.systemPrompt).toContain("PDFMuse");
-    expect(run.requests[0]!.toolNames).toContain("book_search");
-    expect(run.requests[1]!.messages.some((message) => JSON.stringify(message).includes("book_search"))).toBe(true);
+    expect(run.requests[0]!.toolNames).toContain("search_book");
+    expect(run.requests[1]!.messages.some((message) => JSON.stringify(message).includes("search_book"))).toBe(true);
     expect(run.requests[0]!.durationMs).toBeGreaterThanOrEqual(0);
     expect(run.requests[0]!.usage?.totalTokens).toBeGreaterThan(0);
     expect(run.toolCalls).toHaveLength(1);
-    expect(run.toolCalls[0]).toMatchObject({ name: "book_search", parameters: { query: "Chapter One" } });
+    expect(run.toolCalls[0]).toMatchObject({ name: "search_book", parameters: { query: "Chapter One" } });
     expect(run.toolCalls[0]!.resultText).toContain("Chapter One");
     expect(run.toolCalls[0]!.evidence?.[0]?.page).toBe(1);
     expect(run.timeline.some((entry) => entry.kind === "run-start")).toBe(true);
@@ -1283,7 +1283,7 @@ describe("agent host", () => {
     library.close();
   });
 
-  it("keeps book_search uncapped across a run and lets the budget govern (T50)", async () => {
+  it("keeps search_book uncapped across a run and lets the budget govern (T50)", async () => {
     const library = createLibraryModule(dataHome);
     const bookIndex = createBookIndex(dataHome);
     const pageRenderer = createPageRenderer((id) => bookIndex.loadBookByBookId(id));
@@ -1302,9 +1302,9 @@ describe("agent host", () => {
           // 连续五次检索（旧上限是 3 次）；T50 起书内检索不再有每问次数上限。
           const toolCallMessage = assistantMessage("", "toolUse");
           const callId = `call-cap-${requests.length}`;
-          toolCallMessage.content = [{ type: "toolCall", id: callId, name: "book_search", arguments: { query: `Chapter ${requests.length}` } }];
+          toolCallMessage.content = [{ type: "toolCall", id: callId, name: "search_book", arguments: { query: `Chapter ${requests.length}` } }];
           stream.push({ type: "start", partial: toolCallMessage });
-          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: callId, name: "book_search", arguments: { query: `Chapter ${requests.length}` } }, partial: toolCallMessage });
+          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: callId, name: "search_book", arguments: { query: `Chapter ${requests.length}` } }, partial: toolCallMessage });
           stream.push({ type: "done", reason: "toolUse", message: toolCallMessage });
           return;
         }
@@ -1332,7 +1332,7 @@ describe("agent host", () => {
 
     const diagnostics = host.listDiagnostics(fixtureBookId);
     const run = diagnostics.at(-1)!;
-    const searchCalls = run.toolCalls.filter((toolCall) => toolCall.name === "book_search");
+    const searchCalls = run.toolCalls.filter((toolCall) => toolCall.name === "search_book");
     // 五次全部真实执行，没有任何一次被「上限」拦截。
     expect(searchCalls).toHaveLength(5);
     for (const call of searchCalls) {
@@ -1712,7 +1712,7 @@ describe("agent host", () => {
     expect(conversation.at(-1)?.body).toBe("写到一半");
   });
 
-  it("runs book_search tool turns and persists pdf evidence", async () => {
+  it("runs search_book tool turns and persists pdf evidence", async () => {
     // 真实 Library + 索引 + Registry，验证工具续轮闭环。
     const library = createLibraryModule(dataHome);
     const bookIndex = createBookIndex(dataHome, { getBookSource: (bookId) => library.getBookSource(bookId) });
@@ -1733,14 +1733,14 @@ describe("agent host", () => {
           const toolCallMessage = assistantMessage("让我先检索原文。", "toolUse");
           toolCallMessage.content = [
             { type: "text", text: "让我先检索原文。" },
-            { type: "toolCall", id: "call-book-1", name: "book_search", arguments: { query: "Chapter One" } },
+            { type: "toolCall", id: "call-book-1", name: "search_book", arguments: { query: "Chapter One" } },
           ];
           stream.push({ type: "start", partial: toolCallMessage });
           stream.push({ type: "text_delta", contentIndex: 0, delta: "让我先检索原文。" });
           stream.push({
             type: "toolcall_end",
             contentIndex: 1,
-            toolCall: { type: "toolCall", id: "call-book-1", name: "book_search", arguments: { query: "Chapter One" } },
+            toolCall: { type: "toolCall", id: "call-book-1", name: "search_book", arguments: { query: "Chapter One" } },
             partial: toolCallMessage,
           });
           stream.push({ type: "done", reason: "toolUse", message: toolCallMessage });
@@ -1774,13 +1774,13 @@ describe("agent host", () => {
     expect(requests.length).toBe(2);
     const secondRound = JSON.stringify(requests[1]!.context.messages);
     expect(secondRound).toContain("toolResult");
-    expect(secondRound).toContain("book_search");
+    expect(secondRound).toContain("search_book");
     expect(secondRound).toContain("Chapter One");
 
     // 工具事件顺序：start 在 end 之前。
     const toolEvents = events.filter((event): event is Extract<AgentStreamEvent, { stream: "tool" }> => event.stream === "tool");
     expect(toolEvents.map((event) => event.phase)).toEqual(["start", "update", "end"]);
-    expect(toolEvents[0]?.name).toBe("book_search");
+    expect(toolEvents[0]?.name).toBe("search_book");
 
     // Evidence 持久化到 assistant 消息并指向真实页码；工具轮前段的回答不得被后段覆盖。
     const conversation = host.getConversation(fixtureBookId);
@@ -1795,7 +1795,7 @@ describe("agent host", () => {
   });
 
   it("persists the full tool-call trail and run exit at finalize (T44/T50)", async () => {
-    // 自定义同名 book_search 工具：走 wrapper 的落库路径，结果可控。
+    // 自定义同名 search_book 工具：走 wrapper 的落库路径，结果可控。
     // 单次运行内连续 4 轮工具调用：全部真实执行（书内检索无每问上限），随后模型收尾。
     let turns = 0;
     const fake = createFakeStreamFn(({ push }) => {
@@ -1809,14 +1809,14 @@ describe("agent host", () => {
       const toolCallMessage = assistantMessage("", "toolUse");
       toolCallMessage.content = [
         { type: "text", text: "查一下" },
-        { type: "toolCall", id: `call-${turns}`, name: "book_search", arguments: { query: `测试 ${turns}` } },
+        { type: "toolCall", id: `call-${turns}`, name: "search_book", arguments: { query: `测试 ${turns}` } },
       ];
       push({ type: "start", partial: toolCallMessage });
       push({ type: "text_delta", contentIndex: 0, delta: "查一下" });
       push({
         type: "toolcall_end",
         contentIndex: 1,
-        toolCall: { type: "toolCall", id: `call-${turns}`, name: "book_search", arguments: { query: `测试 ${turns}` } },
+        toolCall: { type: "toolCall", id: `call-${turns}`, name: "search_book", arguments: { query: `测试 ${turns}` } },
         partial: toolCallMessage,
       });
       push({ type: "done", reason: "toolUse", message: toolCallMessage });
@@ -1824,7 +1824,7 @@ describe("agent host", () => {
     buildHost({
       createStreamFn: () => fake.streamFn,
       buildTools: () => [{
-        name: "book_search",
+        name: "search_book",
         label: "检索本书",
         description: "",
         parameters: Type.Object({ query: Type.String() }),
@@ -1857,7 +1857,7 @@ describe("agent host", () => {
     ]);
     expect(rows[0]).toMatchObject({
       call_id: "call-1",
-      tool_name: "book_search",
+      tool_name: "search_book",
       title: "检索本书",
       arguments_json: '{"query":"测试 1"}',
       result_text: "检索结果 1",
@@ -2199,13 +2199,13 @@ describe("agent host", () => {
     expect(runRows).toEqual([{ exit_reason: "completed", rounds_used: 4, rounds_total: 50 }]);
   });
 
-  it("soft-blocks web_search beyond three calls per question while book tools keep working (T50)", async () => {
-    // 三次 web_search 用满额度后，第 4 次被软拒；书内工具照常可用。
+  it("soft-blocks search_web beyond three calls per question while book tools keep working (T50)", async () => {
+    // 三次 search_web 用满额度后，第 4 次被软拒；书内工具照常可用。
     const script: Array<{ tool: string; query: string }> = [
-      { tool: "web_search", query: "甲" },
-      { tool: "web_search", query: "乙" },
-      { tool: "web_search", query: "丙" },
-      { tool: "web_search", query: "丁" },
+      { tool: "search_web", query: "甲" },
+      { tool: "search_web", query: "乙" },
+      { tool: "search_web", query: "丙" },
+      { tool: "search_web", query: "丁" },
       { tool: "book_probe", query: "书内" },
     ];
     let calls = 0;
@@ -2228,7 +2228,7 @@ describe("agent host", () => {
       createStreamFn: () => fake.streamFn,
       buildTools: () => [
         {
-          name: "web_search",
+          name: "search_web",
           label: "联网搜索",
           description: "",
           parameters: Type.Object({ query: Type.String() }),
@@ -2259,7 +2259,7 @@ describe("agent host", () => {
     const { toolRows } = readRunRows();
     expect(toolRows.map((row) => row.status)).toEqual(["executed", "executed", "executed", "rejected", "executed"]);
     expect(String(toolRows[3]?.result_text)).toContain("联网额度已用完（3 次）");
-    expect(String(toolRows[3]?.result_text)).toContain("不要再调用 web_search");
+    expect(String(toolRows[3]?.result_text)).toContain("不要再调用 search_web");
     // 联网额度用满后书内工具照常可用（不同工具，不落入检出链）。
     expect(String(toolRows[4]?.result_text)).toContain("书内结果 书内");
     // 诊断里被拒的联网调用带「已达上限」标记。

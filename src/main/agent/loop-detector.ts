@@ -100,7 +100,7 @@ export function resultStubText(input: {
     ? `this result is byte-identical to the ${entry.toolName} result earlier this turn (tool_call_id ${entry.callId}) even with different arguments. The tool has no more to give. Refer to that result. Args of that call: ${entry.argsPreview}`
     : `this result is byte-identical to the ${entry.toolName} result earlier this turn (tool_call_id ${entry.callId}). Refer to that result; it has not changed. Args: ${entry.argsPreview}`;
   return input.hasImages
-    ? `${base} ...includes page images; re-call read_page_image with the same pages to fetch them.`
+    ? `${base} ...includes page images; re-call view_page with the same pages to fetch them.`
     : base;
 }
 

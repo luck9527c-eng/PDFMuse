@@ -52,16 +52,16 @@ describe("conversation controller", () => {
   it("maps tool events to readable status text", () => {
     const controller = createConversationController();
     controller.dispatch({ type: "run-started", runId: RUN_ID, sessionId: SESSION_ID, question: "问题" });
-    controller.dispatch({ type: "agent-event", event: { stream: "tool", phase: "start", runId: RUN_ID, callId: "c1", name: "book_search" } });
+    controller.dispatch({ type: "agent-event", event: { stream: "tool", phase: "start", runId: RUN_ID, callId: "c1", name: "search_book" } });
     expect(controller.getState().toolStatus).toBe("检索本书中...");
-    controller.dispatch({ type: "agent-event", event: { stream: "tool", phase: "end", runId: RUN_ID, callId: "c1", name: "book_search" } });
+    controller.dispatch({ type: "agent-event", event: { stream: "tool", phase: "end", runId: RUN_ID, callId: "c1", name: "search_book" } });
     expect(controller.getState().toolStatus).toBe("检索本书完成");
   });
 
   it("clears streaming and tool status on terminal lifecycle events", () => {
     const controller = createConversationController();
     controller.dispatch({ type: "run-started", runId: RUN_ID, sessionId: SESSION_ID, question: "问题" });
-    controller.dispatch({ type: "agent-event", event: { stream: "tool", phase: "start", runId: RUN_ID, callId: "c1", name: "book_search" } });
+    controller.dispatch({ type: "agent-event", event: { stream: "tool", phase: "start", runId: RUN_ID, callId: "c1", name: "search_book" } });
     expect(controller.getState().toolStatus).toBe("检索本书中...");
 
     const result = controller.dispatch({ type: "agent-event", event: lifecycleEvent(RUN_ID, "end") });

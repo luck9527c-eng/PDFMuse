@@ -36,7 +36,7 @@ import {
   type ReplayImageLoader,
 } from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, parseContextWindowError, toLlmModel, type ContextWindowError, type ResolvedModelConnection } from "./model-runtime.js";
-import { MAX_WEB_SEARCH_CALLS, type PageImageBudget, type ToolExecutionOutcome } from "./tool-registry.js";
+import { MAX_SEARCH_WEB_CALLS, type PageImageBudget, type ToolExecutionOutcome } from "./tool-registry.js";
 import {
   Agent,
   compact,
@@ -717,10 +717,10 @@ export function createAgentHost(options: AgentHostOptions) {
           const gate = guards.checkToolCall();
           if (gate.reject) return rejectWith(gate.reject);
           // 联网搜索子额度：执行即扣（模块缓存命中也扣——预算层不窥探工具内部，额度兼任反打转压力）。
-          if (tool.name === "web_search") {
+          if (tool.name === "search_web") {
             webSearchCalls += 1;
-            if (webSearchCalls > MAX_WEB_SEARCH_CALLS) {
-              return rejectWith(`联网额度已用完（${MAX_WEB_SEARCH_CALLS} 次），不要再调用 web_search，用已有材料和书内工具继续。`);
+            if (webSearchCalls > MAX_SEARCH_WEB_CALLS) {
+              return rejectWith(`联网额度已用完（${MAX_SEARCH_WEB_CALLS} 次），不要再调用 search_web，用已有材料和书内工具继续。`);
             }
           }
           const flightKey = `${tool.name}:${argsKeyOf(params)}`;
@@ -858,7 +858,7 @@ export function createAgentHost(options: AgentHostOptions) {
       const agent = new Agent({
         initialState: {
           systemPrompt,
-          // 常开图像输入：截图附件与 read_page_image 的工具结果图都可能在运行中出现，
+          // 常开图像输入：截图附件与 view_page 的工具结果图都可能在运行中出现，
           // 纯文本轮次不携带图块，声明能力本身无副作用。
           model: toLlmModel(connection, true),
           messages: turnMessages.slice(0, -1),

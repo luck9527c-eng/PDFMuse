@@ -29,7 +29,7 @@ function runSequence(calls: Array<{ callId: string; toolName?: string; params?: 
   const verdicts = [];
   let window: FingerprintEntry[] = [];
   for (const call of calls) {
-    const toolName = call.toolName ?? "book_search";
+    const toolName = call.toolName ?? "search_book";
     const params = call.params ?? { query: "同一检索" };
     const verdict = detectRepeat({ window, toolName, callId: call.callId, params, payload: call.payload });
     window = pushFingerprintEntry(window, entry(call.callId, toolName, params, call.payload));
@@ -134,10 +134,10 @@ describe("loop detector", () => {
   it("mixed chain keeps e counting and N wording separate", () => {
     // 窗口：同果异参一条 + 同果同参一条；再来同参同果 → e=3（链），N=2（同参）。
     const window = [
-      entry("c1", "book_search", { query: "甲" }, payload(BIG)),
-      entry("c2", "book_search", { query: "乙" }, payload(BIG)),
+      entry("c1", "search_book", { query: "甲" }, payload(BIG)),
+      entry("c2", "search_book", { query: "乙" }, payload(BIG)),
     ];
-    const verdict = detectRepeat({ window, toolName: "book_search", callId: "c3", params: { query: "乙" }, payload: payload(BIG) });
+    const verdict = detectRepeat({ window, toolName: "search_book", callId: "c3", params: { query: "乙" }, payload: payload(BIG) });
     expect(verdict).toMatchObject({ chainKind: "param-loop", e: 3, repeatCount: 2 });
     expect(verdict.warningText).toContain("第 2 次一模一样的调用");
   });
@@ -168,20 +168,20 @@ describe("loop detector", () => {
 
   it("image payloads hash and compare over image bytes and stubs append the re-fetch line", () => {
     const imageA = "a".repeat(800); // ≥512 字节载荷，e=2 起满足 stub 门槛
-    const first = entry("c1", "read_page_image", { pages: [3] }, payload("第 3 页原图说明", [imageA]));
+    const first = entry("c1", "view_page", { pages: [3] }, payload("第 3 页原图说明", [imageA]));
     const sameBytes = detectRepeat({
       window: [first],
-      toolName: "read_page_image",
+      toolName: "view_page",
       callId: "c2",
       params: { pages: [3] },
       payload: payload("第 3 页原图说明", [imageA]),
     });
     expect(sameBytes).toMatchObject({ chainKind: "param-loop", e: 2, delivery: "stub" });
-    expect(sameBytes.stubText).toContain("...includes page images; re-call read_page_image with the same pages to fetch them.");
+    expect(sameBytes.stubText).toContain("...includes page images; re-call view_page with the same pages to fetch them.");
     // 图块字节不同 → 新链。
     const differentImage = detectRepeat({
       window: [first],
-      toolName: "read_page_image",
+      toolName: "view_page",
       callId: "c3",
       params: { pages: [3] },
       payload: payload("第 3 页原图说明", ["b".repeat(800)]),
@@ -190,7 +190,7 @@ describe("loop detector", () => {
     // 文本相同但图块数不同 → 新链。
     const missingImage = detectRepeat({
       window: [first],
-      toolName: "read_page_image",
+      toolName: "view_page",
       callId: "c4",
       params: { pages: [3] },
       payload: payload("第 3 页原图说明", []),
@@ -205,10 +205,10 @@ describe("loop detector", () => {
     expect(hashPayload(payload(`${base.text}本问图片预算：已用 1/20 页。`))).not.toBe(hash);
     expect(hashPayload(base)).toBe(hash);
     // 宿主按「裸载荷入指纹、注解后置」执行——此处锁死：同裸载荷两次调用必同哈希。
-    const first = entry("c1", "read_page_image", { pages: [3] }, base);
+    const first = entry("c1", "view_page", { pages: [3] }, base);
     const second = detectRepeat({
       window: [first],
-      toolName: "read_page_image",
+      toolName: "view_page",
       callId: "c2",
       params: { pages: [3] },
       payload: base,
@@ -219,7 +219,7 @@ describe("loop detector", () => {
   it("args preview collapses whitespace and truncates to 120 chars", () => {
     const argsKey = argsKeyOf({ query: `甲${"乙丙丁 ".repeat(60)}` });
     const stub = resultStubText({
-      pointedTo: entry("c1", "book_search", argsKey, payload(BIG)),
+      pointedTo: entry("c1", "search_book", argsKey, payload(BIG)),
       resultLoop: false,
       hasImages: false,
     });

@@ -299,7 +299,7 @@ const modelServer = createServer((request, response) => {
                   index: 0,
                   id: "call-smoke-book",
                   type: "function",
-                  function: { name: "book_search", arguments: JSON.stringify({ query: "Chapter Two" }) },
+                  function: { name: "search_book", arguments: JSON.stringify({ query: "Chapter Two" }) },
                 }],
               },
             }],
@@ -956,7 +956,7 @@ try {
   const restoredConversationText = await waitForText(page.webSocketDebuggerUrl, "PDFMuse 冒烟流式回答已完成。");
   assert.match(restoredConversationText, /冒烟测试问题/, "the restored conversation is not rendered in the assistant panel");
 
-  // book_search 工具续轮：问题触发检索，回答带可点击的本书页码 Evidence。
+  // search_book 工具续轮：问题触发检索，回答带可点击的本书页码 Evidence。
   const toolAskStarted = await evaluate(
     page.webSocketDebuggerUrl,
     `(() => {
@@ -968,7 +968,7 @@ try {
     return true;
   })()`,
   );
-  assert.equal(toolAskStarted, true, "the book_search question could not be typed into the composer");
+  assert.equal(toolAskStarted, true, "the search_book question could not be typed into the composer");
   const toolAnswerText = await waitForText(page.webSocketDebuggerUrl, "第二章从本书第 2 页开始", 15_000);
   assert.match(toolAnswerText, /本书第 2 页/, "the clickable book evidence page tag is unavailable");
   const toolConversation = await evaluate(

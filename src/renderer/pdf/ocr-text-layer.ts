@@ -65,7 +65,7 @@ export function mountRecognizedTextLayer(viewer: HTMLElement, recognizedPage?: R
     const [x0, y0, x1, y1] = block.bbox;
     if (![x0, y0, x1, y1].every((value) => Number.isFinite(value))) continue;
     // 插图块：image_analysis=False 时 content 为空，但版面 bbox 准确——
-    // 以占位文本参与选中（Reader 划给 AI 后可经 read_page_image 查看原图）。
+    // 以占位文本参与选中（Reader 划给 AI 后可经 view_page 查看原图）。
     const isPlaceholderImage = block.type === "image" && !block.text.trim();
     if (!block.text.trim() && !isPlaceholderImage) continue;
     const span = document.createElement("span");
