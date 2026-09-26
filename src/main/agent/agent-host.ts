@@ -89,16 +89,7 @@ export type AgentHostOptions = {
     reportEvidence(evidence: ConversationEvidence[]): void;
     /** 本问（一次运行）共享的原图页预算：页数与次数钳制在工具层执行。 */
     pageBudget: PageImageBudget;
-    /** 本问 run id：检索召回「较早对话」时排除本轮自身消息。 */
-    runId?: string;
   }): AgentTool[];
-  /** 将已完成的会话消息交给检索模块；失败不得阻断回答。 */
-  indexConversationMessage?(bookId: string, message: {
-    id: string;
-    role: "reader" | "assistant";
-    body: string;
-    status: string;
-  }): Promise<void> | void;
   emit(event: AgentStreamEvent): void;
   /** 运行守卫注入（T50 测试）：Run Budget 总额、时限兜底与软收尾时限的生产默认值见 run-guards 常量。 */
   guardOptions?: RunGuardsOptions;
@@ -223,8 +214,6 @@ export function createAgentHost(options: AgentHostOptions) {
   const activeRuns = new Map<string, ActiveRun>();
   const runBooks = new Map<string, { bookId: string; sessionId: string }>();
   const cancelledBeforeStart = new Set<string>();
-  // 会话索引水位线：每次运行只把上次之后新增的完成消息交给索引模块，避免每个问题前全量重索引。
-  const indexedThrough = new Map<string, string>();
   // 运行诊断的内存环形缓冲：常开捕获，按书保留最近若干次运行。
   const diagnosticsStore = createDiagnosticsStore();
   // 撞窗自愈修正的生效窗口（ADR 0010）：provider 报告的真实上限，进程级全局生效，不写回用户配置。
@@ -601,32 +590,11 @@ export function createAgentHost(options: AgentHostOptions) {
       diagnosticsStore.record(bookId, collector.run);
     }
     const history = compacted.history;
-    // 索引需要看到完整的原始会话；压缩只影响发给模型的上下文窗口。水位线之后的消息才需要索引。
-    const watermark = indexedThrough.get(sessionId);
-    const watermarkIndex = watermark ? fullHistory.findIndex((message) => message.id === watermark) : -1;
-    for (const message of fullHistory.slice(watermarkIndex >= 0 ? watermarkIndex + 1 : 0)) {
-      if (message.body && message.status === "complete") {
-        await options.indexConversationMessage?.(bookId, {
-          id: message.id,
-          role: message.role,
-          body: message.body,
-          status: message.status,
-        });
-        indexedThrough.set(sessionId, message.id);
-      }
-    }
     if (cancelledBeforeStart.delete(runId)) {
       options.emit({ stream: "lifecycle", phase: "cancelled", runId, sessionId });
       return;
     }
     const readerMessage = store.appendMessage({ sessionId, runId, role: "reader", body: question, status: "complete", focus });
-    await options.indexConversationMessage?.(bookId, {
-      id: readerMessage.id,
-      role: readerMessage.role,
-      body: readerMessage.body,
-      status: readerMessage.status,
-    });
-    indexedThrough.set(sessionId, readerMessage.id);
 
     const llmMessages = await historyToLlmMessages(history, historyToolCalls, {
       question,
@@ -665,7 +633,6 @@ export function createAgentHost(options: AgentHostOptions) {
       reportEvidence,
       // 每问新建：页数额度与复用键随运行生命周期，下一问自动重置（次数上限已删除）。
       pageBudget: { pagesDelivered: 0, deliveredMedia: new Map() },
-      runId,
     }) ?? [];
 
     // 工具包装（T50）：捕获参数、结果与耗时进运行诊断；软收尾短拒、联网子额度、
@@ -1052,15 +1019,6 @@ export function createAgentHost(options: AgentHostOptions) {
       if (!assistantFailure && lastAnswerInput > 0) {
         store.saveSessionAnchor(sessionId, lastAnswerInput, connection.model, message.messageId);
       }
-      if (assistantFailure?.status !== "cancelled" && assistantBody) {
-        await options.indexConversationMessage?.(bookId, {
-          id: message.messageId,
-          role: "assistant",
-          body: assistantBody,
-          status: assistantFailure?.status ?? "complete",
-        });
-        indexedThrough.set(sessionId, message.messageId);
-      }
       options.emit({
         stream: "message",
         runId,
@@ -1195,7 +1153,6 @@ export function createAgentHost(options: AgentHostOptions) {
       }
       try {
         store.clearConversation(bookId);
-        indexedThrough.delete(store.findSession(bookId)?.id ?? "");
         return { ok: true as const };
       } catch {
         return { ok: false as const, code: "WRITE_ERROR" as const, message: "无法清空本书会话，请重试。" };

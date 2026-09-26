@@ -6,7 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createBookIndex, keepStrongHits, pageTextSemanticFactor, splitSearchTerms, tokenizeForIndex, type EmbeddingProvider } from "./book-index.js";
 import { createLibraryModule } from "../library.js";
-import { createSessionStore } from "./session-store.js";
 
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
 
@@ -261,104 +260,32 @@ describe("book index", () => {
     expect(onEmbeddingError).toHaveBeenCalledWith(failure);
   });
 
-  it("returns earlier conversation messages as a separate source", async () => {
+  it("对话召回腿已退役：存量 conversation 向量行是死数据，不进任何检索腿（T54）", async () => {
     index.close();
     const provider: EmbeddingProvider = {
       model: "test-embedding-v1",
-      embed: async (inputs) => inputs.map((input) => (
-        input.includes("记忆") || input.includes("回顾") ? [0, 1] : [1, 0]
-      )),
+      embed: async (inputs) => inputs.map(() => [0, 1]),
     };
-    const sessionStore = createSessionStore(dataHome);
     index = createBookIndex(dataHome, {
       getEmbeddingProvider: () => provider,
       getBookSource: (bookId) => library.getBookSource(bookId),
-      getConversationSearch: () => sessionStore.searchMessages,
-      getRunMessageIds: (id, runId) => sessionStore.listRunMessageIds(id, runId),
     });
     await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
-    const session = sessionStore.ensureSession(bookId);
-    // 语义行的 source_id 用库里的消息行 id（与生产 indexConversationMessage 的接线一致）。
-    const seededAnswer = sessionStore.appendMessage({
-      sessionId: session.id,
-      runId: "run-1",
-      role: "assistant",
-      body: "这是一条可供后续回顾的记忆",
-      status: "complete",
-    });
-    sessionStore.appendMessage({
-      sessionId: session.id,
-      runId: "run-1",
-      role: "assistant",
-      body: "失败回答不可回顾",
-      status: "error",
-    });
-    await index.indexConversationMessage(bookId, {
-      id: seededAnswer.id,
-      role: "assistant",
-      body: "这是一条可供后续回顾的记忆",
-      status: "complete",
-    });
-    // 上一轮的语义腿召回：正文不含检索词「回顾」，只有向量腿能召回它。
-    const seededSleep = sessionStore.appendMessage({
-      sessionId: session.id,
-      runId: "run-1",
-      role: "assistant",
-      body: "记忆在睡眠中巩固",
-      status: "complete",
-    });
-    await index.indexConversationMessage(bookId, {
-      id: seededSleep.id,
-      role: "assistant",
-      body: "记忆在睡眠中巩固",
-      status: "complete",
-    });
-    const currentQuestion = sessionStore.appendMessage({
-      sessionId: session.id,
-      runId: "run-2",
-      role: "reader",
-      body: "本轮提问也提到回顾",
-      status: "complete",
-    });
-    await index.indexConversationMessage(bookId, {
-      id: currentQuestion.id,
-      role: "reader",
-      body: "本轮提问也提到回顾",
-      status: "complete",
-    });
-    // 本轮问题的另一种形状：不含检索词，只会从语义腿召回——同样必须被排除。
-    const currentFollowup = sessionStore.appendMessage({
-      sessionId: session.id,
-      runId: "run-2",
-      role: "reader",
-      body: "帮我把刚才的记忆再展开讲讲",
-      status: "complete",
-    });
-    await index.indexConversationMessage(bookId, {
-      id: currentFollowup.id,
-      role: "reader",
-      body: "帮我把刚才的记忆再展开讲讲",
-      status: "complete",
-    });
+    // 直接落一行 conversation 语义向量（历史库里的真实形态）：检索必须无视它。
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    const timestamp = new Date().toISOString();
+    database.prepare(`
+      INSERT INTO semantic_embeddings
+        (book_id, source, source_id, page, text, vector_json, model, dimensions, content_hash, created_at, updated_at)
+      VALUES (?, 'conversation', 'legacy-message', NULL, '这是一条存量会话嵌入，正文含 回顾 一词', '[0,1]', ?, 2, 'h', ?, ?)
+    `).run(bookId, provider.model, timestamp, timestamp);
+    database.close();
 
-    const search = await index.search(bookId, "回顾", 8, undefined, undefined, "run-2");
+    const search = await index.search(bookId, "回顾", 8);
     expect(search.status).toBe("ok");
     if (search.status !== "ok") return;
-    // 当前 run 的消息不召回：本轮问题刚落库，召回它是纯噪声且诱导重复检索；
-    // 关键词腿（currentQuestion）与语义腿（currentFollowup）都要排除。
-    const conversationHits = search.hits.filter((hit) => hit.source === "conversation");
-    expect(conversationHits).toHaveLength(2);
-    expect(conversationHits.map((hit) => hit.sourceId))
-      .toEqual(expect.arrayContaining([seededAnswer.id, seededSleep.id]));
-    expect(conversationHits[0]?.page).toBeUndefined();
-
-    // 不排除当前 run 时四条会话候选都在。
-    const withoutCurrentRun = await index.search(bookId, "回顾", 8);
-    if (withoutCurrentRun.status === "ok") {
-      expect(withoutCurrentRun.hits.filter((hit) => hit.source === "conversation").map((hit) => hit.sourceId))
-        .toEqual(expect.arrayContaining([seededAnswer.id, currentQuestion.id, currentFollowup.id, seededSleep.id]));
-    }
-    sessionStore.close();
+    expect(search.hits.filter((hit) => hit.source === "conversation")).toHaveLength(0);
+    expect(search.hits.every((hit) => hit.source === "pdf")).toBe(true);
   });
 
   it("识别页插图块出占位行：进 readPages 全文、不进 FTS 检索（T53）", async () => {

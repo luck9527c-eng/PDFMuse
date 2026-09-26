@@ -28,8 +28,6 @@ export type ToolExecutionContext = {
   bookId: string;
   focus?: ReadingFocus;
   signal?: AbortSignal;
-  /** 本问的 run id：检索召回「较早对话」时排除本轮自身消息（本轮问题刚落库，召回它是纯噪声）。 */
-  runId?: string;
   reportEvidence(evidence: PdfEvidence[]): void;
   bookIndex: BookIndex;
   /** 页面渲染模块：视觉工具经此取页面原图，检索模块不再承担渲染。 */
@@ -84,16 +82,15 @@ const searchBookSchema = Type.Object({
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, description: "返回的命中数量上限，默认 6" })),
 });
 
-/** search_book：整本书混合检索，返回带来源的 PDF 摘录或较早会话候选。 */
+/** search_book：整本书混合检索，返回带页码的原文摘录。 */
 function createSearchBookTool(): RegisteredTool {
   return {
     name: "search_book",
     title: "检索本书",
     description:
-      "按关键词在整本书内定位相关页码（关键词与语义混合检索，返回带来源的原文摘录）。"
-      + "标准顺序：先用本工具把主题定位到页码，再用 read_pages 读取整页原文作答。"
-      + "本工具没有每问次数限制，多主题的复杂问题可以从不同角度反复检索，把全书相关处查完。"
-      + "只有检索较早对话内容时才单独使用本工具；不要用本工具替代 read_pages 的整页阅读——检索摘录只有片段，讲解和总结需要整页上下文。",
+      "按关键词在整本书内定位相关页码，返回带来源的原文摘录（关键词与语义混合检索）。"
+      + "页码为 PDF 页序号（从 1 开始），不是书内印刷页码。"
+      + "不确定相关内容在哪几页时用它定位；检索摘录只是片段，作答和讲解等应基于 read_pages 的整页原文。",
     parameters: searchBookSchema,
     async execute(input, ctx) {
       // 参数已由 agent-loop 的 validateToolArguments 按 schema 校验；这里只做 schema 表达不了的语义收敛。
@@ -104,18 +101,13 @@ function createSearchBookTool(): RegisteredTool {
 
       await ctx.bookIndex.ensureIndexed(ctx.bookId, () => ctx.bookIndex.loadBookByBookId(ctx.bookId), ctx.signal);
 
-      const outcome = await ctx.bookIndex.search(ctx.bookId, keyword, hitLimit, ctx.focus, ctx.signal, ctx.runId);
+      const outcome = await ctx.bookIndex.search(ctx.bookId, keyword, hitLimit, ctx.focus, ctx.signal);
       if (outcome.status === "unavailable") {
         return { displaySummary: `检索「${keyword}」不可用`, contentText: outcome.note };
       }
-      const pdfHits = outcome.hits.filter((hit) => hit.source !== "conversation");
-      const lines = outcome.hits.map((hit) => (
-        hit.source === "conversation"
-          ? `较早对话：${hit.snippet}`
-          : `第 ${hit.page ?? "未知"} 页（相关度 ${(hit.score ?? 0).toFixed(2)}）：${hit.snippet}`
-      ));
+      const lines = outcome.hits.map((hit) => `第 ${hit.page ?? "未知"} 页（相关度 ${(hit.score ?? 0).toFixed(2)}）：${hit.snippet}`);
       const evidence: PdfEvidence[] = outcome.hits.flatMap((hit) => (
-        hit.source === "conversation" || hit.page === undefined
+        hit.page === undefined
           ? []
           : [{ source: "pdf" as const, page: hit.page, snippet: hit.snippet, trust: "trusted" as const, score: hit.score }]
       ));
@@ -123,7 +115,7 @@ function createSearchBookTool(): RegisteredTool {
         outcome.status === "partial" ? outcome.note : "",
         outcome.retrievalMode === "fts-only" ? "当前未完成向量检索，结果仅基于关键词匹配。" : "",
       ].filter(Boolean).join("\n\n");
-      // 未命中本书页面（空命中或只召回较早对话）时把下一步写进结果：模型常在空命中后
+      // 未命中本书页面时把下一步写进结果：模型常在空命中后
       // 空转续查或放弃整页阅读，这比只靠工具描述自觉更可靠。
       const currentPage = ctx.focus?.currentPage;
       const readPagesHint = currentPage !== undefined
@@ -131,9 +123,7 @@ function createSearchBookTool(): RegisteredTool {
         : "如需讲解，请改用 read_pages 读取相关章节的整页原文。";
       const body = lines.length === 0
         ? `没有在书中找到相关内容。请基于已有上下文回答，并明确说明书中未检索到。\n\n${readPagesHint}`
-        : pdfHits.length === 0
-          ? `${lines.join("\n\n")}\n\n（以上仅为较早对话摘录，未命中本书页面。${readPagesHint}）`
-          : lines.join("\n\n");
+        : lines.join("\n\n");
       const contentText = `${header}${body}`.slice(0, CONTENT_MAX_LENGTH);
       return {
         displaySummary: `已检索「${keyword}」，命中 ${outcome.hits.length} 处${outcome.retrievalMode === "hybrid" ? "（混合检索）" : ""}`,
@@ -148,7 +138,7 @@ const readPagesSchema = Type.Object({
   pages: Type.Array(Type.Integer({ minimum: 1 }), {
     minItems: 1,
     maxItems: 8,
-    description: "要读取的 PDF 页码列表，最多 8 页；可传入不连续的页码（章节跨页或跳页时）",
+    description: "要读取的 PDF 页码列表，最多 8 页，可传入不连续的页码",
   }),
   offset: Type.Optional(Type.Integer({
     minimum: 0,
@@ -162,9 +152,9 @@ function createReadPagesTool(): RegisteredTool {
     name: "read_pages",
     title: "读取页面",
     description:
-      "按页码列表整页读取文字，一次可读多页、支持不连续页码、没有每问次数限制。"
-      + "讲解、总结、复习某个小节或某几页内容时优先用本工具读取原文（章节跨页时把涉及的页码一并传入）；范围未知时先用 search_book 把主题定位到页码，再回来用本工具精读。"
-      + `单次最多返回 ${READ_PAGES_MAX_CHARS.toLocaleString("en-US")} 字符：同一批页码的全文超限时从头部截断，结果末尾会给出续读 offset，用相同页码带上该 offset 即可继续读取，直到提示已读完全文。`,
+      "按 PDF 页码列表整页读取文字（页码为页序号，从 1 开始，与书内印刷页码不同；扫描页读取 OCR 识别文本），一次可读多页、支持不连续页码。"
+      + "讲解、总结、复习某小节或某几页时用它读原文；不知道页码时先用 search_book 定位。"
+      + `单次只返回本次请求各页拼接全文的前 ${READ_PAGES_MAX_CHARS.toLocaleString("en-US")} 字符，末尾附续读 offset——offset 是该拼接全文中的字符偏移（不是页码偏移），用相同页码带上它继续读取省略的部分。`,
     parameters: readPagesSchema,
     async execute(input, ctx) {
       const { pages, offset } = input as Static<typeof readPagesSchema>;
@@ -227,7 +217,8 @@ function createSearchWebTool(): RegisteredTool {
     name: "search_web",
     title: "联网搜索",
     description:
-      `联网搜索网络资料（每问最多 ${MAX_SEARCH_WEB_CALLS} 次，额度独立于书内工具）。当书内检索不足以回答、或问题涉及书外事实（作者生平、出版背景、外部概念对照、时事）时使用。回答中引用网络内容时必须附上来源链接，并明确说明这不是本书内容。`,
+      "联网搜索网络资料。优先使用书内工具获取本书内容，本书不足或问题涉及书外事实（作者生平、出版背景、外部概念对照、时事等）时才用本工具。"
+      + "回答中引用网络内容必须附来源链接并说明这不是本书内容；书中观点与网络信息冲突时，分别说明双方及各自出处。",
     parameters: searchWebSchema,
     async execute(input, ctx) {
       if (!ctx.webSearch) {
@@ -257,7 +248,7 @@ const viewPageSchema = Type.Object({
   pages: Type.Array(Type.Integer({ minimum: 1 }), {
     minItems: 1,
     maxItems: 4,
-    description: "要查看原图的 PDF 页码列表；请只列先经检索定位、确需核对的页",
+    description: "要查看原图的 PDF 页码列表",
   }),
   figure: Type.Optional(Type.Integer({
     minimum: 1,
@@ -325,17 +316,15 @@ async function renderWithinHardLimits(
   throw new Error("页面原图超出尺寸硬限制，降采样后仍超限。");
 }
 
-/** view_page：渲染页面原图（整页或单幅插图裁剪）发给模型，精确查看公式、图表与结构。每问受页数额度钳制（无次数上限）。 */
+/** view_page：渲染页面原图（整页或单幅插图裁剪）发给模型，查看文本层没有的内容。 */
 function createViewPageTool(): RegisteredTool {
   return {
     name: "view_page",
     title: "查看页面原图",
     description:
-      "渲染指定页的原图并随结果直接发送，用于精确查看 OCR 文本无法保留的内容：数学公式（分数、根号、上下标）、表格结构、图表。"
-      + "当答案依赖识别页中的关键公式或数字、且文本形式可疑（符号异常、等式不成立、上下文矛盾）时，可用本工具查看该页原图核对；原生文本页无需核对。"
-      + "识别页的 read_pages 文本中每幅插图带 [插图 N·约占页面 X%] 占位行：需要读图时优先只传该页页码并带 figure=N 取单幅裁剪（更清晰），核对公式或对照整页版式时才看整页。"
-      + "先用 search_book、read_pages 或上一轮回答引用的原文把范围定位到具体页码后再调用本工具；默认只查看 1 页，确需相邻页对照或跨页内容时才增加。"
-      + `本问内图片查看按页额度计量（整页与单幅插图裁剪各计 1 页，共 ${MAX_PAGE_IMAGE_PAGES} 页，已看过的图重复查看不消耗额度），没有次数限制；额度用完后本工具不再出图，请把额度花在最需要的图上。`,
+      "渲染指定页或其中一幅插图的原图并随结果发送，用于查看文本层没有的内容：识别页的图片、照片、图表在文本中只有 [插图 N·…] 占位。"
+      + "读者要求查看或解释某个图、表时直接调用；此外，公式与表格通常已完整转为文本，仅当答案依赖关键公式或数字、且文本形式可疑（符号异常、等式不成立、上下文矛盾等）时才看原图核对——原生文本页的复杂表格与公式在纯文本中同样可能失真。"
+      + "占位行标明各页插图编号（页内编号，从 1 开始）：读图优先只传该页页码并带 figure=N 取单幅裁剪（更清晰）；核对公式或对照整页版式才看整页。",
     parameters: viewPageSchema,
     async execute(input, ctx) {
       const { pages, figure } = input as Static<typeof viewPageSchema>;

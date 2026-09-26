@@ -109,10 +109,6 @@ export type BookIndexOptions = {
   getBookSource?(bookId: string): BookSource | undefined;
   /** Recognized Text 行最小读接口（recognized_pages 表属 OCR）：原生文本不足时兜底取识别行。 */
   readRecognizedBlocks?(bookId: string, page: number): ReadonlyArray<MineruBlock> | undefined;
-  /** 会话检索最小读接口（会话表属会话存储）：懒取，组装根中会话存储晚于本模块创建。 */
-  getConversationSearch?(): ((bookId: string, likePattern: string) => Array<{ id: string; body: string }>) | undefined;
-  /** 当前 run 的会话消息 id 只读接口（会话表属会话存储）：会话召回的关键词与语义两腿都排除本轮自身消息。 */
-  getRunMessageIds?(bookId: string, runId: string): string[];
 };
 
 type EmbeddingRow = {
@@ -124,13 +120,6 @@ type EmbeddingRow = {
   model: string;
   dimensions: number;
   content_hash: string;
-};
-
-type ConversationIndexInput = {
-  id: string;
-  role: "reader" | "assistant";
-  body: string;
-  status?: string;
 };
 
 const DEFAULT_EMBEDDING_BATCH_SIZE = 32;
@@ -309,10 +298,6 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       content_hash = excluded.content_hash,
       updated_at = excluded.updated_at
   `);
-  const conversationEmbeddingStatement = database.prepare(`
-    SELECT source_id FROM semantic_embeddings
-    WHERE book_id = ? AND source = 'conversation' AND source_id = ?
-  `);
 
   async function embeddingProvider() {
     return options.embeddingProvider ?? options.getEmbeddingProvider?.();
@@ -400,42 +385,6 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       return true;
     } catch (error) {
       options.onEmbeddingError?.(error);
-      return false;
-    }
-  }
-
-  async function indexConversationMessage(bookId: string, input: ConversationIndexInput) {
-    if (input.status && input.status !== "complete") return false;
-    const text = input.body.trim();
-    if (!text || !input.id) return false;
-    const provider = await embeddingProvider();
-    if (!provider) return false;
-    const existing = conversationEmbeddingStatement.get(bookId, input.id) as { source_id: string } | undefined;
-    const hash = contentHash(text);
-    if (existing) {
-      const current = embeddingRows(bookId).find((row) => row.source === "conversation" && row.source_id === input.id);
-      if (current?.model === provider.model && current.content_hash === hash) return true;
-    }
-    try {
-      const vectors = await provider.embed([text]);
-      const vector = vectors[0];
-      if (!vector || vector.length === 0 || !vector.every((value) => Number.isFinite(value))) return false;
-      const timestamp = new Date().toISOString();
-      embeddingUpsertStatement.run(
-        bookId,
-        "conversation",
-        input.id,
-        null,
-        text,
-        JSON.stringify(vector),
-        provider.model,
-        vector.length,
-        hash,
-        timestamp,
-        timestamp,
-      );
-      return true;
-    } catch {
       return false;
     }
   }
@@ -581,8 +530,6 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       limit = 6,
       focus?: ReadingFocus,
       signal?: AbortSignal,
-      /** 当前 run 的会话消息不进「较早对话」召回——那是本轮问题本身，召回只会诱导重复检索。 */
-      excludeRunId?: string,
     ): Promise<BookSearchOutcome> {
       const trimmed = query.trim();
       if (!trimmed) return { status: "unavailable", note: "检索词为空。" };
@@ -672,23 +619,6 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
         addCandidate({ source: "pdf", sourceId: `${page.page}:0`, page: page.page, text: page.text }, lexical);
       }
 
-      // 早期对话同样是候选来源；经会话存储的读接口查询，未接线时只用 PDF 候选。
-      // 当前 run 的消息（本轮问题刚落库）在关键词与语义两腿都排除——本轮问题未必包含
-      // 检索词（问「请假制度」、搜「年假」），只按 LIKE 命中过滤会从语义腿漏进来。
-      const conversationSearch = options.getConversationSearch?.();
-      const runMessageIds = new Set<string>();
-      if (excludeRunId) {
-        for (const id of options.getRunMessageIds?.(bookId, excludeRunId) ?? []) runMessageIds.add(id);
-      }
-      if (conversationSearch) {
-        for (const term of (singleTerm ? [trimmed] : terms)) {
-          for (const hit of conversationSearch(bookId, likePattern(term))) {
-            if (runMessageIds.has(hit.id)) continue;
-            addCandidate({ source: "conversation", sourceId: hit.id, text: hit.body }, 0.9);
-          }
-        }
-      }
-
       let retrievalMode: "hybrid" | "fts-only" = "fts-only";
       const provider = await embeddingProvider();
       let queryVector: readonly number[] | undefined;
@@ -708,11 +638,12 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       if (queryVector) {
         const rows = embeddingRows(bookId);
         for (const row of rows) {
-          if (row.source === "conversation" && runMessageIds.has(row.source_id)) continue;
+          // 对话召回腿已退役（T54）：存量 conversation 向量行是死数据，不参与检索。
+          if (row.source === "conversation") continue;
           const vector = parseVector(row.vector_json);
           if (!vector || row.model !== provider?.model || row.dimensions !== queryVector.length) continue;
           // 短页/目录页（点导引行堆出来的低信息密度页）向量不可靠，按有效文本长度折减。
-          const factor = row.source === "pdf" ? pageTextSemanticFactor(row.text) : 1;
+          const factor = pageTextSemanticFactor(row.text);
           const key = `${row.source}:${row.source === "pdf" ? row.page : row.source_id}`;
           const existing = candidates.get(key);
           const semantic = cosineSimilarity(queryVector, vector) * factor;
@@ -789,8 +720,6 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     ensureEmbeddings,
 
     indexRecognizedPage,
-
-    indexConversationMessage,
 
     /** 按书库记录读取原文件字节（含已记住的密码）；原文件只读，永不修改。 */
     async loadBookByBookId(bookId: string) {

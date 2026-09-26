@@ -253,20 +253,6 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
     SET status = 'cancelled', error_message = ?, updated_at = ?
     WHERE status = 'streaming'
   `);
-  const searchMessagesStatement = database.prepare(`
-    SELECT m.id, m.body
-    FROM agent_messages m
-    JOIN agent_sessions s ON s.id = m.session_id
-    WHERE s.book_id = ? AND m.role IN ('reader', 'assistant')
-      AND m.status = 'complete' AND m.body LIKE ?
-    ORDER BY m.created_at DESC
-    LIMIT 20
-  `);
-  const listRunMessageIdsStatement = database.prepare(`
-    SELECT m.id FROM agent_messages m
-    JOIN agent_sessions s ON s.id = m.session_id
-    WHERE s.book_id = ? AND m.run_id = ?
-  `);
 
   function now() {
     return new Date().toISOString();
@@ -333,16 +319,6 @@ export function createSessionStore(dataHome: string, options: SessionStoreOption
         database.exec("ROLLBACK");
         throw error;
       }
-    },
-
-    /** 会话检索最小读接口（ADR 0007）：检索模块的早期对话召回经此查询，不直读会话表。 */
-    searchMessages(bookId: string, likePattern: string): Array<{ id: string; body: string }> {
-      return searchMessagesStatement.all(bookId, likePattern) as Array<{ id: string; body: string }>;
-    },
-
-    /** 指定 run 的消息 id（bookId 归属随 join 校验）：检索模块的会话腿排除当前轮自我召回用。 */
-    listRunMessageIds(bookId: string, runId: string): string[] {
-      return (listRunMessageIdsStatement.all(bookId, runId) as Array<{ id: string }>).map((row) => row.id);
     },
 
     /** 每书数据清理钩子：在调用方提供的连接上删除本书会话与消息（消息先删以满足外键）。 */

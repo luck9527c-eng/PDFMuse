@@ -8,7 +8,6 @@ import { createLibraryModule } from "../library.js";
 import { createPageRenderer } from "../page-render.js";
 import { createToolRegistry, type PageImageBudget } from "./tool-registry.js";
 import { validateToolArguments } from "./openclaw-core.js";
-import { createSessionStore } from "./session-store.js";
 import { createToolMedia } from "../tool-media.js";
 
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
@@ -134,22 +133,52 @@ describe("tool registry", () => {
     expect(content.filter((block) => block.type === "image")).toHaveLength(2);
   });
 
-  it("steers view_page to locate first and default one page", () => {
+  it("describes view_page as the responsibility-scoped tool without invitations or procedures (T54)", () => {
     const registry = createToolRegistry();
     const description = registry.buildAgentTools(context)
       .find((item) => item.name === "view_page")!.description;
-    expect(description).toContain("默认只查看 1 页");
-    expect(description).toContain("定位");
-    expect(description).toContain("额度");
-    // 旧的「最多 4 页」数量邀请与次数上限措辞不得回流。
-    expect(description).not.toMatch(/最多\s*4\s*页/);
-    expect(description).toContain("没有次数限制");
-    // 保守核对指引（T52）：可疑才核对，原生文本页免核对。
+    // 职责要素：文本层没有的内容、读者点名触发、可疑核对、figure 页内寻址。
+    expect(description).toContain("文本层没有的内容");
+    expect(description).toContain("[插图 N·…] 占位");
+    expect(description).toContain("读者要求查看或解释某个图、表时直接调用");
     expect(description).toContain("文本形式可疑");
-    expect(description).toContain("原生文本页无需核对");
-    // 插图级寻址（T53）：描述教模型从占位行取编号走 figure 参数。
+    expect(description).toContain("原生文本页的复杂表格与公式在纯文本中同样可能失真");
+    expect(description).toContain("公式与表格通常已完整转为文本");
+    expect(description).toContain("页内编号，从 1 开始");
     expect(description).toContain("figure=N");
-    expect(description).toContain("占位行");
+    // 邀请式/流程式/不可判前提/失实措辞不得回流（T54 禁词）。
+    expect(description).not.toContain("没有次数限制");
+    expect(description).not.toContain("额度");
+    expect(description).not.toContain("默认只查看 1 页");
+    expect(description).not.toContain("定位准");
+    expect(description).not.toContain("无法保留");
+  });
+
+  it("describes the three text tools with responsibility scope and page-number conventions (T54)", () => {
+    const registry = createToolRegistry();
+    const descriptions = new Map(registry.buildAgentTools(context).map((tool) => [tool.name, tool.description]));
+    const searchBook = descriptions.get("search_book")!;
+    expect(searchBook).toContain("定位相关页码");
+    expect(searchBook).toContain("页码为 PDF 页序号（从 1 开始），不是书内印刷页码");
+    expect(searchBook).toContain("检索摘录只是片段");
+    expect(searchBook).not.toContain("没有每问次数限制");
+    expect(searchBook).not.toContain("标准顺序");
+    expect(searchBook).not.toContain("反复检索");
+
+    const readPages = descriptions.get("read_pages")!;
+    expect(readPages).toContain("页序号，从 1 开始");
+    expect(readPages).toContain("前 20,000 字符");
+    expect(readPages).toContain("字符偏移（不是页码偏移）");
+    expect(readPages).toContain("OCR 识别文本");
+    expect(readPages).not.toContain("没有每问次数限制");
+    expect(readPages).not.toContain("章节跨页");
+    expect(readPages).not.toContain("从头部截断");
+
+    const searchWeb = descriptions.get("search_web")!;
+    expect(searchWeb).toContain("优先使用书内工具");
+    expect(searchWeb).toContain("冲突时，分别说明双方及各自出处");
+    expect(searchWeb).not.toContain("每问最多");
+    expect(searchWeb).not.toContain("额度");
   });
 
   it("clamps view_page to the twenty-page per-question quota with a note and echo annotation", async () => {
@@ -405,7 +434,7 @@ describe("tool registry", () => {
     expect(text).toContain("没有在书中找到相关内容");
   });
 
-  it("points to read_pages when a search misses the book or only recalls older conversation", async () => {
+  it("points to read_pages when a search misses the book", async () => {
     const registry = createToolRegistry();
     const tool = registry.buildAgentTools(() => ({ ...context(), focus: { currentPage: 10 } }))[0]!;
 
@@ -415,31 +444,6 @@ describe("tool registry", () => {
     expect(emptyText).toContain("没有在书中找到相关内容");
     expect(emptyText).toContain("read_pages");
     expect(emptyText).toContain("第 10 页");
-
-    // 只召回较早对话：同样未命中本书页面，提示读整页而不是继续检索。
-    const sessionStore = createSessionStore(dataHome);
-    const session = sessionStore.ensureSession(bookId);
-    sessionStore.appendMessage({
-      sessionId: session.id,
-      runId: "old-run",
-      role: "assistant",
-      body: "上次聊过 极冷门词组 的含义",
-      status: "complete",
-    });
-    const conversationIndex = createBookIndex(dataHome, {
-      getBookSource: (id) => library.getBookSource(id),
-      getConversationSearch: () => sessionStore.searchMessages,
-    });
-    const conversationTool = registry.buildAgentTools(() => (
-      { ...context(), bookIndex: conversationIndex, focus: { currentPage: 10 } }
-    ))[0]!;
-    const onlyConversation = await conversationTool.execute("call-hint-1", { query: "极冷门词组" });
-    const onlyText = (onlyConversation.content[0] as { text: string }).text;
-    expect(onlyText).toContain("较早对话");
-    expect(onlyText).toContain("未命中本书页面");
-    expect(onlyText).toContain("read_pages");
-    sessionStore.close();
-    conversationIndex.close();
   });
 
   it("reuses the persisted index across executions", async () => {

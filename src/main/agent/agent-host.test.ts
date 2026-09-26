@@ -1184,32 +1184,6 @@ describe("agent host", () => {
     persisted.close();
   });
 
-  it("indexes only newly completed messages per run via the watermark", async () => {
-    const indexed: Array<{ role: string; body: string }> = [];
-    const streamFns = ["回答一", "回答二", "回答三"].map((body) => createFakeStreamFn(({ push }) => {
-      push({ type: "start", partial: assistantMessage("") });
-      push({ type: "done", reason: "stop", message: assistantMessage(body) });
-    }));
-    let call = 0;
-    buildHost({
-      createStreamFn: () => streamFns[call++]!.streamFn,
-      indexConversationMessage: (_bookId, message) => indexed.push({ role: message.role, body: message.body }),
-    });
-
-    let finishedRuns = 0;
-    for (const question of ["问题一", "问题二", "问题三"]) {
-      finishedRuns += 1;
-      const result = await startRun(question);
-      expect(result.ok).toBe(true);
-      await waitFor(() => lifecyclePhase(events).filter((phase) => phase === "end").length >= finishedRuns);
-    }
-
-    // 历史消息不重复索引：每轮只新增该轮的问与答。
-    expect(indexed.map((item) => item.body)).toEqual([
-      "问题一", "回答一", "问题二", "回答二", "问题三", "回答三",
-    ]);
-  });
-
   it("captures run diagnostics for requests, tool calls and usage", async () => {
     const library = createLibraryModule(dataHome);
     const bookIndex = createBookIndex(dataHome, { getBookSource: (bookId) => library.getBookSource(bookId) });
@@ -1423,15 +1397,13 @@ describe("agent host", () => {
     expect(evidence.some((item) => item.page === 29)).toBe(true);
   });
 
-  it("passes current-turn screenshot blocks to the model without indexing them", async () => {
+  it("passes current-turn screenshot blocks to the model", async () => {
     const fake = createFakeStreamFn(({ push }) => {
       push({ type: "start", partial: assistantMessage("") });
       push({ type: "done", reason: "stop", message: assistantMessage("看到了截图") });
     });
-    const indexed: Array<{ role: string; body: string }> = [];
     buildHost({
       createStreamFn: () => fake.streamFn,
-      indexConversationMessage: (_bookId, message) => indexed.push({ role: message.role, body: message.body }),
     });
     const result = await host.start({
       bookId: BOOK_ID,
@@ -1449,10 +1421,6 @@ describe("agent host", () => {
     expect(current?.content).toEqual([
       expect.objectContaining({ type: "text", text: expect.stringContaining("请看这张图") }),
       { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
-    ]);
-    expect(indexed).toEqual([
-      { role: "reader", body: "请看这张图" },
-      { role: "assistant", body: "看到了截图" },
     ]);
   });
 

@@ -143,9 +143,6 @@ app.whenReady().then(async () => {
       },
     });
     closeOcr = ocr.close;
-    // 会话检索读接口晚接（会话存储在检索模块之后创建），与 getEmbeddingProvider 同为懒取。
-    let searchConversationMessages: ((bookId: string, likePattern: string) => Array<{ id: string; body: string }>) | undefined;
-    let listRunMessageIds: ((bookId: string, runId: string) => string[]) | undefined;
     const bookIndex = createBookIndex(startupPreflight.dataHome, {
       onEmbeddingError: (error) => {
         const diagnostic = error instanceof Error
@@ -163,8 +160,6 @@ app.whenReady().then(async () => {
       },
       getBookSource: (bookId) => library.getBookSource(bookId),
       readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
-      getConversationSearch: () => searchConversationMessages,
-      getRunMessageIds: (bookId, runId) => listRunMessageIds?.(bookId, runId) ?? [],
     });
     closeBookIndex = bookIndex.close;
     // 页面渲染独立模块（T34）：OCR 链路、视觉工具与目录 AI 共用，检索模块不再依赖 canvas。
@@ -172,8 +167,6 @@ app.whenReady().then(async () => {
     const sessionStore = createSessionStore(startupPreflight.dataHome, {
       deleteConversationEmbeddings: bookIndex.deleteConversationEmbeddings,
     });
-    searchConversationMessages = sessionStore.searchMessages;
-    listRunMessageIds = sessionStore.listRunMessageIds;
     const loadChatConnection = async (): Promise<ResolvedModelConnection | undefined> => {
       const config = await readAppConfig(configPath);
       return config.chat
@@ -331,7 +324,6 @@ app.whenReady().then(async () => {
         focus: context.focus,
         reportEvidence: context.reportEvidence,
         pageBudget: context.pageBudget,
-        runId: context.runId,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
         renderRegionImage: pageRenderer.renderRegion,
@@ -339,9 +331,6 @@ app.whenReady().then(async () => {
         loadPageImage: toolMedia.loadPageImage,
         webSearch,
       })),
-      indexConversationMessage: async (bookId, message) => {
-        await bookIndex.indexConversationMessage(bookId, message);
-      },
     });
     closeAgentHost = agentHost.close;
     const invalidLibraryMutation = (): LibraryMutationResult => ({
@@ -480,10 +469,6 @@ app.whenReady().then(async () => {
     ipcMain.handle("ocr:get-page", (_event, bookId: unknown, page: unknown) => (
       isOwnedBook(bookId) && typeof page === "number" ? ocr.getPage(bookId, page) : undefined
     ));
-    ipcMain.handle("book:search", async (_event, bookId: unknown, query: unknown, limit: unknown) => {
-      if (!isOwnedBook(bookId) || typeof query !== "string") return { status: "unavailable", hits: [], indexedPages: 0, totalPages: 0, note: "当前 PDF 书籍不可用。" };
-      return bookIndex.search(bookId, query, typeof limit === "number" ? limit : 20);
-    });
     ipcMain.handle("ocr:recognize-page", async (_event, input: unknown) => {
       if (!input || typeof input !== "object") return { ok: false, code: "VALIDATION_ERROR", message: "OCR 页面请求无效。" };
       const value = input as { bookId?: unknown };

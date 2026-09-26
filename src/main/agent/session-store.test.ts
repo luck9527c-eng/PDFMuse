@@ -30,37 +30,6 @@ describe("session store", () => {
     return { session, append };
   }
 
-  it("searchMessages 只返回本书已完成消息并按时间倒序", async () => {
-    store = createSessionStore(dataHome);
-    const { append } = seedConversation(BOOK_ID);
-    append("第一条 讲解能量守恒");
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    append("第二条 讲解动量守恒");
-    append("失败回答不参与检索", "error");
-    seedConversation(OTHER_BOOK_ID).append("另一本书 讲解能量守恒");
-
-    expect(store.searchMessages(BOOK_ID, "%能量守恒%")).toEqual([
-      { id: expect.any(String), body: "第一条 讲解能量守恒" },
-    ]);
-    const both = store.searchMessages(BOOK_ID, "%讲解%");
-    expect(both.map((hit) => hit.body)).toEqual(["第二条 讲解动量守恒", "第一条 讲解能量守恒"]);
-    expect(store.searchMessages("c".repeat(64), "%讲解%")).toEqual([]);
-  });
-
-  it("listRunMessageIds 只返回本书指定 run 的消息 id", async () => {
-    store = createSessionStore(dataHome);
-    const session = store.ensureSession(BOOK_ID);
-    store.appendMessage({ sessionId: session.id, runId: "run-a", role: "reader", body: "A 轮的问题", status: "complete" });
-    store.appendMessage({ sessionId: session.id, runId: "run-b", role: "assistant", body: "B 轮的回答", status: "complete" });
-    const other = store.ensureSession(OTHER_BOOK_ID);
-    store.appendMessage({ sessionId: other.id, runId: "run-a", role: "reader", body: "他书同 run 不串", status: "complete" });
-
-    const ids = store.listRunMessageIds(BOOK_ID, "run-a");
-    expect(ids).toHaveLength(1);
-    expect(ids[0]).toEqual(expect.any(String));
-    expect(store.listRunMessageIds(BOOK_ID, "run-x")).toEqual([]);
-  });
-
   it("finalizeRun 同事务落运行出口行，可按会话读回；清空会话一并清除（T50）", () => {
     store = createSessionStore(dataHome);
     const session = store.ensureSession(BOOK_ID);
