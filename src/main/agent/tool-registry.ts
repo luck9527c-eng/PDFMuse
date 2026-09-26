@@ -180,9 +180,8 @@ function createReadPagesTool(): RegisteredTool {
         };
       }
       const missing = requested.filter((page) => !textByPage.has(page));
-      // 版面失真声明只挂识别页：原生文本页没有公式 LaTeX/表格 HTML/插图占位，全量附注
-      // 既误导模型去调 view_page，又是纯 token 开销。
-      const ocrPages = found.filter((page) => ctx.bookIndex.isPageRecognized(ctx.bookId, page));
+      // 模态注记只在批内确有插图块时挂（T52）：无图识别页零开销，原生文本页没有插图占位。
+      const hasFigures = found.some((page) => ctx.bookIndex.recognizedPageHasImage(ctx.bookId, page));
       const fullText = found.map((page) => `【第 ${page} 页】\n${textByPage.get(page)}`).join("\n\n");
       let body = start > 0 ? fullText.slice(start) : fullText;
       if (body.length > READ_PAGES_MAX_CHARS) {
@@ -207,11 +206,7 @@ function createReadPagesTool(): RegisteredTool {
         score: 1,
       }));
       const label = found.length === 1 ? `第 ${found[0]} 页` : `第 ${found.join("、")} 页`;
-      const modalityNote = ocrPages.length > 0
-        ? (ocrPages.length < found.length
-          ? `\n\n⚠ 第 ${ocrPages.join("、")} 页文本由版面解析生成${OCR_MODALITY_NOTE_DETAIL}`
-          : `\n\n⚠ 本文本由版面解析生成${OCR_MODALITY_NOTE_DETAIL}`)
-        : "";
+      const modalityNote = hasFigures ? `\n\n${OCR_MODALITY_NOTE}` : "";
       return {
         displaySummary: `已读取${label}全文`,
         contentText: `${body}${modalityNote}`,
@@ -257,9 +252,9 @@ function createSearchWebTool(): RegisteredTool {
   };
 }
 
-/** read_pages 识别页的模态声明细节：MinerU 块级解析已按阅读顺序重建结构，但图片内容不可见。 */
-const OCR_MODALITY_NOTE_DETAIL =
-  "：正文与标题已按阅读顺序重建；公式为 LaTeX 记法（如 \\frac{a}{b} 表示分式）、表格可能为 HTML 片段；插图内容不可见（仅保留占位）。凡需要核对图片、照片或原版式细节，先用 view_page 查看原图。";
+/** read_pages 识别页的模态注记（T52 瘦身为一句）：LaTeX/HTML/阅读顺序细节退役，只保留插图不可见这一条升级信号。 */
+const OCR_MODALITY_NOTE =
+  "⚠ 本文本由版面解析生成，插图仅保留占位、内容不可见；需核对图片时用 view_page 查看原图。";
 
 const viewPageSchema = Type.Object({
   pages: Type.Array(Type.Integer({ minimum: 1 }), {
@@ -298,6 +293,7 @@ function createViewPageTool(): RegisteredTool {
     title: "查看页面原图",
     description:
       "渲染指定页的原图并随结果直接发送，用于精确查看 OCR 文本无法保留的内容：数学公式（分数、根号、上下标）、表格结构、图表。"
+      + "当答案依赖识别页中的关键公式或数字、且文本形式可疑（符号异常、等式不成立、上下文矛盾）时，可用本工具查看该页原图核对；原生文本页无需核对。"
       + "先用 search_book、read_pages 或上一轮回答引用的原文把范围定位到具体页码后再调用本工具；默认只查看 1 页，确需相邻页对照或跨页内容时才增加。"
       + `本问内图片查看按页数计量（共 ${MAX_PAGE_IMAGE_PAGES} 页，已看过的页重复查看不消耗额度），没有次数限制；额度用完后本工具不再出图，请把额度花在最需要的页上。`,
     parameters: viewPageSchema,

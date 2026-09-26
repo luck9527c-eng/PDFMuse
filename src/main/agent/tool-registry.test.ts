@@ -22,6 +22,7 @@ describe("tool registry", () => {
   const recognizedPagesByPage = new Map<string, Array<{ type: string; text: string; bbox: [number, number, number, number] }>>();
 
   beforeEach(async () => {
+    recognizedPagesByPage.clear();
     dataHome = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-tools-"));
     library = createLibraryModule(dataHome);
     bookIndex = createBookIndex(dataHome, {
@@ -60,22 +61,37 @@ describe("tool registry", () => {
     expect(registry.toolNames()).toEqual(["search_book", "read_pages", "view_page", "search_web"]);
   });
 
-  it("attaches the OCR modality note only to recognized pages", async () => {
+  it("attaches the slim modality note only when the batch has image blocks", async () => {
     const registry = createToolRegistry();
     const tool = registry.buildAgentTools(context).find((item) => item.name === "read_pages")!;
-    // 原生文本页没有版面失真，不再挂模态声明。
+    // 原生文本页：没有版面解析，不挂注记。
     const nativeResult = await tool.execute("call-note-0", { pages: [1] });
     const nativeText = (nativeResult.content[0] as { text: string }).text;
     expect(nativeText).not.toContain("版面解析生成");
     expect(nativeText).not.toContain("view_page");
 
-    // 有 Recognized Text 块的页按识别来源挂模态声明。
-    recognizedPagesByPage.set(`${bookId}:2`, [{ type: "text", text: "扫描页识别文本", bbox: [0, 0, 1, 1] }]);
-    bookIndex.indexRecognizedPage(bookId, 2, [{ text: "扫描页识别文本" }]);
-    const ocrResult = await tool.execute("call-note-1", { pages: [2] });
-    const ocrText = (ocrResult.content[0] as { text: string }).text;
-    expect(ocrText).toContain("view_page");
-    expect(ocrText).toContain("版面解析生成");
+    // 纯文本/公式块的识别页：文本形态无损，不挂注记（零 token 开销）。
+    recognizedPagesByPage.set(`${bookId}:2`, [
+      { type: "text", text: "扫描页识别文本", bbox: [0, 0, 1, 1] },
+      { type: "equation", text: "E=mc^{2}", bbox: [0, 0, 1, 0.1] },
+    ]);
+    bookIndex.indexRecognizedPage(bookId, 2, [{ text: "扫描页识别文本" }, { text: "E=mc^{2}" }]);
+    const plainOcr = await tool.execute("call-note-1", { pages: [2] });
+    const plainOcrText = (plainOcr.content[0] as { text: string }).text;
+    expect(plainOcrText).not.toContain("版面解析生成");
+    expect(plainOcrText).not.toContain("view_page");
+
+    // 含插图块的识别页：挂一句瘦身注记（T52），旧的多句细节不回流。
+    recognizedPagesByPage.set(`${bookId}:3`, [
+      { type: "text", text: "带插图的扫描页", bbox: [0, 0, 1, 1] },
+      { type: "image", text: "", bbox: [0.1, 0.2, 0.5, 0.8] },
+    ]);
+    bookIndex.indexRecognizedPage(bookId, 3, [{ text: "带插图的扫描页" }]);
+    const figureResult = await tool.execute("call-note-2", { pages: [3] });
+    const figureText = (figureResult.content[0] as { text: string }).text;
+    expect(figureText).toContain("⚠ 本文本由版面解析生成，插图仅保留占位、内容不可见；需核对图片时用 view_page 查看原图。");
+    expect(figureText).not.toContain("LaTeX");
+    expect(figureText).not.toContain("阅读顺序");
   });
 
   it("returns rendered page images as image content blocks via view_page", async () => {
@@ -120,6 +136,9 @@ describe("tool registry", () => {
     // 旧的「最多 4 页」数量邀请与次数上限措辞不得回流。
     expect(description).not.toMatch(/最多\s*4\s*页/);
     expect(description).toContain("没有次数限制");
+    // 保守核对指引（T52）：可疑才核对，原生文本页免核对。
+    expect(description).toContain("文本形式可疑");
+    expect(description).toContain("原生文本页无需核对");
   });
 
   it("clamps view_page to the twenty-page per-question quota with a note and echo annotation", async () => {

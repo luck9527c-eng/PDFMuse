@@ -321,10 +321,10 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       .trim();
   }
 
-  /** 页文本是否来自 MinerU 识别（原生文本不足时兜底）；read_pages 的模态声明按此条件化。 */
-  function isPageRecognized(bookId: string, page: number): boolean {
+  /** 识别块中是否含插图块（image 块 text 恒空、不进页文本，含插图块即必然是识别页）；read_pages 的模态注记按此挂载。 */
+  function recognizedPageHasImage(bookId: string, page: number): boolean {
     const blocks = options.readRecognizedBlocks?.(bookId, page);
-    return Array.isArray(blocks) && blocks.length > 0;
+    return Array.isArray(blocks) && blocks.some((block) => block.type === "image");
   }
 
   function embeddingRows(bookId: string) {
@@ -795,9 +795,9 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       return readPagesStatement.all(bookId, TEXT_EXTRACTION_VERSION, fromPage, toPage) as Array<{ page: number; text: string }>;
     },
 
-    /** 页文本是否来自 MinerU 识别（原生文本不足时兜底）；read_pages 的模态声明按此条件化。 */
-    isPageRecognized(bookId: string, page: number): boolean {
-      return isPageRecognized(bookId, page);
+    /** 识别页是否含插图块（插图 text 恒空、页文本中不可见）；read_pages 的模态注记按此条件化。 */
+    recognizedPageHasImage(bookId: string, page: number): boolean {
+      return recognizedPageHasImage(bookId, page);
     },
 
     stats(bookId: string) {
