@@ -17,10 +17,10 @@ export type PdfEvidence = {
 };
 
 export type PageImageBudget = {
-  /** 本问内实际渲染交付的原图页数（渲染失败与复用命中不扣；次数上限已删除）。 */
+  /** 本问内实际渲染交付的图片数（整页或单幅插图裁剪各计 1；渲染失败与复用命中不扣；次数上限已删除）。 */
   pagesDelivered: number;
-  /** 本问已交付页 → 媒体相对路径：同问同页复用既有媒体文件，字节恒同、不重复渲染。 */
-  deliveredMedia: Map<number, string>;
+  /** 本问已交付图片 → 媒体相对路径（键 `${page}` 或 `${page}:${figure}`）：同问同键复用既有媒体文件，字节恒同、不重复渲染。 */
+  deliveredMedia: Map<string, string>;
 };
 
 export type ToolExecutionContext = {
@@ -33,10 +33,12 @@ export type ToolExecutionContext = {
   bookIndex: BookIndex;
   /** 页面渲染模块：视觉工具经此取页面原图，检索模块不再承担渲染。 */
   renderPageImage(bookId: string, page: number, scale: number): Promise<RenderedPageImage>;
+  /** 页面区域渲染（T53 插图级寻址）：按识别块归一化 bbox 裁剪，整页同倍率下有效 DPI 更高。 */
+  renderRegionImage(bookId: string, page: number, bbox: [number, number, number, number], scale: number): Promise<RenderedPageImage>;
   /** 每问图片预算（agent-host 每问新建、跨调用共享）：页数额度钳制与同问复用在工具层执行。 */
   pageBudget: PageImageBudget;
-  /** 原图转存 book 媒体目录（T44）：live 与回放共享同一份文件字节，会话库只存相对路径。 */
-  savePageImage(bookId: string, page: number, pngBase64: string): Promise<{ relativePath: string }>;
+  /** 原图转存 book 媒体目录（T44）：live 与回放共享同一份文件字节，会话库只存相对路径；figure 存在时为单幅裁剪。 */
+  savePageImage(bookId: string, page: number, pngBase64: string, figure?: number): Promise<{ relativePath: string }>;
   /** 同问复用时按相对路径读回媒体文件字节；缺失返回 null（回退重新渲染）。 */
   loadPageImage?(relativePath: string): Promise<string | null>;
   webSearch?: WebSearchModule;
@@ -180,8 +182,6 @@ function createReadPagesTool(): RegisteredTool {
         };
       }
       const missing = requested.filter((page) => !textByPage.has(page));
-      // 模态注记只在批内确有插图块时挂（T52）：无图识别页零开销，原生文本页没有插图占位。
-      const hasFigures = found.some((page) => ctx.bookIndex.recognizedPageHasImage(ctx.bookId, page));
       const fullText = found.map((page) => `【第 ${page} 页】\n${textByPage.get(page)}`).join("\n\n");
       let body = start > 0 ? fullText.slice(start) : fullText;
       if (body.length > READ_PAGES_MAX_CHARS) {
@@ -206,10 +206,10 @@ function createReadPagesTool(): RegisteredTool {
         score: 1,
       }));
       const label = found.length === 1 ? `第 ${found[0]} 页` : `第 ${found.join("、")} 页`;
-      const modalityNote = hasFigures ? `\n\n${OCR_MODALITY_NOTE}` : "";
+      // 插图不可见信号由页文本内的自描述占位行承载（T53）：升级方式落在图所在的位置，不再整批附注记。
       return {
         displaySummary: `已读取${label}全文`,
-        contentText: `${body}${modalityNote}`,
+        contentText: body,
         evidence,
       };
     },
@@ -252,30 +252,44 @@ function createSearchWebTool(): RegisteredTool {
   };
 }
 
-/** read_pages 识别页的模态注记（T52 瘦身为一句）：LaTeX/HTML/阅读顺序细节退役，只保留插图不可见这一条升级信号。 */
-const OCR_MODALITY_NOTE =
-  "⚠ 本文本由版面解析生成，插图仅保留占位、内容不可见；需核对图片时用 view_page 查看原图。";
-
 const viewPageSchema = Type.Object({
   pages: Type.Array(Type.Integer({ minimum: 1 }), {
     minItems: 1,
     maxItems: 4,
     description: "要查看原图的 PDF 页码列表；请只列先经检索定位、确需核对的页",
   }),
+  figure: Type.Optional(Type.Integer({
+    minimum: 1,
+    description: "插图编号：只查看某页的第 N 幅插图（read_pages 文本中 [插图 N·…] 占位行给出编号）；传入时 pages 只能含该插图所在的一页",
+  })),
 });
 
 /** 每问（run）图片页额度：次数上限已删除（T50），只留页数用量。 */
 export const MAX_PAGE_IMAGE_PAGES = 20;
 
+/** 插图裁剪渲染倍率（T53）：高于整页默认倍率，小图不被 provider 降采样、有效 DPI 更高。 */
+const FIGURE_RENDER_SCALE = 4;
+
 /** provider 图片硬限制（T44）：仅超限时降采样重渲，常规尺寸不重编码（公式清晰度优先）。 */
 const IMAGE_HARD_LIMIT_EDGE_PX = 8_000;
 const IMAGE_HARD_LIMIT_BYTES = 5 * 1024 * 1024;
 
-/** 渲染单页并在超出 provider 硬限制时按比例降采样（页图常规尺寸下不触发）。 */
-async function renderWithinHardLimits(ctx: ToolExecutionContext, page: number): Promise<RenderedPageImage> {
-  let scale = 2;
+/** 预算与复用键：整页与单幅插图裁剪各占一键，同问同键命中复用。 */
+function imageBudgetKey(page: number, figure?: number): string {
+  return figure === undefined ? `${page}` : `${page}:${figure}`;
+}
+
+/** 渲染整页或其归一化 bbox 裁剪，并在超出 provider 硬限制时按比例降采样重渲。 */
+async function renderWithinHardLimits(
+  ctx: ToolExecutionContext,
+  page: number,
+  region?: [number, number, number, number],
+): Promise<RenderedPageImage> {
+  let scale = region === undefined ? 2 : FIGURE_RENDER_SCALE;
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const rendered = await ctx.renderPageImage(ctx.bookId, page, scale);
+    const rendered = region === undefined
+      ? await ctx.renderPageImage(ctx.bookId, page, scale)
+      : await ctx.renderRegionImage(ctx.bookId, page, region, scale);
     const bytes = Math.floor(rendered.imageData.length * 3 / 4);
     const maxEdge = Math.max(rendered.width, rendered.height);
     if (maxEdge <= IMAGE_HARD_LIMIT_EDGE_PX && bytes <= IMAGE_HARD_LIMIT_BYTES) return rendered;
@@ -286,7 +300,7 @@ async function renderWithinHardLimits(ctx: ToolExecutionContext, page: number): 
   throw new Error("页面原图超出尺寸硬限制，降采样后仍超限。");
 }
 
-/** view_page：渲染页面原图发给模型，精确查看公式、表格与结构。每问受页数额度钳制（无次数上限）。 */
+/** view_page：渲染页面原图（整页或单幅插图裁剪）发给模型，精确查看公式、图表与结构。每问受页数额度钳制（无次数上限）。 */
 function createViewPageTool(): RegisteredTool {
   return {
     name: "view_page",
@@ -294,80 +308,158 @@ function createViewPageTool(): RegisteredTool {
     description:
       "渲染指定页的原图并随结果直接发送，用于精确查看 OCR 文本无法保留的内容：数学公式（分数、根号、上下标）、表格结构、图表。"
       + "当答案依赖识别页中的关键公式或数字、且文本形式可疑（符号异常、等式不成立、上下文矛盾）时，可用本工具查看该页原图核对；原生文本页无需核对。"
+      + "识别页的 read_pages 文本中每幅插图带 [插图 N·约占页面 X%] 占位行：需要读图时优先只传该页页码并带 figure=N 取单幅裁剪（更清晰），核对公式或对照整页版式时才看整页。"
       + "先用 search_book、read_pages 或上一轮回答引用的原文把范围定位到具体页码后再调用本工具；默认只查看 1 页，确需相邻页对照或跨页内容时才增加。"
-      + `本问内图片查看按页数计量（共 ${MAX_PAGE_IMAGE_PAGES} 页，已看过的页重复查看不消耗额度），没有次数限制；额度用完后本工具不再出图，请把额度花在最需要的页上。`,
+      + `本问内图片查看按张数计量（整页与单幅插图裁剪各计 1，共 ${MAX_PAGE_IMAGE_PAGES} 页额度，已看过的图重复查看不消耗额度），没有次数限制；额度用完后本工具不再出图，请把额度花在最需要的图上。`,
     parameters: viewPageSchema,
     async execute(input, ctx) {
-      const { pages } = input as Static<typeof viewPageSchema>;
+      const { pages, figure } = input as Static<typeof viewPageSchema>;
       const budget = ctx.pageBudget;
       const requested = [...new Set(pages)].sort((left, right) => left - right);
-      const images: NonNullable<ToolExecutionOutcome["images"]> = [];
-      const media: NonNullable<ToolExecutionOutcome["media"]> = [];
-      const failed: number[] = [];
-      const overBudget: number[] = [];
-      // 复用优先：本问已交付页读回既有媒体字节（不重复渲染、不扣额度）；文件缺失回退新渲染。
-      for (const page of requested) {
-        const existing = budget.deliveredMedia.get(page);
-        if (!existing) continue;
-        const data = (await ctx.loadPageImage?.(existing)) ?? null;
-        if (data) {
-          images.push({ page, mimeType: "image/png", data });
-          media.push({ page, path: existing });
-        } else {
-          budget.deliveredMedia.delete(page);
-        }
-      }
-      // 新页渲染：按剩余页数额度钳制，超出的页不渲染并附注。
-      const remainingAtRequest = Math.max(0, MAX_PAGE_IMAGE_PAGES - budget.pagesDelivered);
-      const freshRequested = requested.filter((page) => !budget.deliveredMedia.has(page) && !images.some((image) => image.page === page));
-      const allowed = freshRequested.slice(0, remainingAtRequest);
-      overBudget.push(...freshRequested.slice(allowed.length));
-      for (const page of allowed) {
-        try {
-          const rendered = await renderWithinHardLimits(ctx, page);
-          // 原图落盘后以同一份字节发给模型：live 与回放字节天然一致（T44）。
-          const saved = await ctx.savePageImage(ctx.bookId, page, rendered.imageData);
-          images.push({ page, mimeType: "image/png", data: rendered.imageData });
-          media.push({ page, path: saved.relativePath });
-          budget.deliveredMedia.set(page, saved.relativePath);
-          budget.pagesDelivered += 1;
-        } catch {
-          // 单页渲染或落盘失败继续其余页，失败页不扣预算、在结果中说明。
-          failed.push(page);
-        }
-      }
-      if (images.length === 0) {
-        const quotaLeft = MAX_PAGE_IMAGE_PAGES - budget.pagesDelivered;
-        return quotaLeft <= 0
-          ? {
-              displaySummary: "图片额度已用完",
-              contentText: `图片额度已用完（${MAX_PAGE_IMAGE_PAGES} 页），不要再调用 view_page，用文字工具继续。`,
-            }
-          : failed.length > 0
-            ? { displaySummary: "原图渲染失败", contentText: "无法渲染所选页面，请检查页码是否在本书范围内。" }
-            : { displaySummary: "没有可交付的页面", contentText: "请求的页面均未能查看，请检查页码后重试。" };
-      }
-      const label = images.map((image) => image.page).join("、");
-      const evidence: PdfEvidence[] = images.map((image) => ({
-        source: "pdf",
-        page: image.page,
-        snippet: "（已查看页面原图）",
-        trust: "trusted",
-        score: 1,
-      }));
-      const quotaNote = overBudget.length > 0
-        ? `（本问图片额度只剩 ${remainingAtRequest} 页：第 ${overBudget.join("、")} 页未附上。）`
-        : "";
-      return {
-        displaySummary: `已附上第 ${label} 页原图${overBudget.length > 0 ? "（额度已满）" : ""}`,
-        contentText: `以下是第 ${label} 页的原图，请以此为准阅读公式与结构。${failed.length > 0 ? `（第 ${failed.join("、")} 页渲染失败未附上。）` : ""}${quotaNote}`,
-        evidence,
-        images,
-        media,
-        // 额度回显走注解层（T50）：逐次变化的文本不进指纹哈希，由 agent-host 后置合成。
-        annotations: [`本问图片预算：已用 ${budget.pagesDelivered}/${MAX_PAGE_IMAGE_PAGES} 页。`],
-      };
+      return figure === undefined
+        ? await executeWholePageView(ctx, budget, requested)
+        : await executeFigureView(ctx, budget, requested, figure);
     },
+  };
+}
+
+/** 整页查看：复用优先、按剩余页额度钳制渲染、逐页落媒体。 */
+async function executeWholePageView(
+  ctx: ToolExecutionContext,
+  budget: PageImageBudget,
+  requested: number[],
+): Promise<ToolExecutionOutcome> {
+  const images: NonNullable<ToolExecutionOutcome["images"]> = [];
+  const media: NonNullable<ToolExecutionOutcome["media"]> = [];
+  const failed: number[] = [];
+  const overBudget: number[] = [];
+  // 复用优先：本问已交付图读回既有媒体字节（不重复渲染、不扣额度）；文件缺失回退新渲染。
+  for (const page of requested) {
+    const existing = budget.deliveredMedia.get(imageBudgetKey(page));
+    if (!existing) continue;
+    const data = (await ctx.loadPageImage?.(existing)) ?? null;
+    if (data) {
+      images.push({ page, mimeType: "image/png", data });
+      media.push({ page, path: existing });
+    } else {
+      budget.deliveredMedia.delete(imageBudgetKey(page));
+    }
+  }
+  // 新页渲染：按剩余页数额度钳制，超出的页不渲染并附注。
+  const remainingAtRequest = Math.max(0, MAX_PAGE_IMAGE_PAGES - budget.pagesDelivered);
+  const freshRequested = requested.filter((page) => !budget.deliveredMedia.has(imageBudgetKey(page)) && !images.some((image) => image.page === page));
+  const allowed = freshRequested.slice(0, remainingAtRequest);
+  overBudget.push(...freshRequested.slice(allowed.length));
+  for (const page of allowed) {
+    try {
+      const rendered = await renderWithinHardLimits(ctx, page);
+      // 原图落盘后以同一份字节发给模型：live 与回放字节天然一致（T44）。
+      const saved = await ctx.savePageImage(ctx.bookId, page, rendered.imageData);
+      images.push({ page, mimeType: "image/png", data: rendered.imageData });
+      media.push({ page, path: saved.relativePath });
+      budget.deliveredMedia.set(imageBudgetKey(page), saved.relativePath);
+      budget.pagesDelivered += 1;
+    } catch {
+      // 单页渲染或落盘失败继续其余页，失败页不扣预算、在结果中说明。
+      failed.push(page);
+    }
+  }
+  if (images.length === 0) {
+    const quotaLeft = MAX_PAGE_IMAGE_PAGES - budget.pagesDelivered;
+    return quotaLeft <= 0
+      ? {
+          displaySummary: "图片额度已用完",
+          contentText: `图片额度已用完（${MAX_PAGE_IMAGE_PAGES} 页），不要再调用 view_page，用文字工具继续。`,
+        }
+      : failed.length > 0
+        ? { displaySummary: "原图渲染失败", contentText: "无法渲染所选页面，请检查页码是否在本书范围内。" }
+        : { displaySummary: "没有可交付的页面", contentText: "请求的页面均未能查看，请检查页码后重试。" };
+  }
+  const label = images.map((image) => image.page).join("、");
+  const evidence: PdfEvidence[] = images.map((image) => ({
+    source: "pdf",
+    page: image.page,
+    snippet: "（已查看页面原图）",
+    trust: "trusted",
+    score: 1,
+  }));
+  const quotaNote = overBudget.length > 0
+    ? `（本问图片额度只剩 ${remainingAtRequest} 页：第 ${overBudget.join("、")} 页未附上。）`
+    : "";
+  return {
+    displaySummary: `已附上第 ${label} 页原图${overBudget.length > 0 ? "（额度已满）" : ""}`,
+    contentText: `以下是第 ${label} 页的原图，请以此为准阅读公式与结构。${failed.length > 0 ? `（第 ${failed.join("、")} 页渲染失败未附上。）` : ""}${quotaNote}`,
+    evidence,
+    images,
+    media,
+    // 额度回显走注解层（T50）：逐次变化的文本不进指纹哈希，由 agent-host 后置合成。
+    annotations: [`本问图片预算：已用 ${budget.pagesDelivered}/${MAX_PAGE_IMAGE_PAGES} 页。`],
+  };
+}
+
+/** 单幅插图查看（T53 插图级寻址）：按识别块 bbox 裁剪渲染，token 更省、有效 DPI 更高。 */
+async function executeFigureView(
+  ctx: ToolExecutionContext,
+  budget: PageImageBudget,
+  requested: number[],
+  figure: number,
+): Promise<ToolExecutionOutcome> {
+  if (requested.length !== 1) {
+    return {
+      displaySummary: "插图查看需要单页",
+      contentText: "查看插图时 pages 只传该插图所在的一页，并用 figure 指明 read_pages 占位行中的插图编号。",
+    };
+  }
+  const page = requested[0]!;
+  const key = imageBudgetKey(page, figure);
+  // 复用优先：同问同幅插图读回既有媒体字节。
+  const existing = budget.deliveredMedia.get(key);
+  if (existing) {
+    const data = (await ctx.loadPageImage?.(existing)) ?? null;
+    if (data) return figureOutcome(page, figure, data, existing, budget);
+    budget.deliveredMedia.delete(key);
+  }
+  if (budget.pagesDelivered >= MAX_PAGE_IMAGE_PAGES) {
+    return {
+      displaySummary: "图片额度已用完",
+      contentText: `图片额度已用完（${MAX_PAGE_IMAGE_PAGES} 页），不要再调用 view_page，用文字工具继续。`,
+    };
+  }
+  const bbox = ctx.bookIndex.recognizedFigureBbox(ctx.bookId, page, figure);
+  if (!bbox) {
+    return {
+      displaySummary: "未找到该插图",
+      contentText: `第 ${page} 页没有第 ${figure} 号插图（该页可能未识别，或编号超出占位行所列范围）；可先用 read_pages 核对该页占位行中的插图编号。`,
+    };
+  }
+  try {
+    const rendered = await renderWithinHardLimits(ctx, page, bbox);
+    const saved = await ctx.savePageImage(ctx.bookId, page, rendered.imageData, figure);
+    budget.deliveredMedia.set(key, saved.relativePath);
+    budget.pagesDelivered += 1;
+    return figureOutcome(page, figure, rendered.imageData, saved.relativePath, budget);
+  } catch {
+    return {
+      displaySummary: "插图渲染失败",
+      contentText: `第 ${page} 页插图 ${figure} 渲染失败，可去掉 figure 参数改看该页整页原图。`,
+    };
+  }
+}
+
+function figureOutcome(
+  page: number,
+  figure: number,
+  data: string,
+  mediaPath: string,
+  budget: PageImageBudget,
+): ToolExecutionOutcome {
+  return {
+    displaySummary: `已附上第 ${page} 页插图 ${figure} 原图`,
+    contentText: `以下是第 ${page} 页插图 ${figure} 的原图裁剪，请以此为准阅读图中内容。`,
+    evidence: [{ source: "pdf", page, snippet: `（已查看第 ${page} 页插图 ${figure} 原图）`, trust: "trusted", score: 1 }],
+    images: [{ page, mimeType: "image/png", data }],
+    media: [{ page, path: mediaPath }],
+    annotations: [`本问图片预算：已用 ${budget.pagesDelivered}/${MAX_PAGE_IMAGE_PAGES} 页。`],
   };
 }
 

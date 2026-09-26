@@ -171,7 +171,7 @@ describe("book index", () => {
     const versions = verified.prepare("SELECT DISTINCT extraction_version FROM book_pages WHERE book_id = ?").all(bookId);
     const oldVectors = verified.prepare("SELECT COUNT(*) AS count FROM semantic_embeddings WHERE book_id = ? AND source_id = '1:0'").get(bookId);
     verified.close();
-    expect(versions).toEqual([{ extraction_version: "v2-structured-lines" }]);
+    expect(versions).toEqual([{ extraction_version: "v3-figure-placeholders" }]);
     expect(oldVectors).toEqual({ count: 0 });
   });
 
@@ -359,6 +359,77 @@ describe("book index", () => {
         .toEqual(expect.arrayContaining([seededAnswer.id, currentQuestion.id, currentFollowup.id, seededSleep.id]));
     }
     sessionStore.close();
+  });
+
+  it("识别页插图块出占位行：进 readPages 全文、不进 FTS 检索（T53）", async () => {
+    index.indexRecognizedPage(bookId, 2, [
+      { text: "带图正文", type: "text", bbox: [0, 0, 1, 0.5] },
+      { text: "", type: "image", bbox: [0.1, 0.1, 0.6, 0.7] },
+    ]);
+    const pages = index.readPages(bookId, 2, 2);
+    expect(pages[0]?.text).toContain("带图正文");
+    expect(pages[0]?.text).toContain("[插图 1·约占页面 30%：内容不可见，可用 view_page 查看第 2 页插图 1]");
+
+    // 「插图」不进倒排索引：占位行不可检索，正文照常可检索。
+    const miss = await index.search(bookId, "插图");
+    expect(miss.status).not.toBe("unavailable");
+    if (miss.status !== "unavailable") {
+      expect(miss.hits.filter((hit) => hit.source === "pdf" && hit.page === 2)).toHaveLength(0);
+    }
+    const hit = await index.search(bookId, "带图正文");
+    expect(hit.status).not.toBe("unavailable");
+    if (hit.status !== "unavailable") {
+      expect(hit.hits.some((item) => item.source === "pdf" && item.page === 2)).toBe(true);
+    }
+  });
+
+  it("纯插图页：占位行进页文本、FTS 无任何可检索内容", async () => {
+    index.indexRecognizedPage(bookId, 3, [{ text: "", type: "image", bbox: [0.1, 0.1, 0.6, 0.7] }]);
+    const pages = index.readPages(bookId, 3, 3);
+    expect(pages[0]?.text).toContain("[插图 1·约占页面 30%");
+    const outcome = await index.search(bookId, "插图");
+    expect(outcome.status).not.toBe("unavailable");
+    if (outcome.status !== "unavailable") {
+      expect(outcome.hits.filter((item) => item.source === "pdf" && item.page === 3)).toHaveLength(0);
+    }
+  });
+
+  it("recognizedFigureBbox 按占位同序返回第 N 幅插图 bbox（T53 插图级寻址）", () => {
+    index.close();
+    const blocks = [
+      { type: "image", text: "", bbox: [0.1, 0.1, 0.4, 0.4] },
+      { type: "text", text: "正文", bbox: [0, 0.4, 1, 0.5] },
+      { type: "image", text: "", bbox: [0.5, 0.5, 0.8, 0.8] },
+    ];
+    index = createBookIndex(dataHome, {
+      getBookSource: (id) => library.getBookSource(id),
+      readRecognizedBlocks: (id, page) => (id === bookId && page === 2 ? blocks : undefined),
+    });
+    expect(index.recognizedFigureBbox(bookId, 2, 1)).toEqual([0.1, 0.1, 0.4, 0.4]);
+    expect(index.recognizedFigureBbox(bookId, 2, 2)).toEqual([0.5, 0.5, 0.8, 0.8]);
+    expect(index.recognizedFigureBbox(bookId, 2, 3)).toBeUndefined();
+    expect(index.recognizedFigureBbox(bookId, 3, 1)).toBeUndefined();
+  });
+
+  it("语义切片剔除插图占位行（防「插图」二字污染检索向量）", async () => {
+    const embedded: string[] = [];
+    const provider: EmbeddingProvider = {
+      model: "stub",
+      embed: async (inputs) => {
+        embedded.push(...inputs);
+        return inputs.map(() => [0, 1]);
+      },
+    };
+    index.close();
+    index = createBookIndex(dataHome, { getBookSource: (id) => library.getBookSource(id), embeddingProvider: provider });
+    index.indexRecognizedPage(bookId, 2, [
+      { text: "带图正文", type: "text", bbox: [0, 0, 1, 0.5] },
+      { text: "", type: "image", bbox: [0.1, 0.1, 0.6, 0.7] },
+    ]);
+    await index.ensureEmbeddings(bookId);
+    expect(embedded.length).toBeGreaterThan(0);
+    expect(embedded.join("\n")).toContain("带图正文");
+    for (const text of embedded) expect(text).not.toContain("插图");
   });
 
   it("falls back to recognized lines for pages without native text", async () => {

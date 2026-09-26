@@ -1,4 +1,5 @@
 import type { ScheduleJobInput } from "./background-jobs.js";
+import type { RecognizedBlockLike } from "./agent/figure-placeholder.js";
 import type {
   BackgroundJobKind,
   BackgroundJobStatus,
@@ -10,7 +11,7 @@ export type IngestSource = "background" | "interactive";
 export type OcrBookCheckpoint = { focusPage: number; completed: number };
 
 export type RecognizedTextIngestionDependencies = {
-  indexRecognizedPage(bookId: string, page: number, lines: readonly { text: string }[]): void;
+  indexRecognizedPage(bookId: string, page: number, lines: readonly RecognizedBlockLike[]): void;
   scheduleEmbedding(input: Omit<ScheduleBackgroundJobInput, "kind">): Promise<boolean> | boolean;
   invalidateOutline(bookId: string, page: number): void;
   loadPageCount(bookId: string): number;
@@ -27,7 +28,7 @@ const ACTIVE_JOB_STATUSES: BackgroundJobStatus[] = ["queued", "running", "paused
 export function createRecognizedTextIngestion(dependencies: RecognizedTextIngestionDependencies) {
   return {
     /** 一页 Recognized Text 变更后的全部联动：进索引、按配置排语义索引、失效目录；手动来源额外按交互优先级重排目录。 */
-    async ingestRecognizedPage(bookId: string, page: number, lines: readonly { text: string }[], source: IngestSource) {
+    async ingestRecognizedPage(bookId: string, page: number, lines: readonly RecognizedBlockLike[], source: IngestSource) {
       dependencies.indexRecognizedPage(bookId, page, lines);
       await dependencies.scheduleEmbedding({ bookId, priority: EMBEDDING_PRIORITY, total: dependencies.loadPageCount(bookId) });
       dependencies.invalidateOutline(bookId, page);

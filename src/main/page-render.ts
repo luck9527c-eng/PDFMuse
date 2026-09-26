@@ -3,6 +3,9 @@ import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 /** 页面渲染产物：PNG base64 与像素尺寸。 */
 export type RenderedPageImage = { imageData: string; width: number; height: number };
 
+/** 0-1 归一化页面区域（识别块 bbox 坐标系）。 */
+export type RegionBbox = [number, number, number, number];
+
 /** 书源加载：按 bookId 取原文件字节与已存密码；原文件只读，永不修改。 */
 export type PageBookSource = (bookId: string) => Promise<{ bytes: Uint8Array; password?: string }>;
 
@@ -11,7 +14,8 @@ export type PageBookSource = (bookId: string) => Promise<{ bytes: Uint8Array; pa
  * 无状态、不加缓存；每页独立打开与销毁文档，渲染内部保持既有实现。
  */
 export function createPageRenderer(loadBook: PageBookSource) {
-  async function renderPage(bookId: string, pageNumber: number, scale: number): Promise<RenderedPageImage> {
+  /** 渲染整页到独立 canvas；调用方负责 cleanup（销毁 pdfjs 文档）。 */
+  async function openPageCanvas(bookId: string, pageNumber: number, scale: number) {
     const { createCanvas } = await import("@napi-rs/canvas");
     const source = await loadBook(bookId);
     const loadingTask = getDocument({
@@ -25,15 +29,54 @@ export function createPageRenderer(loadBook: PageBookSource) {
       const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
       const context = canvas.getContext("2d");
       await page.render({ canvas: canvas as never, canvasContext: context as never, viewport }).promise;
+      return { canvas, cleanup: () => loadingTask.destroy() };
+    } catch (error) {
+      await loadingTask.destroy();
+      throw error;
+    }
+  }
+
+  async function renderPage(bookId: string, pageNumber: number, scale: number): Promise<RenderedPageImage> {
+    const { canvas, cleanup } = await openPageCanvas(bookId, pageNumber, scale);
+    try {
       return { imageData: canvas.toBuffer("image/png").toString("base64"), width: canvas.width, height: canvas.height };
     } finally {
-      await loadingTask.destroy();
+      await cleanup();
+    }
+  }
+
+  /**
+   * 渲染页面的归一化 bbox 区域（T53 插图级寻址）：整页按倍率渲出后裁剪——同样的渲染
+   * 倍率下，裁剪交付的小图不被 provider 降采样，有效 DPI 高于整页图。
+   */
+  async function renderRegion(bookId: string, pageNumber: number, bbox: RegionBbox, scale: number): Promise<RenderedPageImage> {
+    const [x0, y0, x1, y1] = bbox;
+    if (![x0, y0, x1, y1].every((value) => Number.isFinite(value)) || x1 <= x0 || y1 <= y0) {
+      throw new Error("裁剪区域无效。");
+    }
+    const { createCanvas } = await import("@napi-rs/canvas");
+    const { canvas, cleanup } = await openPageCanvas(bookId, pageNumber, scale);
+    try {
+      const left = Math.max(0, Math.floor(x0 * canvas.width));
+      const top = Math.max(0, Math.floor(y0 * canvas.height));
+      const right = Math.min(canvas.width, Math.ceil(x1 * canvas.width));
+      const bottom = Math.min(canvas.height, Math.ceil(y1 * canvas.height));
+      const width = right - left;
+      const height = bottom - top;
+      if (width <= 0 || height <= 0) throw new Error("裁剪区域落在页面之外。");
+      const crop = createCanvas(width, height);
+      crop.getContext("2d").drawImage(canvas, left, top, width, height, 0, 0, width, height);
+      return { imageData: crop.toBuffer("image/png").toString("base64"), width, height };
+    } finally {
+      await cleanup();
     }
   }
 
   return {
     /** 渲染指定页为 PNG（base64）；视觉工具与目录 AI 按需传倍率。 */
     renderPage,
+    /** 渲染指定页的归一化 bbox 区域为 PNG（base64）；插图级查看与块级对照共用。 */
+    renderRegion,
   };
 }
 

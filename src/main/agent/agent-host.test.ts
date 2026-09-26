@@ -1247,6 +1247,7 @@ describe("agent host", () => {
         pageBudget: context.pageBudget,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
+        renderRegionImage: pageRenderer.renderRegion,
         savePageImage: async (id: string, page: number) => ({ relativePath: `${id}/p${page}-test.png` }),
       })),
     });
@@ -1322,6 +1323,7 @@ describe("agent host", () => {
         pageBudget: context.pageBudget,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
+        renderRegionImage: pageRenderer.renderRegion,
         savePageImage: async (id: string, page: number) => ({ relativePath: `${id}/p${page}-test.png` }),
       })),
     });
@@ -1762,6 +1764,7 @@ describe("agent host", () => {
         pageBudget: context.pageBudget,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
+        renderRegionImage: pageRenderer.renderRegion,
         savePageImage: async (id: string, page: number) => ({ relativePath: `${id}/p${page}-test.png` }),
       })),
     });

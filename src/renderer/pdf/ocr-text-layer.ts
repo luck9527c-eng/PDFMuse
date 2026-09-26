@@ -72,6 +72,8 @@ export function mountRecognizedTextLayer(viewer: HTMLElement, recognizedPage?: R
     span.textContent = isPlaceholderImage ? "［插图］" : block.text;
     span.title = blockTypeLabel(block);
     span.dataset.ocrType = block.type;
+    // 块 bbox 盖章：选中载荷携带归一化坐标，块级原图对照（T53）经此裁剪。
+    span.dataset.ocrBbox = JSON.stringify(block.bbox);
     // 块级 bbox 为 0-1 归一化坐标，直接换算为页面百分比定位；选中即整块，公式块拿到 LaTeX 原文。
     span.style.left = `${Math.max(0, Math.min(100, x0 * 100))}%`;
     span.style.top = `${Math.max(0, Math.min(100, y0 * 100))}%`;

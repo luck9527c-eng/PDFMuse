@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { MineruBlock, ReadingFocus } from "../../shared/contracts.js";
 import type { BookSource } from "../library.js";
+import { assembleBlockText, figureBlocks, stripFigurePlaceholderLines, type RecognizedBlockLike } from "./figure-placeholder.js";
 import { chunkPageText } from "./semantic-chunker.js";
 
 /**
@@ -15,7 +16,7 @@ import { chunkPageText } from "./semantic-chunker.js";
  */
 const CJK_PATTERN = /[\u3000-\u9fff\uff00-\uffef]/;
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
-const TEXT_EXTRACTION_VERSION = "v2-structured-lines";
+const TEXT_EXTRACTION_VERSION = "v3-figure-placeholders";
 /** 单次检索参与关键词腿的词数上限：查询串更长时只取前 N 个词，避免检索式无限膨胀。 */
 const MAX_SEARCH_TERMS = 8;
 /** 语义分按页文本有效长度折减的下限：短页（封面/目录页）的向量不可靠，但不能完全作废。 */
@@ -214,6 +215,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       book_id TEXT NOT NULL,
       page INTEGER NOT NULL,
       text TEXT NOT NULL,
+      indexable_text TEXT NOT NULL DEFAULT '',
       extraction_version TEXT NOT NULL DEFAULT 'v2-structured-lines',
       PRIMARY KEY (book_id, page)
     );
@@ -244,6 +246,10 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   if (!pageColumns.some((column) => column.name === "extraction_version")) {
     database.exec("ALTER TABLE book_pages ADD COLUMN extraction_version TEXT NOT NULL DEFAULT 'v1-flat-text'");
   }
+  // indexable_text 投影列（T53）：占位行只留在 text（read_pages 交付），FTS/LIKE/语义全部吃投影列。
+  if (!pageColumns.some((column) => column.name === "indexable_text")) {
+    database.exec("ALTER TABLE book_pages ADD COLUMN indexable_text TEXT NOT NULL DEFAULT ''");
+  }
 
   const embeddingBatchSize = Math.max(1, options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE);
   const indexing = new Map<string, Promise<{ indexedPages: number; totalPages: number; note?: string }>>();
@@ -256,9 +262,10 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     "SELECT COUNT(*) AS count FROM book_pages WHERE book_id = ?",
   );
   const insertPageStatement = database.prepare(`
-    INSERT INTO book_pages (book_id, page, text, extraction_version) VALUES (?, ?, ?, ?)
+    INSERT INTO book_pages (book_id, page, text, indexable_text, extraction_version) VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(book_id, page) DO UPDATE SET
       text = excluded.text,
+      indexable_text = excluded.indexable_text,
       extraction_version = excluded.extraction_version
   `);
   const insertFtsStatement = database.prepare(
@@ -277,8 +284,9 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   const indexedPagesBeforeStatement = database.prepare(
     "SELECT MAX(page) AS max_page, COUNT(*) AS count FROM book_pages WHERE book_id = ? AND extraction_version = ?",
   );
+  // 语义切片的输入是 indexable_text 投影列：占位行不进检索向量。
   const pageTextStatement = database.prepare(
-    "SELECT page, text FROM book_pages WHERE book_id = ? AND extraction_version = ? ORDER BY page ASC",
+    "SELECT page, indexable_text AS text FROM book_pages WHERE book_id = ? AND extraction_version = ? ORDER BY page ASC",
   );
   const readPagesStatement = database.prepare(
     "SELECT page, text FROM book_pages WHERE book_id = ? AND extraction_version = ? AND page >= ? AND page <= ? ORDER BY page ASC",
@@ -309,22 +317,16 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     return options.embeddingProvider ?? options.getEmbeddingProvider?.();
   }
 
-  /** 原生文本不足一页下限时，用 Recognized Text 块兜底（经 OCR 模块的读接口）。 */
+  /** 原生文本不足一页下限时，用 Recognized Text 块兜底（经 OCR 模块的读接口）；插图块出占位行。 */
   function recognizedPageText(bookId: string, page: number) {
     const blocks = options.readRecognizedBlocks?.(bookId, page);
-    if (!blocks) return "";
-    return blocks
-      .map((line) => (line && typeof line.text === "string" ? line.text : ""))
-      .filter(Boolean)
-      .join("\n")
-      .replace(/[^\S\n]+/g, " ")
-      .trim();
+    return blocks ? assembleBlockText(blocks, page).text : "";
   }
 
-  /** 识别块中是否含插图块（image 块 text 恒空、不进页文本，含插图块即必然是识别页）；read_pages 的模态注记按此挂载。 */
-  function recognizedPageHasImage(bookId: string, page: number): boolean {
+  /** 识别页第 figure 个插图块的 bbox（与页文本占位编号同一序）；view_page 插图级寻址经此取裁剪区域。 */
+  function recognizedFigureBbox(bookId: string, page: number, figure: number): [number, number, number, number] | undefined {
     const blocks = options.readRecognizedBlocks?.(bookId, page);
-    return Array.isArray(blocks) && blocks.some((block) => block.type === "image");
+    return blocks ? figureBlocks(blocks)[figure - 1]?.bbox : undefined;
   }
 
   function embeddingRows(bookId: string) {
@@ -337,6 +339,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     signal?: AbortSignal,
   ) {
     const pages = pageTextStatement.all(bookId, TEXT_EXTRACTION_VERSION) as Array<{ page: number; text: string }>;
+    // 语义切片的占位剔除由 pageTextStatement 读 indexable_text 投影列完成（T53：占位不进检索向量）。
     const chunks = pages.flatMap((page) => chunkPageText(page.text, page.page).map((chunk) => ({
       ...chunk,
       sourceId: `${page.page}:${chunk.id}`,
@@ -486,12 +489,15 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       for (let page = indexed + 1; page <= document.numPages; page += 1) {
         if (signal?.aborted) break;
         const nativeText = await extractPageText(document, page);
-        const text = nativeText.length >= 16 ? nativeText : (recognizedPageText(bookId, page) || nativeText);
+        const recognized = nativeText.length >= 16 ? "" : recognizedPageText(bookId, page);
+        const text = recognized || nativeText;
+        // FTS 只吃可检索文本：识别兜底的占位行进页全文、不进倒排索引。
+        const indexable = recognized ? stripFigurePlaceholderLines(recognized) : text;
         database.exec("BEGIN");
         try {
-          insertPageStatement.run(bookId, page, text, TEXT_EXTRACTION_VERSION);
+          insertPageStatement.run(bookId, page, text, indexable, TEXT_EXTRACTION_VERSION);
           deleteFtsPageStatement.run(bookId, page);
-          if (text) insertFtsStatement.run(bookId, page, tokenizeForIndex(text));
+          if (indexable.trim()) insertFtsStatement.run(bookId, page, tokenizeForIndex(indexable));
           database.exec("COMMIT");
         } catch (error) {
           database.exec("ROLLBACK");
@@ -511,14 +517,15 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     return { indexedPages: indexed, totalPages: row.pageCount, ...partial };
   }
 
-  function indexRecognizedPage(bookId: string, page: number, lines: readonly { text: string }[]) {
-    const text = lines.map((line) => line.text).join("\n").replace(/[^\S\n]+/g, " ").trim();
+  function indexRecognizedPage(bookId: string, page: number, lines: readonly RecognizedBlockLike[]) {
+    // 装配一次出两套文本：页全文含插图占位（read_pages 交付），投影列与 FTS 只吃剔除占位后的可检索文本。
+    const { text, indexableText } = assembleBlockText(lines, page);
     if (!BOOK_ID_PATTERN.test(bookId) || !Number.isSafeInteger(page) || page <= 0) return false;
     try {
       database.exec("BEGIN");
-      insertPageStatement.run(bookId, page, text, TEXT_EXTRACTION_VERSION);
+      insertPageStatement.run(bookId, page, text, indexableText, TEXT_EXTRACTION_VERSION);
       deleteFtsPageStatement.run(bookId, page);
-      if (text) insertFtsStatement.run(bookId, page, tokenizeForIndex(text));
+      if (indexableText) insertFtsStatement.run(bookId, page, tokenizeForIndex(indexableText));
       database.prepare("DELETE FROM semantic_embeddings WHERE book_id = ? AND source = 'pdf' AND page = ?").run(bookId, page);
       database.exec("COMMIT");
       return true;
@@ -607,7 +614,8 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       // 召回候选页，命中词数多的页排前（lexical 分 = 命中占比加权）。
       const terms = splitSearchTerms(trimmed);
       const singleTerm = terms.length <= 1;
-      const likeConditions = terms.map(() => "text LIKE ? ESCAPE '\\'").join(" OR ");
+      // LIKE 兜底扫 indexable_text 投影列：插图占位行（含「页面/查看」等常用词）不参与关键词召回。
+      const likeConditions = terms.map(() => "indexable_text LIKE ? ESCAPE '\\'").join(" OR ");
       const termLikeStatement = database.prepare(`
         SELECT page, text FROM book_pages
         WHERE book_id = ? AND extraction_version = ? AND (${likeConditions})
@@ -795,9 +803,9 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       return readPagesStatement.all(bookId, TEXT_EXTRACTION_VERSION, fromPage, toPage) as Array<{ page: number; text: string }>;
     },
 
-    /** 识别页是否含插图块（插图 text 恒空、页文本中不可见）；read_pages 的模态注记按此条件化。 */
-    recognizedPageHasImage(bookId: string, page: number): boolean {
-      return recognizedPageHasImage(bookId, page);
+    /** 识别页第 figure 个插图块的 bbox（与页文本占位编号同一序）；view_page 插图级寻址经此取裁剪区域。 */
+    recognizedFigureBbox(bookId: string, page: number, figure: number): [number, number, number, number] | undefined {
+      return recognizedFigureBbox(bookId, page, figure);
     },
 
     stats(bookId: string) {

@@ -9,10 +9,10 @@ import path from "node:path";
 export function createToolMedia(dataHome: string) {
   const mediaRoot = path.join(dataHome, "media");
 
-  async function savePageImage(bookId: string, page: number, pngBase64: string): Promise<{ relativePath: string }> {
+  async function savePageImage(bookId: string, page: number, pngBase64: string, figure?: number): Promise<{ relativePath: string }> {
     const dir = path.join(mediaRoot, bookId);
     await mkdir(dir, { recursive: true });
-    const fileName = `p${page}-${randomUUID().slice(0, 8)}.png`;
+    const fileName = `p${page}${figure ? `-f${figure}` : ""}-${randomUUID().slice(0, 8)}.png`;
     await writeFile(path.join(dir, fileName), Buffer.from(pngBase64, "base64"));
     return { relativePath: `${bookId}/${fileName}` };
   }

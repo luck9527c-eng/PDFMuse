@@ -15,7 +15,7 @@ import {
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 import type { BookOutlineNode, OpenedPdfBook, ReadingZoomMode, RecognizedPageText, SelectedPassage } from "../../shared/contracts";
-import { normalizePageRects, ocrAnchorRect, type Rectangle } from "./selection-geometry";
+import { normalizePageRects, ocrAnchorBlock, type Rectangle } from "./selection-geometry";
 import { mountRecognizedTextLayer } from "./ocr-text-layer";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -47,6 +47,7 @@ export interface PdfViewerHandle {
   hasNativeText(page: number): Promise<boolean>;
   getThumbnail(page: number): Promise<string | undefined>;
   getPageImage(page: number, scale?: number): Promise<{ data: string; width: number; height: number } | undefined>;
+  getRegionImage(page: number, bbox: [number, number, number, number], scale?: number): Promise<string | undefined>;
 }
 
 export type ViewerSelection =
@@ -54,6 +55,8 @@ export type ViewerSelection =
       kind: "selected";
       passage: SelectedPassage;
       popover: { x: number; y: number };
+      /** 选区起点落在扫描页识别块上时携带：块级原图对照（T53）经 bbox 裁剪渲染端 pdfjs 直渲。 */
+      ocr?: { page: number; bbox: [number, number, number, number] };
     }
   | {
       kind: "rejected";
@@ -232,6 +235,33 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         return { data: canvas.toDataURL("image/png").replace(/^data:image\/png;base64,/, ""), width: canvas.width, height: canvas.height };
       }).catch(() => undefined);
     },
+    // 块级原图对照（T53）：识别块 bbox 区域高倍率渲染后裁剪——人工校对取代被否决的置信度显示。
+    getRegionImage(pageNumber, bbox, scale = 3) {
+      const adapter = adapterRef.current;
+      if (!adapter?.document || pageNumber < 1 || pageNumber > adapter.document.numPages) return Promise.resolve(undefined);
+      return adapter.document.getPage(pageNumber).then(async (page) => {
+        const viewport = page.getViewport({ scale });
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.ceil(viewport.width);
+        canvas.height = Math.ceil(viewport.height);
+        const context = canvas.getContext("2d", { alpha: false });
+        if (!context) return undefined;
+        await page.render({ canvas, canvasContext: context, viewport }).promise;
+        const [x0, y0, x1, y1] = bbox;
+        const left = Math.max(0, Math.floor(x0 * canvas.width));
+        const top = Math.max(0, Math.floor(y0 * canvas.height));
+        const right = Math.min(canvas.width, Math.ceil(x1 * canvas.width));
+        const bottom = Math.min(canvas.height, Math.ceil(y1 * canvas.height));
+        if (right <= left || bottom <= top) return undefined;
+        const crop = document.createElement("canvas");
+        crop.width = right - left;
+        crop.height = bottom - top;
+        const cropContext = crop.getContext("2d", { alpha: false });
+        if (!cropContext) return undefined;
+        cropContext.drawImage(canvas, left, top, crop.width, crop.height, 0, 0, crop.width, crop.height);
+        return crop.toDataURL("image/png");
+      }).catch(() => undefined);
+    },
   }));
 
   useEffect(() => {
@@ -374,7 +404,8 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       const pageRect = startPage.getBoundingClientRect();
       // 扫描页选区高亮直接用 MinerU 块 bbox，且只取选区起点所在块——
       // "所有相交块"会因块 bbox 彼此重叠叠成整页色块（Reader 截图复盘）。
-      const ocrRect = ocrAnchorRect(startPage, range);
+      const anchor = ocrAnchorBlock(startPage, range);
+      const ocrRect = anchor?.rect ?? null;
       const rects = normalizePageRects(pageRect, ocrRect ? [ocrRect] : Array.from(range.getClientRects()));
       const selectionRect = ocrRect ?? range.getBoundingClientRect();
       if (ocrRect) showOcrBlockHighlight(startPage, ocrRect);
@@ -392,6 +423,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
           x: selectionRect.left + selectionRect.width / 2,
           y: selectionRect.top,
         },
+        ...(anchor ? { ocr: { page, bbox: anchor.bbox } } : {}),
       });
     };
     const scheduleSelectionReport = () => {

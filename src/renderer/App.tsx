@@ -129,6 +129,8 @@ export function App() {
   const [panMode, setPanMode] = useState(false);
   const [findQuery, setFindQuery] = useState("");
   const [passage, setPassage] = useState<PassagePopover>();
+  // 块级原图对照（T53）：识别块 bbox 裁剪预览，随选中popover消失一并关闭。
+  const [blockImage, setBlockImage] = useState<{ dataUrl: string; x: number; y: number }>();
   const [selectionFeedback, setSelectionFeedback] = useState<{ message: string; tone: "success" | "error" }>();
   const [draft, setDraft] = useState("");
   const [attachedPassage, setAttachedPassage] = useState<SelectedPassage>();
@@ -591,6 +593,21 @@ export function App() {
     }
   }, []);
 
+  // 块级原图对照（T53）：识别块 bbox 高倍率裁剪直显——人眼对照取代被否决的置信度显示。
+  const compareBlockOriginal = useCallback(async (target: { page: number; bbox: [number, number, number, number] }, anchor: { x: number; y: number }) => {
+    const dataUrl = await viewerRef.current?.getRegionImage(target.page, target.bbox);
+    if (!dataUrl) {
+      setSelectionFeedback({ message: "原图渲染失败，请重试。", tone: "error" });
+      return;
+    }
+    setBlockImage({ dataUrl, x: anchor.x, y: anchor.y });
+  }, []);
+
+  // 选区消失（换选、滚动、解释/提问收起 popover）时对照浮层一并收起。
+  useEffect(() => {
+    if (!passage) setBlockImage(undefined);
+  }, [passage]);
+
   const addClipboardImages = useCallback(async (items: DataTransferItem[]) => {
     const remaining = MAX_AGENT_IMAGE_ATTACHMENTS - attachmentsRef.current.length;
     if (remaining <= 0) {
@@ -905,6 +922,15 @@ export function App() {
             <button onClick={() => askAboutPassage(passage.passage)}><MessageSquareText size={14} />提问</button>
             <span />
             <button onClick={() => void copyPassage(passage.passage)}><Copy size={14} />复制</button>
+            {passage.ocr && (
+              <button onClick={() => void compareBlockOriginal(passage.ocr!, passage.popover)}><ScanText size={14} />对照原图</button>
+            )}
+          </div>
+        )}
+        {blockImage && (
+          <div className="block-comparison" style={{ left: blockImage.x, top: blockImage.y + 12 }}>
+            <img src={blockImage.dataUrl} alt="识别块原图对照" />
+            <button aria-label="关闭原图对照" onClick={() => setBlockImage(undefined)}><X size={14} /></button>
           </div>
         )}
         <PasswordDialog request={passwordRequest} onCancel={() => setPasswordRequest(undefined)} onUnlock={unlockPdf} />

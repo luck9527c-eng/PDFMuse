@@ -50,7 +50,10 @@ describe("tool registry", () => {
       bookId,
       bookIndex,
       renderPageImage: (id: string, page: number, scale: number) => pageRenderer.renderPage(id, page, scale),
-      savePageImage: async (id: string, page: number) => ({ relativePath: `${id}/p${page}-test.png` }),
+      renderRegionImage: (id: string, page: number, bbox: [number, number, number, number], scale: number) => pageRenderer.renderRegion(id, page, bbox, scale),
+      savePageImage: async (id: string, page: number, _bytes: string, figure?: number) => (
+        { relativePath: `${id}/p${page}${figure ? `-f${figure}` : ""}-test.png` }
+      ),
       pageBudget: budget,
       reportEvidence: reportEvidence as (evidence: never[]) => void,
     };
@@ -61,37 +64,42 @@ describe("tool registry", () => {
     expect(registry.toolNames()).toEqual(["search_book", "read_pages", "view_page", "search_web"]);
   });
 
-  it("attaches the slim modality note only when the batch has image blocks", async () => {
+  it("delivers figure placeholders inline and retires the batch modality note (T53)", async () => {
     const registry = createToolRegistry();
     const tool = registry.buildAgentTools(context).find((item) => item.name === "read_pages")!;
-    // 原生文本页：没有版面解析，不挂注记。
+    // 原生文本页：没有版面解析，没有占位。
     const nativeResult = await tool.execute("call-note-0", { pages: [1] });
     const nativeText = (nativeResult.content[0] as { text: string }).text;
     expect(nativeText).not.toContain("版面解析生成");
-    expect(nativeText).not.toContain("view_page");
+    expect(nativeText).not.toContain("[插图");
 
-    // 纯文本/公式块的识别页：文本形态无损，不挂注记（零 token 开销）。
+    // 纯文本/公式块的识别页：无图可升级，零占位零注记。
     recognizedPagesByPage.set(`${bookId}:2`, [
       { type: "text", text: "扫描页识别文本", bbox: [0, 0, 1, 1] },
       { type: "equation", text: "E=mc^{2}", bbox: [0, 0, 1, 0.1] },
     ]);
-    bookIndex.indexRecognizedPage(bookId, 2, [{ text: "扫描页识别文本" }, { text: "E=mc^{2}" }]);
+    bookIndex.indexRecognizedPage(bookId, 2, [
+      { text: "扫描页识别文本", type: "text", bbox: [0, 0, 1, 1] },
+      { text: "E=mc^{2}", type: "equation", bbox: [0, 0, 1, 0.1] },
+    ]);
     const plainOcr = await tool.execute("call-note-1", { pages: [2] });
     const plainOcrText = (plainOcr.content[0] as { text: string }).text;
+    expect(plainOcrText).not.toContain("[插图");
     expect(plainOcrText).not.toContain("版面解析生成");
-    expect(plainOcrText).not.toContain("view_page");
 
-    // 含插图块的识别页：挂一句瘦身注记（T52），旧的多句细节不回流。
+    // 含插图块的识别页：自描述占位行落在图所在的位置，整批注记已退役（占位与注记互斥）。
     recognizedPagesByPage.set(`${bookId}:3`, [
       { type: "text", text: "带插图的扫描页", bbox: [0, 0, 1, 1] },
-      { type: "image", text: "", bbox: [0.1, 0.2, 0.5, 0.8] },
+      { type: "image", text: "", bbox: [0.1, 0.2, 0.6, 0.9] },
     ]);
-    bookIndex.indexRecognizedPage(bookId, 3, [{ text: "带插图的扫描页" }]);
+    bookIndex.indexRecognizedPage(bookId, 3, [
+      { text: "带插图的扫描页", type: "text", bbox: [0, 0, 1, 1] },
+      { text: "", type: "image", bbox: [0.1, 0.2, 0.6, 0.9] },
+    ]);
     const figureResult = await tool.execute("call-note-2", { pages: [3] });
     const figureText = (figureResult.content[0] as { text: string }).text;
-    expect(figureText).toContain("⚠ 本文本由版面解析生成，插图仅保留占位、内容不可见；需核对图片时用 view_page 查看原图。");
-    expect(figureText).not.toContain("LaTeX");
-    expect(figureText).not.toContain("阅读顺序");
+    expect(figureText).toContain("[插图 1·约占页面 35%：内容不可见，可用 view_page 查看第 3 页插图 1]");
+    expect(figureText).not.toContain("版面解析生成");
   });
 
   it("returns rendered page images as image content blocks via view_page", async () => {
@@ -139,11 +147,14 @@ describe("tool registry", () => {
     // 保守核对指引（T52）：可疑才核对，原生文本页免核对。
     expect(description).toContain("文本形式可疑");
     expect(description).toContain("原生文本页无需核对");
+    // 插图级寻址（T53）：描述教模型从占位行取编号走 figure 参数。
+    expect(description).toContain("figure=N");
+    expect(description).toContain("占位行");
   });
 
   it("clamps view_page to the twenty-page per-question quota with a note and echo annotation", async () => {
     const registry = createToolRegistry();
-    const budget = { pagesDelivered: 18, deliveredMedia: new Map<number, string>() };
+    const budget = { pagesDelivered: 18, deliveredMedia: new Map<string, string>() };
     const tool = registry.buildAgentTools(() => context(undefined, budget))
       .find((item) => item.name === "view_page")!;
 
@@ -171,7 +182,7 @@ describe("tool registry", () => {
   it("reuses same-question delivered pages without re-rendering and without spending quota", async () => {
     const toolMedia = createToolMedia(dataHome);
     const registry = createToolRegistry();
-    const budget = { pagesDelivered: 0, deliveredMedia: new Map<number, string>() };
+    const budget = { pagesDelivered: 0, deliveredMedia: new Map<string, string>() };
     let renders = 0;
     const countingContext = () => ({
       ...context(undefined, budget),
@@ -197,6 +208,63 @@ describe("tool registry", () => {
     expect(secondDetails.media?.[0]?.path).toBe((first.details as { media?: Array<{ page: number; path: string }> }).media?.[0]?.path);
   });
 
+  it("views a single figure crop via the figure parameter with reuse and quota accounting (T53)", async () => {
+    const registry = createToolRegistry();
+    const toolMedia = createToolMedia(dataHome);
+    const budget = { pagesDelivered: 0, deliveredMedia: new Map<string, string>() };
+    let regionRenders = 0;
+    const countingContext = () => ({
+      ...context(undefined, budget),
+      savePageImage: toolMedia.savePageImage,
+      loadPageImage: toolMedia.loadPageImage,
+      renderRegionImage: async (id: string, page: number, bbox: [number, number, number, number], scale: number) => {
+        regionRenders += 1;
+        return pageRenderer.renderRegion(id, page, bbox, scale);
+      },
+    });
+    // 识别页 2 带两幅插图：figure 寻址与占位编号同序（第 2 幅 = 第二个 image 块）。
+    recognizedPagesByPage.set(`${bookId}:2`, [
+      { type: "text", text: "带图页", bbox: [0, 0, 1, 0.1] },
+      { type: "image", text: "", bbox: [0.1, 0.1, 0.45, 0.5] },
+      { type: "image", text: "", bbox: [0.55, 0.1, 0.9, 0.5] },
+    ]);
+    const tool = registry.buildAgentTools(countingContext).find((item) => item.name === "view_page")!;
+
+    const first = await tool.execute("call-figure-1", { pages: [2], figure: 2 });
+    expect(regionRenders).toBe(1);
+    const firstImage = first.content.find((block) => block.type === "image") as { data: string };
+    expect(firstImage.data.length).toBeGreaterThan(100);
+    const firstText = (first.content[0] as { text: string }).text;
+    expect(firstText).toContain("第 2 页插图 2 的原图裁剪");
+    const firstDetails = first.details as {
+      media?: Array<{ page: number; path: string }>;
+      evidence?: Array<{ page: number }>;
+      annotations?: string[];
+    };
+    expect(firstDetails.media?.[0]?.path).toContain("p2-f2-");
+    expect(firstDetails.evidence?.[0]?.page).toBe(2);
+    expect(firstDetails.annotations).toEqual(["本问图片预算：已用 1/20 页。"]);
+
+    // 同问同幅复用：不重复渲染、字节恒同、不扣额度；整页查看键独立、互不挤占。
+    const second = await tool.execute("call-figure-2", { pages: [2], figure: 2 });
+    expect(regionRenders).toBe(1);
+    expect((second.content.find((block) => block.type === "image") as { data: string }).data).toBe(firstImage.data);
+    const wholePage = await tool.execute("call-figure-3", { pages: [2] });
+    expect(wholePage.content.filter((block) => block.type === "image")).toHaveLength(1);
+    expect(budget.pagesDelivered).toBe(2);
+
+    // 编号越界与多页请求：软错误结果指引修正，不抛错。
+    const beyond = await tool.execute("call-figure-4", { pages: [2], figure: 3 });
+    expect((beyond.content[0] as { text: string }).text).toContain("没有第 3 号插图");
+    const multiPage = await tool.execute("call-figure-5", { pages: [1, 2], figure: 1 });
+    expect((multiPage.content[0] as { text: string }).text).toContain("只传该插图所在的一页");
+
+    // 额度用完后的插图查看：与整页同文案软拒绝。
+    budget.pagesDelivered = 20;
+    const exhausted = await tool.execute("call-figure-6", { pages: [2], figure: 1 });
+    expect((exhausted.content[0] as { text: string }).text).toContain("图片额度已用完（20 页）");
+  });
+
   it("keeps image quotas separate across questions", async () => {
     const registry = createToolRegistry();
     const toolOf = (budget: PageImageBudget) => registry.buildAgentTools(() => context(undefined, budget))
@@ -204,7 +272,7 @@ describe("tool registry", () => {
     await toolOf({ pagesDelivered: 0, deliveredMedia: new Map() }).execute("call-q1", { pages: [1, 2] });
 
     // 新的一问：页数额度与复用键都随运行重建（agent-host 每问新建预算对象）。
-    const secondBudget = { pagesDelivered: 0, deliveredMedia: new Map<number, string>() };
+    const secondBudget = { pagesDelivered: 0, deliveredMedia: new Map<string, string>() };
     const second = await toolOf(secondBudget).execute("call-q2", { pages: [3] });
     expect(second.content.filter((block) => block.type === "image")).toHaveLength(1);
     expect((second.details as { annotations?: string[] }).annotations).toEqual(["本问图片预算：已用 1/20 页。"]);

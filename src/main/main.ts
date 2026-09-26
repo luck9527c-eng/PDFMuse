@@ -334,6 +334,7 @@ app.whenReady().then(async () => {
         runId: context.runId,
         bookIndex,
         renderPageImage: pageRenderer.renderPage,
+        renderRegionImage: pageRenderer.renderRegion,
         savePageImage: toolMedia.savePageImage,
         loadPageImage: toolMedia.loadPageImage,
         webSearch,
