@@ -92,7 +92,7 @@ function createSearchBookTool(): RegisteredTool {
     description:
       "按关键词在整本书内定位相关页码，返回带来源的原文摘录（关键词与语义混合检索）。"
       + "页码为 PDF 页序号（从 1 开始），不是书内印刷页码。"
-      + "不确定相关内容在哪几页时用它定位；检索摘录只是片段，作答和讲解等应基于 read_pages 的整页原文。",
+      + "不确定相关内容在哪几页时用它定位；只需确认一小段原文（如习题题干、定义或结论句）时，命中片段本身即够用，不必再整页读取；讲解、总结等需要上下文的作答仍应基于 read_pages 的整页原文。",
     parameters: searchBookSchema,
     async execute(input, ctx) {
       // 参数已由 agent-loop 的 validateToolArguments 按 schema 校验；这里只做 schema 表达不了的语义收敛。
@@ -190,8 +190,9 @@ function createReadPagesTool(): RegisteredTool {
     name: "read_pages",
     title: "读取页面",
     description:
-      "按 PDF 页码列表整页读取文字（页码为页序号，从 1 开始，与书内印刷页码不同；扫描页读取 OCR 识别文本），一次可读多页、支持不连续页码。"
-      + "讲解、总结、复习某小节或某几页时用它读原文；不知道页码时先用 read_outline 查章节结构，或用 search_book 检索定位。"
+      "按 PDF 页码列表整页读取文字（页码为页序号，从 1 开始，与书内印刷页码不同；扫描页读取 OCR 识别文本），支持不连续页码；一次请求多页的目的是减少往返，不是提前备料。"
+      + "讲解、总结、复习某小节或某几页时用它读原文，讲解概念可读整个相关小节；不知道页码时先用 read_outline 查章节结构，或用 search_book 检索定位。"
+      + "按最小充分页集取页：只读回答真正依赖的页；页码已从选区、上文或检索得知时直接取该页；要确认小节或习题区的起止范围，查 read_outline 的页码。"
       + `单次只返回本次请求各页拼接全文的前 ${READ_PAGES_MAX_CHARS.toLocaleString("en-US")} 字符，末尾附续读 offset——offset 是该拼接全文中的字符偏移（不是页码偏移），用相同页码带上它继续读取省略的部分。`,
     parameters: readPagesSchema,
     async execute(input, ctx) {

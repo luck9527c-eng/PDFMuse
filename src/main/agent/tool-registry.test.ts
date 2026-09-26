@@ -195,7 +195,8 @@ describe("tool registry", () => {
     const searchBook = descriptions.get("search_book")!;
     expect(searchBook).toContain("定位相关页码");
     expect(searchBook).toContain("页码为 PDF 页序号（从 1 开始），不是书内印刷页码");
-    expect(searchBook).toContain("检索摘录只是片段");
+    expect(searchBook).toContain("命中片段本身即够用，不必再整页读取");
+    expect(searchBook).toContain("仍应基于 read_pages 的整页原文");
     expect(searchBook).not.toContain("没有每问次数限制");
     expect(searchBook).not.toContain("标准顺序");
     expect(searchBook).not.toContain("反复检索");
@@ -213,6 +214,9 @@ describe("tool registry", () => {
     expect(readPages).toContain("字符偏移（不是页码偏移）");
     expect(readPages).toContain("OCR 识别文本");
     expect(readPages).toContain("先用 read_outline 查章节结构");
+    expect(readPages).toContain("减少往返，不是提前备料");
+    expect(readPages).toContain("按最小充分页集取页");
+    expect(readPages).toContain("查 read_outline 的页码");
     expect(readPages).not.toContain("没有每问次数限制");
     expect(readPages).not.toContain("章节跨页");
     expect(readPages).not.toContain("从头部截断");
