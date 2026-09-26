@@ -9,6 +9,7 @@ import { createPageRenderer } from "../page-render.js";
 import { createToolRegistry, type PageImageBudget } from "./tool-registry.js";
 import { validateToolArguments } from "./openclaw-core.js";
 import { createToolMedia } from "../tool-media.js";
+import type { BookOutlineNode } from "../../shared/contracts.js";
 
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
 
@@ -19,9 +20,11 @@ describe("tool registry", () => {
   let pageRenderer: ReturnType<typeof createPageRenderer>;
   let bookId: string;
   const recognizedPagesByPage = new Map<string, Array<{ type: string; text: string; bbox: [number, number, number, number] }>>();
+  let outlineNodes: BookOutlineNode[] | undefined;
 
   beforeEach(async () => {
     recognizedPagesByPage.clear();
+    outlineNodes = undefined;
     dataHome = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-tools-"));
     library = createLibraryModule(dataHome);
     bookIndex = createBookIndex(dataHome, {
@@ -48,6 +51,7 @@ describe("tool registry", () => {
     return {
       bookId,
       bookIndex,
+      getOutline: (id: string) => (id === bookId ? outlineNodes : undefined),
       renderPageImage: (id: string, page: number, scale: number) => pageRenderer.renderPage(id, page, scale),
       renderRegionImage: (id: string, page: number, bbox: [number, number, number, number], scale: number) => pageRenderer.renderRegion(id, page, bbox, scale),
       savePageImage: async (id: string, page: number, _bytes: string, figure?: number) => (
@@ -58,9 +62,40 @@ describe("tool registry", () => {
     };
   }
 
-  it("exposes the four reading and search tools", () => {
+  it("exposes the five reading and search tools", () => {
     const registry = createToolRegistry();
-    expect(registry.toolNames()).toEqual(["search_book", "read_pages", "view_page", "search_web"]);
+    expect(registry.toolNames()).toEqual(["search_book", "read_outline", "read_pages", "view_page", "search_web"]);
+  });
+
+  it("renders the hierarchical outline tree with PDF page numbers via read_outline (T55)", async () => {
+    outlineNodes = [
+      {
+        id: "n1",
+        label: "第1章 数据的机器层次表示",
+        page: 35,
+        children: [
+          { id: "n1-1", label: "1.1 概述", page: 35, children: [] },
+          { id: "n1-2", label: "1.2 机器数表示", page: 36, children: [] },
+        ],
+      },
+      { id: "n2", label: "附录", children: [] },
+    ];
+    const registry = createToolRegistry();
+    const tool = registry.buildAgentTools(context).find((item) => item.name === "read_outline")!;
+    const result = await tool.execute("call-outline-1", {});
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toBe("第1章 数据的机器层次表示 …… 第 35 页\n  1.1 概述 …… 第 35 页\n  1.2 机器数表示 …… 第 36 页\n附录");
+    expect((result.details as { displaySummary?: string }).displaySummary).toContain("4 个条目");
+  });
+
+  it("notes honestly when the outline has not been built yet (T55)", async () => {
+    outlineNodes = undefined;
+    const registry = createToolRegistry();
+    const tool = registry.buildAgentTools(context).find((item) => item.name === "read_outline")!;
+    const result = await tool.execute("call-outline-2", {});
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("还没有可用目录");
+    expect(text).toContain("search_book");
   });
 
   it("delivers figure placeholders inline and retires the batch modality note (T53)", async () => {
@@ -154,7 +189,7 @@ describe("tool registry", () => {
     expect(description).not.toContain("无法保留");
   });
 
-  it("describes the three text tools with responsibility scope and page-number conventions (T54)", () => {
+  it("describes the four text tools with responsibility scope and page-number conventions (T54/T55)", () => {
     const registry = createToolRegistry();
     const descriptions = new Map(registry.buildAgentTools(context).map((tool) => [tool.name, tool.description]));
     const searchBook = descriptions.get("search_book")!;
@@ -165,11 +200,19 @@ describe("tool registry", () => {
     expect(searchBook).not.toContain("标准顺序");
     expect(searchBook).not.toContain("反复检索");
 
+    const readOutline = descriptions.get("read_outline")!;
+    expect(readOutline).toContain("带层级的章节结构与各节的 PDF 页序号（从 1 开始");
+    expect(readOutline).toContain("回答章节结构、全书组织类问题，或需要按章定位页码范围时使用");
+    expect(readOutline).toContain("如实标注");
+    expect(readOutline).not.toContain("额度");
+    expect(readOutline).not.toContain("没有次数限制");
+
     const readPages = descriptions.get("read_pages")!;
     expect(readPages).toContain("页序号，从 1 开始");
     expect(readPages).toContain("前 20,000 字符");
     expect(readPages).toContain("字符偏移（不是页码偏移）");
     expect(readPages).toContain("OCR 识别文本");
+    expect(readPages).toContain("先用 read_outline 查章节结构");
     expect(readPages).not.toContain("没有每问次数限制");
     expect(readPages).not.toContain("章节跨页");
     expect(readPages).not.toContain("从头部截断");

@@ -29,6 +29,7 @@ const INITIAL_STATE: ConversationControllerState = {
 
 const TOOL_TITLES: Record<string, string> = {
   search_book: "检索本书",
+  read_outline: "读取目录",
   read_pages: "读取页面",
   view_page: "查看页面原图",
   search_web: "联网搜索",

@@ -1,6 +1,6 @@
 import { Type, type Static, type TSchema } from "typebox";
 
-import type { ReadingFocus } from "../../shared/contracts.js";
+import type { BookOutlineNode, ReadingFocus } from "../../shared/contracts.js";
 import type { RegionBbox } from "../../shared/region.js";
 import type { RenderedPageImage } from "../page-render.js";
 import type { BookIndex } from "./book-index.js";
@@ -30,6 +30,8 @@ export type ToolExecutionContext = {
   signal?: AbortSignal;
   reportEvidence(evidence: PdfEvidence[]): void;
   bookIndex: BookIndex;
+  /** 目录读接口（book_outlines 表属目录模块）：read_outline 经此取章节树。 */
+  getOutline(bookId: string): BookOutlineNode[] | undefined;
   /** 页面渲染模块：视觉工具经此取页面原图，检索模块不再承担渲染。 */
   renderPageImage(bookId: string, page: number, scale: number): Promise<RenderedPageImage>;
   /** 页面区域渲染（T53 插图级寻址）：按识别块归一化 bbox 裁剪，整页同倍率下有效 DPI 更高。 */
@@ -134,6 +136,42 @@ function createSearchBookTool(): RegisteredTool {
   };
 }
 
+const readOutlineSchema = Type.Object({});
+
+/** read_outline：读取本书目录（章节树 + PDF 页序号），结构类问题与按章定位的入口。 */
+function createReadOutlineTool(): RegisteredTool {
+  return {
+    name: "read_outline",
+    title: "读取目录",
+    description:
+      "读取本书目录：返回带层级的章节结构与各节的 PDF 页序号（从 1 开始，与书内印刷页码不同）。"
+      + "回答章节结构、全书组织类问题，或需要按章定位页码范围时使用；目录未补全时结果会如实标注。",
+    parameters: readOutlineSchema,
+    async execute(_input, ctx) {
+      const nodes = ctx.getOutline(ctx.bookId);
+      // 空树是唯一可靠探测的「未补全」态；非空树如实呈现，不编造完成度断言。
+      if (!nodes || nodes.length === 0) {
+        return {
+          displaySummary: "目录尚未建立",
+          contentText: "本书还没有可用目录（无内置目录且自动补全未完成）；可改用 search_book 按关键词定位相关页码。",
+        };
+      }
+      const lines: string[] = [];
+      const walk = (items: BookOutlineNode[], depth: number) => {
+        for (const node of items) {
+          lines.push(`${"  ".repeat(depth)}${node.label}${node.page !== undefined ? ` …… 第 ${node.page} 页` : ""}`);
+          walk(node.children, depth + 1);
+        }
+      };
+      walk(nodes, 0);
+      return {
+        displaySummary: `已读取目录（${lines.length} 个条目）`,
+        contentText: lines.join("\n").slice(0, CONTENT_MAX_LENGTH),
+      };
+    },
+  };
+}
+
 const readPagesSchema = Type.Object({
   pages: Type.Array(Type.Integer({ minimum: 1 }), {
     minItems: 1,
@@ -153,7 +191,7 @@ function createReadPagesTool(): RegisteredTool {
     title: "读取页面",
     description:
       "按 PDF 页码列表整页读取文字（页码为页序号，从 1 开始，与书内印刷页码不同；扫描页读取 OCR 识别文本），一次可读多页、支持不连续页码。"
-      + "讲解、总结、复习某小节或某几页时用它读原文；不知道页码时先用 search_book 定位。"
+      + "讲解、总结、复习某小节或某几页时用它读原文；不知道页码时先用 read_outline 查章节结构，或用 search_book 检索定位。"
       + `单次只返回本次请求各页拼接全文的前 ${READ_PAGES_MAX_CHARS.toLocaleString("en-US")} 字符，末尾附续读 offset——offset 是该拼接全文中的字符偏移（不是页码偏移），用相同页码带上它继续读取省略的部分。`,
     parameters: readPagesSchema,
     async execute(input, ctx) {
@@ -462,7 +500,7 @@ function figureOutcome(
 
 export function createToolRegistry(options: { toolTimeoutMs?: number } = {}) {
   const toolTimeoutMs = options.toolTimeoutMs ?? TOOL_EXECUTION_TIMEOUT_MS;
-  const tools: RegisteredTool[] = [createSearchBookTool(), createReadPagesTool(), createViewPageTool(), createSearchWebTool()];
+  const tools: RegisteredTool[] = [createSearchBookTool(), createReadOutlineTool(), createReadPagesTool(), createViewPageTool(), createSearchWebTool()];
 
   /**
    * 单次工具 420 秒软超时（T50）：到点不抛错，返回软错误结果让模型换路继续；

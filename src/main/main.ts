@@ -325,6 +325,7 @@ app.whenReady().then(async () => {
         reportEvidence: context.reportEvidence,
         pageBudget: context.pageBudget,
         bookIndex,
+        getOutline: (id) => bookOutline.get(id),
         renderPageImage: pageRenderer.renderPage,
         renderRegionImage: pageRenderer.renderRegion,
         savePageImage: toolMedia.savePageImage,
