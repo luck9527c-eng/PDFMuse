@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { MineruBlock, ReadingFocus } from "../../shared/contracts.js";
+import type { RegionBbox } from "../../shared/region.js";
 import type { BookSource } from "../library.js";
 import { assembleBlockText, figureBlocks, stripFigurePlaceholderLines, type RecognizedBlockLike } from "./figure-placeholder.js";
 import { chunkPageText } from "./semantic-chunker.js";
@@ -324,7 +325,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   }
 
   /** 识别页第 figure 个插图块的 bbox（与页文本占位编号同一序）；view_page 插图级寻址经此取裁剪区域。 */
-  function recognizedFigureBbox(bookId: string, page: number, figure: number): [number, number, number, number] | undefined {
+  function recognizedFigureBbox(bookId: string, page: number, figure: number): RegionBbox | undefined {
     const blocks = options.readRecognizedBlocks?.(bookId, page);
     return blocks ? figureBlocks(blocks)[figure - 1]?.bbox : undefined;
   }
@@ -804,7 +805,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     },
 
     /** 识别页第 figure 个插图块的 bbox（与页文本占位编号同一序）；view_page 插图级寻址经此取裁剪区域。 */
-    recognizedFigureBbox(bookId: string, page: number, figure: number): [number, number, number, number] | undefined {
+    recognizedFigureBbox(bookId: string, page: number, figure: number): RegionBbox | undefined {
       return recognizedFigureBbox(bookId, page, figure);
     },
 

@@ -1,10 +1,9 @@
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 
+import { regionPixelRect, type RegionBbox } from "../shared/region.js";
+
 /** 页面渲染产物：PNG base64 与像素尺寸。 */
 export type RenderedPageImage = { imageData: string; width: number; height: number };
-
-/** 0-1 归一化页面区域（识别块 bbox 坐标系）。 */
-export type RegionBbox = [number, number, number, number];
 
 /** 书源加载：按 bookId 取原文件字节与已存密码；原文件只读，永不修改。 */
 export type PageBookSource = (bookId: string) => Promise<{ bytes: Uint8Array; password?: string }>;
@@ -47,26 +46,18 @@ export function createPageRenderer(loadBook: PageBookSource) {
 
   /**
    * 渲染页面的归一化 bbox 区域（T53 插图级寻址）：整页按倍率渲出后裁剪——同样的渲染
-   * 倍率下，裁剪交付的小图不被 provider 降采样，有效 DPI 高于整页图。
+   * 倍率下，裁剪交付的小图不被 provider 降采样，有效 DPI 高于整页图。像素换算与渲染端
+   * 块级对照共用 regionPixelRect。
    */
   async function renderRegion(bookId: string, pageNumber: number, bbox: RegionBbox, scale: number): Promise<RenderedPageImage> {
-    const [x0, y0, x1, y1] = bbox;
-    if (![x0, y0, x1, y1].every((value) => Number.isFinite(value)) || x1 <= x0 || y1 <= y0) {
-      throw new Error("裁剪区域无效。");
-    }
-    const { createCanvas } = await import("@napi-rs/canvas");
     const { canvas, cleanup } = await openPageCanvas(bookId, pageNumber, scale);
     try {
-      const left = Math.max(0, Math.floor(x0 * canvas.width));
-      const top = Math.max(0, Math.floor(y0 * canvas.height));
-      const right = Math.min(canvas.width, Math.ceil(x1 * canvas.width));
-      const bottom = Math.min(canvas.height, Math.ceil(y1 * canvas.height));
-      const width = right - left;
-      const height = bottom - top;
-      if (width <= 0 || height <= 0) throw new Error("裁剪区域落在页面之外。");
-      const crop = createCanvas(width, height);
-      crop.getContext("2d").drawImage(canvas, left, top, width, height, 0, 0, width, height);
-      return { imageData: crop.toBuffer("image/png").toString("base64"), width, height };
+      const rect = regionPixelRect(bbox, canvas.width, canvas.height);
+      if (!rect) throw new Error("裁剪区域无效或落在页面之外。");
+      const { createCanvas } = await import("@napi-rs/canvas");
+      const crop = createCanvas(rect.width, rect.height);
+      crop.getContext("2d").drawImage(canvas, rect.left, rect.top, rect.width, rect.height, 0, 0, rect.width, rect.height);
+      return { imageData: crop.toBuffer("image/png").toString("base64"), width: rect.width, height: rect.height };
     } finally {
       await cleanup();
     }

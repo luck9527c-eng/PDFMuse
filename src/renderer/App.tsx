@@ -45,6 +45,7 @@ import type {
   StartupPreflight,
 } from "../shared/contracts";
 import { APPEARANCE_DEFAULTS, MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES } from "../shared/contracts";
+import type { RegionBbox } from "../shared/region";
 import { IconButton } from "./components/IconButton";
 import { ConversationMessageItem } from "./components/ConversationMessageItem";
 import { DiagnosticsDrawer } from "./components/DiagnosticsDrawer";
@@ -594,7 +595,7 @@ export function App() {
   }, []);
 
   // 块级原图对照（T53）：识别块 bbox 高倍率裁剪直显——人眼对照取代被否决的置信度显示。
-  const compareBlockOriginal = useCallback(async (target: { page: number; bbox: [number, number, number, number] }, anchor: { x: number; y: number }) => {
+  const compareBlockOriginal = useCallback(async (target: { page: number; bbox: RegionBbox }, anchor: { x: number; y: number }) => {
     const dataUrl = await viewerRef.current?.getRegionImage(target.page, target.bbox);
     if (!dataUrl) {
       setSelectionFeedback({ message: "原图渲染失败，请重试。", tone: "error" });

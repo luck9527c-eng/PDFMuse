@@ -1,3 +1,5 @@
+import type { RegionBbox } from "./region.js";
+
 export type PreflightFailureCode =
   | "APPLICATION_DIRECTORY_NOT_WRITABLE"
   | "DATA_HOME_NOT_WRITABLE"
@@ -280,7 +282,7 @@ export type OcrPageResult =
   | { ok: true; page: RecognizedPageText }
   | { ok: false; code: "VALIDATION_ERROR" | "UNAVAILABLE" | "FAILED" | "CANCELLED"; message: string };
 
-export type MineruBlock = { type: string; text: string; bbox: [number, number, number, number] };
+export type MineruBlock = { type: string; text: string; bbox: RegionBbox };
 export type MineruPageRequest = { page: number; pdfPath: string; priority?: OcrDispatchPriority };
 export type MineruPageData = { blocks: MineruBlock[]; markdown: string };
 export type MineruWorkerResponse =

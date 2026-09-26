@@ -15,6 +15,7 @@ import {
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 import type { BookOutlineNode, OpenedPdfBook, ReadingZoomMode, RecognizedPageText, SelectedPassage } from "../../shared/contracts";
+import { regionPixelRect, type RegionBbox } from "../../shared/region";
 import { normalizePageRects, ocrAnchorBlock, type Rectangle } from "./selection-geometry";
 import { mountRecognizedTextLayer } from "./ocr-text-layer";
 
@@ -47,7 +48,7 @@ export interface PdfViewerHandle {
   hasNativeText(page: number): Promise<boolean>;
   getThumbnail(page: number): Promise<string | undefined>;
   getPageImage(page: number, scale?: number): Promise<{ data: string; width: number; height: number } | undefined>;
-  getRegionImage(page: number, bbox: [number, number, number, number], scale?: number): Promise<string | undefined>;
+  getRegionImage(page: number, bbox: RegionBbox, scale?: number): Promise<string | undefined>;
 }
 
 export type ViewerSelection =
@@ -56,7 +57,7 @@ export type ViewerSelection =
       passage: SelectedPassage;
       popover: { x: number; y: number };
       /** 选区起点落在扫描页识别块上时携带：块级原图对照（T53）经 bbox 裁剪渲染端 pdfjs 直渲。 */
-      ocr?: { page: number; bbox: [number, number, number, number] };
+      ocr?: { page: number; bbox: RegionBbox };
     }
   | {
       kind: "rejected";
@@ -235,8 +236,9 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         return { data: canvas.toDataURL("image/png").replace(/^data:image\/png;base64,/, ""), width: canvas.width, height: canvas.height };
       }).catch(() => undefined);
     },
-    // 块级原图对照（T53）：识别块 bbox 区域高倍率渲染后裁剪——人工校对取代被否决的置信度显示。
-    getRegionImage(pageNumber, bbox, scale = 3) {
+    // 块级原图对照（T53）：识别块 bbox 区域高倍率渲染后裁剪——人工校对取代被否决的置信度显示；
+    // 像素换算与主进程 view_page 插图裁剪共用 regionPixelRect，两端裁剪一致。
+    getRegionImage(pageNumber: number, bbox: RegionBbox, scale = 3) {
       const adapter = adapterRef.current;
       if (!adapter?.document || pageNumber < 1 || pageNumber > adapter.document.numPages) return Promise.resolve(undefined);
       return adapter.document.getPage(pageNumber).then(async (page) => {
@@ -247,18 +249,14 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         const context = canvas.getContext("2d", { alpha: false });
         if (!context) return undefined;
         await page.render({ canvas, canvasContext: context, viewport }).promise;
-        const [x0, y0, x1, y1] = bbox;
-        const left = Math.max(0, Math.floor(x0 * canvas.width));
-        const top = Math.max(0, Math.floor(y0 * canvas.height));
-        const right = Math.min(canvas.width, Math.ceil(x1 * canvas.width));
-        const bottom = Math.min(canvas.height, Math.ceil(y1 * canvas.height));
-        if (right <= left || bottom <= top) return undefined;
+        const rect = regionPixelRect(bbox, canvas.width, canvas.height);
+        if (!rect) return undefined;
         const crop = document.createElement("canvas");
-        crop.width = right - left;
-        crop.height = bottom - top;
+        crop.width = rect.width;
+        crop.height = rect.height;
         const cropContext = crop.getContext("2d", { alpha: false });
         if (!cropContext) return undefined;
-        cropContext.drawImage(canvas, left, top, crop.width, crop.height, 0, 0, crop.width, crop.height);
+        cropContext.drawImage(canvas, rect.left, rect.top, rect.width, rect.height, 0, 0, rect.width, rect.height);
         return crop.toDataURL("image/png");
       }).catch(() => undefined);
     },

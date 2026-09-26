@@ -1,3 +1,5 @@
+import type { RegionBbox } from "../../shared/region.js";
+
 /**
  * 插图占位（T53）：image 块 text 恒为空、在页文本中不可见——装配层为每个插图块发一行
  * 自描述占位（编号 + 尺寸），升级方式落在图所在的位置，取代 read_pages 的整批模态注记。
@@ -8,14 +10,14 @@
 export type RecognizedBlockLike = {
   text: string;
   type?: string;
-  bbox?: [number, number, number, number];
+  bbox?: RegionBbox;
 };
 
-/** 占位行的稳定前缀与后缀：识别谓词只认我们自己生成的形状。 */
-const FIGURE_PLACEHOLDER_PREFIX = "[插图 ";
+/** 占位行的精确形状（识别谓词只认我们自己生成的完整格式，正文撞前缀不误伤）。 */
+const FIGURE_PLACEHOLDER_PATTERN = /^\[插图 \d+·约占页面 \d+%：内容不可见，可用 view_page 查看第 \d+ 页插图 \d+\]$/;
 
 /** 插图块在页文本中的占位行：编号为页内第 N 个插图块（1 起），尺寸为 bbox 面积占比。 */
-export function figurePlaceholderLine(page: number, figure: number, bbox: [number, number, number, number]): string {
+export function figurePlaceholderLine(page: number, figure: number, bbox: RegionBbox): string {
   const [x0, y0, x1, y1] = bbox;
   const area = Math.max(0, Math.min(1, (x1 - x0))) * Math.max(0, Math.min(1, (y1 - y0)));
   const percent = Math.max(1, Math.min(100, Math.round(area * 100)));
@@ -24,7 +26,7 @@ export function figurePlaceholderLine(page: number, figure: number, bbox: [numbe
 
 /** 行是否为插图占位（FTS 与语义切片按此剔除）。 */
 export function isFigurePlaceholderLine(line: string): boolean {
-  return line.startsWith(FIGURE_PLACEHOLDER_PREFIX) && line.endsWith("]");
+  return FIGURE_PLACEHOLDER_PATTERN.test(line);
 }
 
 /** 去除文本中的全部占位行，保留其余行与换行结构。 */
@@ -35,7 +37,7 @@ export function stripFigurePlaceholderLines(text: string): string {
     .join("\n");
 }
 
-function isFiniteBbox(bbox: [number, number, number, number]): boolean {
+function isFiniteBbox(bbox: RegionBbox): boolean {
   return bbox.every((value) => Number.isFinite(value)) && bbox[2] > bbox[0] && bbox[3] > bbox[1];
 }
 

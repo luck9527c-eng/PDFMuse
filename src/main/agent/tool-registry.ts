@@ -1,6 +1,7 @@
 import { Type, type Static, type TSchema } from "typebox";
 
 import type { ReadingFocus } from "../../shared/contracts.js";
+import type { RegionBbox } from "../../shared/region.js";
 import type { RenderedPageImage } from "../page-render.js";
 import type { BookIndex } from "./book-index.js";
 import type { AgentTool, AgentToolResult } from "./openclaw-core.js";
@@ -34,7 +35,7 @@ export type ToolExecutionContext = {
   /** 页面渲染模块：视觉工具经此取页面原图，检索模块不再承担渲染。 */
   renderPageImage(bookId: string, page: number, scale: number): Promise<RenderedPageImage>;
   /** 页面区域渲染（T53 插图级寻址）：按识别块归一化 bbox 裁剪，整页同倍率下有效 DPI 更高。 */
-  renderRegionImage(bookId: string, page: number, bbox: [number, number, number, number], scale: number): Promise<RenderedPageImage>;
+  renderRegionImage(bookId: string, page: number, bbox: RegionBbox, scale: number): Promise<RenderedPageImage>;
   /** 每问图片预算（agent-host 每问新建、跨调用共享）：页数额度钳制与同问复用在工具层执行。 */
   pageBudget: PageImageBudget;
   /** 原图转存 book 媒体目录（T44）：live 与回放共享同一份文件字节，会话库只存相对路径；figure 存在时为单幅裁剪。 */
@@ -279,11 +280,35 @@ function imageBudgetKey(page: number, figure?: number): string {
   return figure === undefined ? `${page}` : `${page}:${figure}`;
 }
 
+/** 额度用尽的软拒绝（整页与插图共用同一文案）。 */
+function quotaExhaustedOutcome(): ToolExecutionOutcome {
+  return {
+    displaySummary: "图片额度已用完",
+    contentText: `图片额度已用完（${MAX_PAGE_IMAGE_PAGES} 页），不要再调用 view_page，用文字工具继续。`,
+  };
+}
+
+/** 同问复用：按键读回既有媒体字节（不重复渲染、不扣额度）；文件缺失删键返回 null（调用方回退新渲染）。 */
+async function reuseDeliveredMedia(
+  ctx: ToolExecutionContext,
+  budget: PageImageBudget,
+  key: string,
+): Promise<{ data: string; path: string } | null> {
+  const existing = budget.deliveredMedia.get(key);
+  if (!existing) return null;
+  const data = (await ctx.loadPageImage?.(existing)) ?? null;
+  if (!data) {
+    budget.deliveredMedia.delete(key);
+    return null;
+  }
+  return { data, path: existing };
+}
+
 /** 渲染整页或其归一化 bbox 裁剪，并在超出 provider 硬限制时按比例降采样重渲。 */
 async function renderWithinHardLimits(
   ctx: ToolExecutionContext,
   page: number,
-  region?: [number, number, number, number],
+  region?: RegionBbox,
 ): Promise<RenderedPageImage> {
   let scale = region === undefined ? 2 : FIGURE_RENDER_SCALE;
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -310,7 +335,7 @@ function createViewPageTool(): RegisteredTool {
       + "当答案依赖识别页中的关键公式或数字、且文本形式可疑（符号异常、等式不成立、上下文矛盾）时，可用本工具查看该页原图核对；原生文本页无需核对。"
       + "识别页的 read_pages 文本中每幅插图带 [插图 N·约占页面 X%] 占位行：需要读图时优先只传该页页码并带 figure=N 取单幅裁剪（更清晰），核对公式或对照整页版式时才看整页。"
       + "先用 search_book、read_pages 或上一轮回答引用的原文把范围定位到具体页码后再调用本工具；默认只查看 1 页，确需相邻页对照或跨页内容时才增加。"
-      + `本问内图片查看按张数计量（整页与单幅插图裁剪各计 1，共 ${MAX_PAGE_IMAGE_PAGES} 页额度，已看过的图重复查看不消耗额度），没有次数限制；额度用完后本工具不再出图，请把额度花在最需要的图上。`,
+      + `本问内图片查看按页额度计量（整页与单幅插图裁剪各计 1 页，共 ${MAX_PAGE_IMAGE_PAGES} 页，已看过的图重复查看不消耗额度），没有次数限制；额度用完后本工具不再出图，请把额度花在最需要的图上。`,
     parameters: viewPageSchema,
     async execute(input, ctx) {
       const { pages, figure } = input as Static<typeof viewPageSchema>;
@@ -335,15 +360,10 @@ async function executeWholePageView(
   const overBudget: number[] = [];
   // 复用优先：本问已交付图读回既有媒体字节（不重复渲染、不扣额度）；文件缺失回退新渲染。
   for (const page of requested) {
-    const existing = budget.deliveredMedia.get(imageBudgetKey(page));
-    if (!existing) continue;
-    const data = (await ctx.loadPageImage?.(existing)) ?? null;
-    if (data) {
-      images.push({ page, mimeType: "image/png", data });
-      media.push({ page, path: existing });
-    } else {
-      budget.deliveredMedia.delete(imageBudgetKey(page));
-    }
+    const reused = await reuseDeliveredMedia(ctx, budget, imageBudgetKey(page));
+    if (!reused) continue;
+    images.push({ page, mimeType: "image/png", data: reused.data });
+    media.push({ page, path: reused.path });
   }
   // 新页渲染：按剩余页数额度钳制，超出的页不渲染并附注。
   const remainingAtRequest = Math.max(0, MAX_PAGE_IMAGE_PAGES - budget.pagesDelivered);
@@ -367,10 +387,7 @@ async function executeWholePageView(
   if (images.length === 0) {
     const quotaLeft = MAX_PAGE_IMAGE_PAGES - budget.pagesDelivered;
     return quotaLeft <= 0
-      ? {
-          displaySummary: "图片额度已用完",
-          contentText: `图片额度已用完（${MAX_PAGE_IMAGE_PAGES} 页），不要再调用 view_page，用文字工具继续。`,
-        }
+      ? quotaExhaustedOutcome()
       : failed.length > 0
         ? { displaySummary: "原图渲染失败", contentText: "无法渲染所选页面，请检查页码是否在本书范围内。" }
         : { displaySummary: "没有可交付的页面", contentText: "请求的页面均未能查看，请检查页码后重试。" };
@@ -413,18 +430,9 @@ async function executeFigureView(
   const page = requested[0]!;
   const key = imageBudgetKey(page, figure);
   // 复用优先：同问同幅插图读回既有媒体字节。
-  const existing = budget.deliveredMedia.get(key);
-  if (existing) {
-    const data = (await ctx.loadPageImage?.(existing)) ?? null;
-    if (data) return figureOutcome(page, figure, data, existing, budget);
-    budget.deliveredMedia.delete(key);
-  }
-  if (budget.pagesDelivered >= MAX_PAGE_IMAGE_PAGES) {
-    return {
-      displaySummary: "图片额度已用完",
-      contentText: `图片额度已用完（${MAX_PAGE_IMAGE_PAGES} 页），不要再调用 view_page，用文字工具继续。`,
-    };
-  }
+  const reused = await reuseDeliveredMedia(ctx, budget, key);
+  if (reused) return figureOutcome(page, figure, reused.data, reused.path, budget);
+  if (budget.pagesDelivered >= MAX_PAGE_IMAGE_PAGES) return quotaExhaustedOutcome();
   const bbox = ctx.bookIndex.recognizedFigureBbox(ctx.bookId, page, figure);
   if (!bbox) {
     return {
