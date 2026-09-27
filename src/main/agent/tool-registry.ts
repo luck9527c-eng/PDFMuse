@@ -71,8 +71,8 @@ type RegisteredTool = {
 };
 
 const QUERY_MAX_LENGTH = 200;
-/** 每问联网搜索子额度（T50 Tool Quota，与 Run Budget 独立计数）：执行即扣，缓存命中也扣。 */
-export const MAX_SEARCH_WEB_CALLS = 3;
+/** 每问联网搜索子额度（T50 Tool Quota，与 Run Budget 独立计数）：执行即扣，缓存命中也扣；Reader 2026-09-27 调至 5。 */
+export const MAX_SEARCH_WEB_CALLS = 5;
 /** 单次工具调用统一软超时（T50）：罩住建索引与实际检索；到点返回软错误结果，模型可继续。 */
 const TOOL_EXECUTION_TIMEOUT_MS = 420_000;
 const CONTENT_MAX_LENGTH = 8_000;

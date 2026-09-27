@@ -2173,13 +2173,15 @@ describe("agent host", () => {
     expect(runRows).toEqual([{ exit_reason: "completed", rounds_used: 4, rounds_total: 50 }]);
   });
 
-  it("soft-blocks search_web beyond three calls per question while book tools keep working (T50)", async () => {
-    // 三次 search_web 用满额度后，第 4 次被软拒；书内工具照常可用。
+  it("soft-blocks search_web beyond five calls per question while book tools keep working (T50)", async () => {
+    // 五次 search_web 用满额度后，第 6 次被软拒；书内工具照常可用。
     const script: Array<{ tool: string; query: string }> = [
       { tool: "search_web", query: "甲" },
       { tool: "search_web", query: "乙" },
       { tool: "search_web", query: "丙" },
       { tool: "search_web", query: "丁" },
+      { tool: "search_web", query: "戊" },
+      { tool: "search_web", query: "己" },
       { tool: "book_probe", query: "书内" },
     ];
     let calls = 0;
@@ -2231,11 +2233,13 @@ describe("agent host", () => {
     await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
 
     const { toolRows } = readRunRows();
-    expect(toolRows.map((row) => row.status)).toEqual(["executed", "executed", "executed", "rejected", "executed"]);
-    expect(String(toolRows[3]?.result_text)).toContain("联网额度已用完（3 次）");
-    expect(String(toolRows[3]?.result_text)).toContain("不要再调用 search_web");
+    expect(toolRows.map((row) => row.status)).toEqual([
+      "executed", "executed", "executed", "executed", "executed", "rejected", "executed",
+    ]);
+    expect(String(toolRows[5]?.result_text)).toContain("联网额度已用完（5 次）");
+    expect(String(toolRows[5]?.result_text)).toContain("不要再调用 search_web");
     // 联网额度用满后书内工具照常可用（不同工具，不落入检出链）。
-    expect(String(toolRows[4]?.result_text)).toContain("书内结果 书内");
+    expect(String(toolRows[6]?.result_text)).toContain("书内结果 书内");
     // 诊断里被拒的联网调用带「已达上限」标记。
     const diagnostics = host.listDiagnostics(BOOK_ID);
     const blocked = diagnostics.at(-1)?.toolCalls.find((toolCall) => toolCall.blocked);
