@@ -437,8 +437,6 @@ async function executeWholePageView(
     evidence,
     images,
     media,
-    // 额度回显走注解层（T50）：逐次变化的文本不进指纹哈希，由 agent-host 后置合成。
-    annotations: [`本问图片预算：已用 ${budget.pagesDelivered}/${MAX_PAGE_IMAGE_PAGES} 页。`],
   };
 }
 
@@ -459,7 +457,7 @@ async function executeFigureView(
   const key = imageBudgetKey(page, figure);
   // 复用优先：同问同幅插图读回既有媒体字节。
   const reused = await reuseDeliveredMedia(ctx, budget, key);
-  if (reused) return figureOutcome(page, figure, reused.data, reused.path, budget);
+  if (reused) return figureOutcome(page, figure, reused.data, reused.path);
   if (budget.pagesDelivered >= MAX_PAGE_IMAGE_PAGES) return quotaExhaustedOutcome();
   const bbox = ctx.bookIndex.recognizedFigureBbox(ctx.bookId, page, figure);
   if (!bbox) {
@@ -473,7 +471,7 @@ async function executeFigureView(
     const saved = await ctx.savePageImage(ctx.bookId, page, rendered.imageData, figure);
     budget.deliveredMedia.set(key, saved.relativePath);
     budget.pagesDelivered += 1;
-    return figureOutcome(page, figure, rendered.imageData, saved.relativePath, budget);
+    return figureOutcome(page, figure, rendered.imageData, saved.relativePath);
   } catch {
     return {
       displaySummary: "插图渲染失败",
@@ -487,7 +485,6 @@ function figureOutcome(
   figure: number,
   data: string,
   mediaPath: string,
-  budget: PageImageBudget,
 ): ToolExecutionOutcome {
   return {
     displaySummary: `已附上第 ${page} 页插图 ${figure} 原图`,
@@ -495,7 +492,6 @@ function figureOutcome(
     evidence: [{ source: "pdf", page, snippet: `（已查看第 ${page} 页插图 ${figure} 原图）`, trust: "trusted", score: 1 }],
     images: [{ page, mimeType: "image/png", data }],
     media: [{ page, path: mediaPath }],
-    annotations: [`本问图片预算：已用 ${budget.pagesDelivered}/${MAX_PAGE_IMAGE_PAGES} 页。`],
   };
 }
 

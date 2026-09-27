@@ -237,10 +237,11 @@ describe("tool registry", () => {
     const first = await tool.execute("call-budget-1", { pages: [1, 2, 3] });
     const firstText = (first.content[0] as { text: string }).text;
     expect(first.content.filter((block) => block.type === "image")).toHaveLength(2);
-    // 额度回显走注解层（T50）：逐次变化的文本不进指纹哈希，也不直接出现在基础文本里。
+    // 逐次额度回显已退役（Reader 2026-09-27）：额度只在撞墙时说话，成功结果零额度文本。
     expect(firstText).not.toContain("本问图片预算");
-    expect((first.details as { annotations?: string[] }).annotations).toEqual(["本问图片预算：已用 20/20 页。"]);
-    // 只剩 2 页：钳制交付页 1、2，页 3 不渲染、不进证据。
+    expect(firstText).not.toContain("额度：已用");
+    expect((first.details as { annotations?: string[] }).annotations).toBeUndefined();
+    // 只剩 2 页：钳制交付页 1、2，页 3 不渲染、不进证据（边界处的部分交付说明保留）。
     expect(firstText).toContain("额度只剩 2 页");
     expect(firstText).toContain("第 3 页未附上");
     const details = first.details as { evidence?: Array<{ page: number }> };
@@ -319,7 +320,8 @@ describe("tool registry", () => {
     };
     expect(firstDetails.media?.[0]?.path).toContain("p2-f2-");
     expect(firstDetails.evidence?.[0]?.page).toBe(2);
-    expect(firstDetails.annotations).toEqual(["本问图片预算：已用 1/20 页。"]);
+    expect(firstDetails.annotations).toBeUndefined();
+    expect(firstText).not.toContain("本问图片预算");
 
     // 同问同幅复用：不重复渲染、字节恒同、不扣额度；整页查看键独立、互不挤占。
     const second = await tool.execute("call-figure-2", { pages: [2], figure: 2 });
@@ -351,7 +353,7 @@ describe("tool registry", () => {
     const secondBudget = { pagesDelivered: 0, deliveredMedia: new Map<string, string>() };
     const second = await toolOf(secondBudget).execute("call-q2", { pages: [3] });
     expect(second.content.filter((block) => block.type === "image")).toHaveLength(1);
-    expect((second.details as { annotations?: string[] }).annotations).toEqual(["本问图片预算：已用 1/20 页。"]);
+    expect((second.details as { annotations?: string[] }).annotations).toBeUndefined();
   });
 
   it("continues reading truncated pages with the offset parameter", async () => {
