@@ -39,6 +39,9 @@ type JobRow = {
 export type JobExecutorContext = {
   signal: AbortSignal;
   checkpoint(value: string | undefined, progress: number, total?: number): void;
+  /** 让位（T57-04）：任务请求自暂停（走暂停/断点机制），串行泵让排队任务先行，
+   *  队列空闲后自动恢复续跑。只应在数据依赖就绪时调用一次——重复调用会形成让位循环。 */
+  yieldOnce(): void;
 };
 
 export type JobExecutor = (job: BackgroundJob, context: JobExecutorContext) => Promise<void>;
@@ -139,6 +142,8 @@ export function createBackgroundJobModule(
     resolveSettled(): void;
     action?: "pause" | "cancel";
   }>();
+  // 让位任务登记：执行器 yieldOnce 后自暂停，泵在队列空闲时自动恢复（FIFO，一次一个）。
+  const yieldedJobIds = new Set<string>();
   let pumping = false;
   let closed = false;
 
@@ -186,7 +191,18 @@ export function createBackgroundJobModule(
             FROM background_jobs WHERE status = 'queued'
             ORDER BY priority DESC, created_at ASC LIMIT 1
           `).get() as JobRow | undefined;
-          if (!row) break;
+          if (!row) {
+            // 队列空闲：恢复一个让位任务。已取消或已被 Reader 恢复的条目直接消费掉，
+            // 不强行复活——Reader 的手动操作优先于让位通道。
+            const yieldId = yieldedJobIds.values().next().value;
+            if (yieldId === undefined) break;
+            yieldedJobIds.delete(yieldId);
+            const yieldRow = rowFor(yieldId);
+            if (yieldRow?.status === "paused") {
+              update(yieldId, "status = ?, claim_id = NULL", ["queued"]);
+            }
+            continue;
+          }
           const executor = executors[row.kind];
           if (!executor) {
             update(row.id, "status = ?, error_message = ?", ["failed", "当前任务类型尚未配置执行器。"]);
@@ -201,16 +217,23 @@ export function createBackgroundJobModule(
           update(row.id, "status = ?, attempts = attempts + 1, claim_id = ?, error_message = NULL", ["running", claimId]);
           const running = toJob(rowFor(row.id)!);
           try {
-            await executor(running, {
-              signal: controller.signal,
-              checkpoint(value, progress, total = running.total) {
-                if (closed) return;
-                const boundedProgress = Math.max(0, Math.min(total, Math.floor(progress)));
-                const result = database.prepare("UPDATE background_jobs SET progress = ?, total = ?, checkpoint = ?, updated_at = ? WHERE id = ? AND status = 'running' AND claim_id = ?")
-                  .run(boundedProgress, total, value ?? null, now(), row.id, claimId);
-                if (Number(result.changes) > 0) notify(row.book_id);
-              },
-            });
+          await executor(running, {
+            signal: controller.signal,
+            checkpoint(value, progress, total = running.total) {
+              if (closed) return;
+              const boundedProgress = Math.max(0, Math.min(total, Math.floor(progress)));
+              const result = database.prepare("UPDATE background_jobs SET progress = ?, total = ?, checkpoint = ?, updated_at = ? WHERE id = ? AND status = 'running' AND claim_id = ?")
+                .run(boundedProgress, total, value ?? null, now(), row.id, claimId);
+              if (Number(result.changes) > 0) notify(row.book_id);
+            },
+            yieldOnce() {
+              const state = active.get(row.id);
+              if (!state || state.action) return;
+              state.action = "pause";
+              yieldedJobIds.add(row.id);
+              state.controller.abort();
+            },
+          });
             if (!closed && !settleRequestedAction(row.id)) {
               update(row.id, "status = ?, progress = total, claim_id = NULL, error_message = NULL", ["completed"]);
             }
@@ -366,6 +389,7 @@ export function createBackgroundJobModule(
         state.resolveSettled();
       }
       active.clear();
+      yieldedJobIds.clear();
       database.close();
     },
   };

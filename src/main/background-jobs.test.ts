@@ -234,4 +234,100 @@ describe("background jobs", () => {
     expect(module.list(BOOK_B)).toHaveLength(1);
   });
 
+  it("lets a running job yield to queued jobs and auto-resumes when the queue idles", async () => {
+    const events: string[] = [];
+    let yielded = false;
+    module = createBackgroundJobModule(dataHome, {
+      ocr: async (_job, context) => {
+        events.push("ocr:start");
+        const aborted = new Promise<void>((resolve) => {
+          context.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        if (!yielded) {
+          yielded = true;
+          context.yieldOnce();
+        }
+        if (context.signal.aborted) {
+          await aborted;
+          throw new Error("OCR 任务已暂停或取消。");
+        }
+        events.push("ocr:done");
+      },
+      outline: async () => {
+        events.push("outline:done");
+      },
+    });
+    // 真实时序：开书即同时排队 outline 与 ocr，OCR 先跑、让位后 outline 先行。
+    module.schedule({ bookId: BOOK_A, kind: "ocr", priority: 20 });
+    module.schedule({ bookId: BOOK_A, kind: "outline", priority: 5 });
+    await waitFor(() => module?.list(BOOK_A).every((job) => job.status === "completed") ?? false);
+    // 让位任务自暂停 → 排队任务先行 → 队列空闲后自动恢复续跑。
+    expect(events).toEqual(["ocr:start", "outline:done", "ocr:start", "ocr:done"]);
+  });
+
+  it("does not auto-resume a yielded job the reader cancelled while it waited", async () => {
+    const events: string[] = [];
+    let yielded = false;
+    let releaseOutline: (() => void) | undefined;
+    module = createBackgroundJobModule(dataHome, {
+      ocr: async (_job, context) => {
+        events.push("ocr:start");
+        const aborted = new Promise<void>((resolve) => {
+          context.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        if (!yielded) {
+          yielded = true;
+          context.yieldOnce();
+        }
+        if (context.signal.aborted) {
+          await aborted;
+          throw new Error("OCR 任务已暂停或取消。");
+        }
+        events.push("ocr:done");
+      },
+      outline: async () => {
+        events.push("outline:start");
+        await new Promise<void>((resolve) => { releaseOutline = resolve; });
+        events.push("outline:done");
+      },
+    });
+    module.schedule({ bookId: BOOK_A, kind: "ocr", priority: 20 });
+    module.schedule({ bookId: BOOK_A, kind: "outline", priority: 5 });
+    // OCR 让位自暂停，outline 已在运行：Reader 在让位等待期取消 OCR。
+    await waitFor(() => module?.list(BOOK_A).find((job) => job.kind === "outline")?.status === "running" ?? false);
+    const ocrJob = module.list(BOOK_A).find((job) => job.kind === "ocr");
+    if (ocrJob) await module.cancel(ocrJob.id);
+    releaseOutline?.();
+    await waitFor(() => module?.list(BOOK_A).every((job) => job.status === "completed" || job.status === "cancelled") ?? false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(events).toEqual(["ocr:start", "outline:start", "outline:done"]);
+    expect(module.list(BOOK_A).find((job) => job.kind === "ocr")?.status).toBe("cancelled");
+  });
+
+  it("keeps a reader-paused job paused instead of auto-resuming it", async () => {
+    const events: string[] = [];
+    module = createBackgroundJobModule(dataHome, {
+      ocr: async (_job, context) => {
+        events.push("ocr:start");
+        await new Promise<void>((resolve) => {
+          context.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        throw new Error("OCR 任务已暂停或取消。");
+      },
+      outline: async () => {
+        events.push("outline:done");
+      },
+    });
+    const ocrJob = module.schedule({ bookId: BOOK_A, kind: "ocr", priority: 20 });
+    await waitFor(() => module?.list(BOOK_A)[0]?.status === "running");
+    if (ocrJob.ok) await module.pause(ocrJob.job.id);
+    await waitFor(() => module?.list(BOOK_A)[0]?.status === "paused");
+    module.schedule({ bookId: BOOK_A, kind: "outline", priority: 5 });
+    await waitFor(() => module?.list(BOOK_A).every((job) => job.status !== "queued" && job.status !== "running") ?? false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Reader 主动暂停的任务不经让位通道自动恢复。
+    expect(events).toEqual(["ocr:start", "outline:done"]);
+    expect(module.list(BOOK_A).find((job) => job.kind === "ocr")?.status).toBe("paused");
+  });
+
 });

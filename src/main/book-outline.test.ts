@@ -11,6 +11,7 @@ import {
   findOutlineChapterRange,
   findOutlineSectionPath,
   locateTocPages,
+  shouldYieldToOutline,
   type BookOutlineAiDeps,
   type OpenOutlineDocument,
   type OutlineHeading,
@@ -770,6 +771,40 @@ describe("toc page locator", () => {
     expect(result.covered).toBe(false);
     expect(result.hits).toEqual([1]);
     expect(result.pages).toEqual([1, 2]);
+  });
+});
+
+describe("outline yield probe", () => {
+  function probe(specs: Array<[page: number, index: boolean]>) {
+    return specs.map(([page, hasIndexBlock]) => ({ page, hasIndexBlock }));
+  }
+
+  it("yields when the probe window is fully scanned even without index pages", () => {
+    expect(shouldYieldToOutline([], 30, 100)).toBe(true);
+    expect(shouldYieldToOutline(probe([[1, false], [2, false]]), 2, 100)).toBe(false);
+    expect(shouldYieldToOutline(probe([[1, false], [2, false]]), 30, 100)).toBe(true);
+  });
+
+  it("yields on run-end once the gap pages after the last index page are scanned and index-free", () => {
+    const pages = probe([[1, false], [2, true], [3, false], [4, false]]);
+    // 最后一个 index 页 M=2：gap 页 3 已扫但 4 未扫，不能下结论。
+    expect(shouldYieldToOutline(pages, 3, 100)).toBe(false);
+    // 3、4 已扫且无 index → 目录区已结束。
+    expect(shouldYieldToOutline(pages, 4, 100)).toBe(true);
+  });
+
+  it("does not yield while index pages keep appearing within the gap", () => {
+    const pages = probe([[1, false], [2, true], [3, false], [4, true], [5, false], [6, false]]);
+    expect(shouldYieldToOutline(pages, 4, 100)).toBe(false);
+    expect(shouldYieldToOutline(pages, 5, 100)).toBe(false);
+    expect(shouldYieldToOutline(pages, 6, 100)).toBe(true);
+  });
+
+  it("never yields before the window is adjudicable", () => {
+    expect(shouldYieldToOutline([], 0, 10)).toBe(false);
+    expect(shouldYieldToOutline(probe([[1, true]]), 0, 10)).toBe(false);
+    // 单页书：窗口即全书，扫完即覆盖。
+    expect(shouldYieldToOutline([], 1, 1)).toBe(true);
   });
 });
 

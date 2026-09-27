@@ -24,7 +24,15 @@ import { createWorkerMineruEngine } from "./mineru.js";
 import { createPageRenderer } from "./page-render.js";
 import { createBackgroundJobModule } from "./background-jobs.js";
 import { createRecognizedTextIngestion } from "./recognized-text-ingestion.js";
-import { createBookOutlineModule, findOutlineChapterRange, findOutlineSectionPath } from "./book-outline.js";
+import {
+  createBookOutlineModule,
+  findOutlineChapterRange,
+  findOutlineSectionPath,
+  shouldYieldToOutline,
+  TOC_PROBE_WINDOW_PAGES,
+  TOC_YIELD_GAP_PAGES,
+  type OutlineYieldProbePage,
+} from "./book-outline.js";
 import { prioritizedPageOrder } from "./ocr-page-order.js";
 import { createReaderProfileModule } from "./reader-profile.js";
 import { createAppearanceSettingsModule } from "./appearance-settings.js";
@@ -53,6 +61,9 @@ let closeBookIndex: (() => void) | undefined;
 let closeOcr: (() => void) | undefined;
 let closeBackgroundJobs: (() => void) | undefined;
 let closeBookOutline: (() => void) | undefined;
+// 让位一次性登记（按任务 id）：probe 判定只看块库状态，同任务续跑后条件仍成立，
+// 不登记会让「让位 → 续跑 → 再让位」成为循环。任务 id 每次调度唯一，集合不增长。
+const yieldedOcrJobs = new Set<string>();
 
 // 组装根唯一的窗口广播：agent 事件与后台状态推送共用同一遍历（ADR-0008 泛化 agent broadcast）。
 function broadcastToWindows(channel: string, payload: unknown) {
@@ -237,6 +248,22 @@ app.whenReady().then(async () => {
         let nextIndex = completed;
         let failure: string | undefined;
         const inFlight = new Set<Promise<void>>();
+        // 目录数据就绪即让位（T57-04）：run-end（目录区结束）或探测窗口扫满，二者取先。
+        // 判定只在前沿推进后做一次性检查，越过窗口 + gap 后不可能再触发。
+        const windowEnd = Math.min(book.pageCount, TOC_PROBE_WINDOW_PAGES);
+        const maybeYieldToOutline = (reached: number) => {
+          if (yieldedOcrJobs.has(job.id)) return;
+          if (reached > windowEnd + TOC_YIELD_GAP_PAGES) return;
+          const probe: OutlineYieldProbePage[] = [];
+          for (let page = 1; page <= windowEnd; page += 1) {
+            const blocks = ocr.getPage(job.bookId, page)?.blocks;
+            probe.push({ page, hasIndexBlock: (blocks ?? []).some((block) => block?.type === "index") });
+          }
+          if (shouldYieldToOutline(probe, reached, book.pageCount)) {
+            yieldedOcrJobs.add(job.id);
+            context.yieldOnce();
+          }
+        };
         const pump = () => {
           while (!failure && !context.signal.aborted && inFlight.size < limit && nextIndex < pages.length) {
             const index = nextIndex;
@@ -256,6 +283,7 @@ app.whenReady().then(async () => {
               if (reached > written) {
                 written = reached;
                 context.checkpoint(ingestion.encodeOcrCheckpoint(reached), reached, book.pageCount);
+                maybeYieldToOutline(reached);
               }
             })().finally(() => {
               inFlight.delete(task);

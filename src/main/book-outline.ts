@@ -385,7 +385,8 @@ function buildTocNodes(
  *  该页是否可判定（有原生文本或已有识别结果——空白页的空识别结果也算已判定）。 */
 export type TocLocatorPageInput = { page: number; lines: readonly string[]; hasIndexBlock: boolean; covered: boolean };
 
-const TOC_PROBE_WINDOW_PAGES = 30;
+export const TOC_PROBE_WINDOW_PAGES = 30;
+export const TOC_YIELD_GAP_PAGES = 2;
 const TOC_TEXT_LINE_CAP = 80;
 const TOC_DENSITY_MIN_LINES = 4;
 const TOC_MIN_LEADER_LINES = 3;
@@ -428,6 +429,36 @@ export function locateTocPages(inputs: readonly TocLocatorPageInput[]): { hits: 
     pages: [...candidates].sort((left, right) => left - right),
     covered: inputs.every((input) => input.covered),
   };
+}
+
+export type OutlineYieldProbePage = { page: number; hasIndexBlock: boolean };
+
+/** 让位判定（纯函数，只看块库状态）：目录数据就绪即让位，扫描不必等全书——
+ *  1. run-end：探测窗口内最后一个 index 页 M 之后的 g 页全部已扫且无 index 块 → 目录区已结束；
+ *  2. 窗口覆盖：窗口内页面全部已扫（无 index 也放行——密度兜底与「零调用」路径都需要这次机会）。
+ *  scannedCount 为线性页序已扫描页数；pages 必须覆盖整个探测窗口，窗口外页与本判定无关。
+ *  碎片化目录（间隔超过 g 页）由模型续点回报兜住，早触发不损失完整性。 */
+export function shouldYieldToOutline(
+  pages: readonly OutlineYieldProbePage[],
+  scannedCount: number,
+  pageCount: number,
+): boolean {
+  const windowEnd = Math.min(pageCount, TOC_PROBE_WINDOW_PAGES);
+  if (windowEnd <= 0) return false;
+  if (scannedCount >= windowEnd) return true;
+  const indexByPage = new Map(pages.map((page) => [page.page, page.hasIndexBlock]));
+  let lastIndex = 0;
+  for (const page of pages) {
+    if (page.hasIndexBlock) lastIndex = Math.max(lastIndex, page.page);
+  }
+  if (lastIndex === 0) return false;
+  const end = Math.min(lastIndex + TOC_YIELD_GAP_PAGES, windowEnd);
+  for (let page = lastIndex + 1; page <= end; page += 1) {
+    if (!indexByPage.has(page)) return false;
+    if (page > scannedCount) return false;
+    if (indexByPage.get(page)) return false;
+  }
+  return true;
 }
 
 /** 全书装配：AI 目录行 + 正文锚点投票解算偏移；偏移不可信（锚点不足）时输出空目录等 OCR 补全后重算。 */
