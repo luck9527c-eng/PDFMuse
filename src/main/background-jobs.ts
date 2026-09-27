@@ -217,23 +217,23 @@ export function createBackgroundJobModule(
           update(row.id, "status = ?, attempts = attempts + 1, claim_id = ?, error_message = NULL", ["running", claimId]);
           const running = toJob(rowFor(row.id)!);
           try {
-          await executor(running, {
-            signal: controller.signal,
-            checkpoint(value, progress, total = running.total) {
-              if (closed) return;
-              const boundedProgress = Math.max(0, Math.min(total, Math.floor(progress)));
-              const result = database.prepare("UPDATE background_jobs SET progress = ?, total = ?, checkpoint = ?, updated_at = ? WHERE id = ? AND status = 'running' AND claim_id = ?")
-                .run(boundedProgress, total, value ?? null, now(), row.id, claimId);
-              if (Number(result.changes) > 0) notify(row.book_id);
-            },
-            yieldOnce() {
-              const state = active.get(row.id);
-              if (!state || state.action) return;
-              state.action = "pause";
-              yieldedJobIds.add(row.id);
-              state.controller.abort();
-            },
-          });
+            await executor(running, {
+              signal: controller.signal,
+              checkpoint(value, progress, total = running.total) {
+                if (closed) return;
+                const boundedProgress = Math.max(0, Math.min(total, Math.floor(progress)));
+                const result = database.prepare("UPDATE background_jobs SET progress = ?, total = ?, checkpoint = ?, updated_at = ? WHERE id = ? AND status = 'running' AND claim_id = ?")
+                  .run(boundedProgress, total, value ?? null, now(), row.id, claimId);
+                if (Number(result.changes) > 0) notify(row.book_id);
+              },
+              yieldOnce() {
+                const state = active.get(row.id);
+                if (!state || state.action) return;
+                state.action = "pause";
+                yieldedJobIds.add(row.id);
+                state.controller.abort();
+              },
+            });
             if (!closed && !settleRequestedAction(row.id)) {
               update(row.id, "status = ?, progress = total, claim_id = NULL, error_message = NULL", ["completed"]);
             }

@@ -780,6 +780,52 @@ describe("book outline", () => {
     expect(calls).toBe(1);
   });
 
+  it("calls the ai on run-end without waiting for full window coverage", async () => {
+    closeOcr?.();
+    // 扫描书 10 页：目录区在第 2 页（index 块），OCR 只推进到第 6 页——
+    // run-end（M=2 之后的 gap 页 3、4 已扫且无 index）成立即让位并提取，不等窗口扫满。
+    const engine: MineruEngine = {
+      name: "测试 OCR",
+      model: "测试模型",
+      async recognizePage(input) {
+        if (input.page === 2) {
+          return {
+            blocks: [{ type: "index", text: "第一章 测试目录…………………………1\n第一节 测试内容…………………………2", bbox: [0.1, 0.1, 0.9, 0.5] }],
+            markdown: "目录",
+          };
+        }
+        return {
+          blocks: [{ type: "text", text: `第${input.page}页正文，内容长度足够参与统计。`, bbox: [0.1, 0.1, 0.9, 0.16] }],
+          markdown: "",
+        };
+      },
+    };
+    const ocr = createOcrModule(dataHome, engine, {
+      resolvePdfPath: (bookId) => (bookId === BOOK_ID ? { path: "C:/book.pdf", encrypted: false } : undefined),
+    });
+    closeOcr = ocr.close;
+    for (const page of [1, 2, 3, 4, 5, 6]) {
+      await ocr.recognizePage({ bookId: BOOK_ID, page });
+    }
+    const requested: number[][] = [];
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource(Array.from({ length: 10 }, () => [])),
+      aiOutline: {
+        renderPage: async () => ({ imageData: "aW1n" }),
+        complete: async (input) => {
+          requested.push(input.pages);
+          return '{"hasToc":false,"entries":[],"continuesAt":null}';
+        },
+      },
+      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+    });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(result.status).toBe("generated");
+    // 让位判定成立即调模型；候选页裁到已扫前缀（1~6）内。
+    expect(requested).toEqual([[1, 2, 3]]);
+  });
+
   it("feeds page_number blocks into the offset vote for scanned books", async () => {
     closeOcr?.();
     const engine: MineruEngine = {
@@ -940,8 +986,9 @@ describe("toc page locator", () => {
       { page: 2, lines: tocLines, hasIndexBlock: true, covered: true },
       { page: 3, lines: bodyLines, hasIndexBlock: false, covered: true },
       { page: 4, lines: bodyLines, hasIndexBlock: false, covered: true },
-      { page: 5, lines: bodyLines, hasIndexBlock: false, covered: true },
+      { page: 5, lines: tocLines, hasIndexBlock: false, covered: true },
     ];
+    // 密度只在 index 无命中时兜底：index 命中后别处的密集页（参考文献式）不并选。
     expect(locateTocPages(inputs)).toEqual({ hits: [2], pages: [1, 2, 3], covered: true });
   });
 

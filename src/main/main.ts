@@ -28,12 +28,13 @@ import {
   createBookOutlineModule,
   findOutlineChapterRange,
   findOutlineSectionPath,
+  hasIndexBlock,
   shouldYieldToOutline,
   TOC_PROBE_WINDOW_PAGES,
   TOC_YIELD_GAP_PAGES,
   type OutlineYieldProbePage,
 } from "./book-outline.js";
-import { prioritizedPageOrder } from "./ocr-page-order.js";
+import { linearPageOrder } from "./ocr-page-order.js";
 import { createReaderProfileModule } from "./reader-profile.js";
 import { createAppearanceSettingsModule } from "./appearance-settings.js";
 import type {
@@ -239,7 +240,7 @@ app.whenReady().then(async () => {
         const book = library.list().find((item) => item.id === job.bookId);
         if (!book) throw new Error("当前 PDF 书籍不可用。");
         const { completed } = ingestion.decodeOcrCheckpoint(job.checkpoint);
-        const pages = prioritizedPageOrder(book.pageCount);
+        const pages = linearPageOrder(book.pageCount);
         // 弹性池动态派页（T49）：至多 N 页在途；断点只推进连续前沿——前沿之前必然已落库，
         // 前沿之后的在途页崩溃后按缓存缺失自然重扫。线性页序（T57-02）下断点即「已扫到第几页」。
         const limit = mineruEngine.concurrency;
@@ -256,8 +257,7 @@ app.whenReady().then(async () => {
           if (reached > windowEnd + TOC_YIELD_GAP_PAGES) return;
           const probe: OutlineYieldProbePage[] = [];
           for (let page = 1; page <= windowEnd; page += 1) {
-            const blocks = ocr.getPage(job.bookId, page)?.blocks;
-            probe.push({ page, hasIndexBlock: (blocks ?? []).some((block) => block?.type === "index") });
+            probe.push({ page, hasIndexBlock: hasIndexBlock(ocr.getPage(job.bookId, page)?.blocks) });
           }
           if (shouldYieldToOutline(probe, reached, book.pageCount)) {
             yieldedOcrJobs.add(job.id);

@@ -428,12 +428,18 @@ function isDenseTocPage(lines: readonly string[]): boolean {
  *  漏标的相邻页），真实信号命中（hits）单独返回——tocPageSet 只信真实命中，不让边距吞掉
  *  紧邻目录页的正文标题。covered 表示窗口内每页都可判定（有原生文本或已有识别结果）。 */
 export function locateTocPages(inputs: readonly TocLocatorPageInput[]): { hits: number[]; pages: number[]; covered: boolean } {
-  const hits: number[] = [];
-  const candidates = new Set<number>();
+  const indexHits: number[] = [];
+  const densityHits: number[] = [];
   for (const input of inputs) {
-    if (!input.hasIndexBlock && !isDenseTocPage(input.lines)) continue;
-    hits.push(input.page);
-    for (const page of [input.page - 1, input.page, input.page + 1]) {
+    if (input.hasIndexBlock) indexHits.push(input.page);
+    else if (isDenseTocPage(input.lines)) densityHits.push(input.page);
+  }
+  // 密度是 index 无命中时的兜底（不并跑）：密集的非目录页（参考文献）不该借并选混进
+  // tocPageSet，压制定位命中页之外的正文标题锚点。
+  const hits = indexHits.length > 0 ? indexHits : densityHits;
+  const candidates = new Set<number>();
+  for (const hit of hits) {
+    for (const page of [hit - 1, hit, hit + 1]) {
       if (page >= 1) candidates.add(page);
     }
   }
@@ -488,7 +494,7 @@ export function repairOutlineMonotonicity(nodes: readonly BookOutlineNode[]): Bo
 
 /** 正文标题准入（第三档）：只收章节序数与公认特名——实测 paragraph_title 混有大量
  *  「（1）/N.」式列举项，无序数的裸标题也多为正文强调句，宁缺毋滥。 */
-const KNOWN_SECTION_NAME = /^(附录|参考文献|索引|习题|前言|序言|后记|延伸阅读)/;
+const KNOWN_SECTION_NAME = /^(附录|参考文献|索引|习题)/;
 const RECOGNIZED_HEADING_TYPES = new Set(["title", "paragraph_title"]);
 
 export function isAdmittedBodyHeading(label: string): boolean {
@@ -582,6 +588,20 @@ function blockTextLines(blocks: ReadonlyArray<MineruBlock> | undefined): string[
 }
 
 const PAGE_NUMBER_LINE_PATTERN = /^(?:第?\s*\d+\s*页|page\s+\d+(?:\s+of\s+\d+)?|\d+)$/i;
+
+/** 页文本行（定位与 AI 载荷共用）：OCR 页按块拆行，原生页用文本行。 */
+function pageTextLines(
+  source: "native" | "ocr" | "empty",
+  lines: readonly OutlineTextLine[],
+  blocks: ReadonlyArray<MineruBlock> | undefined,
+): string[] {
+  return source === "ocr" ? blockTextLines(blocks) : lines.map((line) => normalizeLabel(line.text));
+}
+
+/** index 块判定（布局模型的目录页签名）：定位器与 OCR 让位探针共用同一谓词。 */
+export function hasIndexBlock(blocks: ReadonlyArray<MineruBlock> | undefined): boolean {
+  return (blocks ?? []).some((block) => block?.type === "index");
+}
 
 /** 页文本选源：原生文本充足用原生，否则识别块补位——定位器与页候选循环共用同一裁决。 */
 function selectPageText(
@@ -780,7 +800,7 @@ export function createBookOutlineModule(
       version INTEGER NOT NULL,
       nodes_json TEXT NOT NULL,
       total_pages INTEGER NOT NULL,
-      strategy TEXT NOT NULL DEFAULT '',
+      strategy TEXT NOT NULL DEFAULT 'empty',
       updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS book_outline_ai (
@@ -793,7 +813,7 @@ export function createBookOutlineModule(
   // 既有库补列：目录来源（T57-05）。
   const outlineColumns = database.prepare("PRAGMA table_info(book_outlines)").all() as Array<{ name: string }>;
   if (!outlineColumns.some((column) => column.name === "strategy")) {
-    database.exec("ALTER TABLE book_outlines ADD COLUMN strategy TEXT NOT NULL DEFAULT ''");
+    database.exec("ALTER TABLE book_outlines ADD COLUMN strategy TEXT NOT NULL DEFAULT 'empty'");
   }
   const openDocument = options.openDocument ?? openPdfOutlineDocument;
 
@@ -873,14 +893,14 @@ export function createBookOutlineModule(
     options.onOutlineChange?.(bookId);
   }
 
-  /** 探测窗口内的目录信号定位：index 块命中 ∪ 文本密度命中。窗口每页必须可判定
-   *  （有原生文本或已有识别结果，空白页的空识别结果也算）才下结论——OCR 在途或
-   *  失败时保持未覆盖，等信号齐了再提目录。 */
+  /** 探测窗口内的目录信号定位：index 块命中，无命中时密度兜底。AI 是否可调用由
+   *  「让位判定」裁定（run-end 或窗口覆盖齐，复用 shouldYieldToOutline）——让位提前
+   *  触发的目录任务在窗口未扫满时也能提取；候选页裁到已覆盖前缀内。 */
   async function locateTocCandidates(
     bookId: string,
     document: OutlineDocument,
     signal?: AbortSignal,
-  ): Promise<{ hits: number[]; pages: number[]; covered: boolean }> {
+  ): Promise<{ hits: number[]; pages: number[]; adjudicated: boolean }> {
     const windowEnd = Math.min(document.pageCount, TOC_PROBE_WINDOW_PAGES);
     const inputs: TocLocatorPageInput[] = [];
     for (let page = 1; page <= windowEnd; page += 1) {
@@ -890,16 +910,25 @@ export function createBookOutlineModule(
       const { lines, source } = selectPageText(native, blocks);
       inputs.push({
         page,
-        lines: source === "ocr" ? blockTextLines(blocks) : lines.map((line) => normalizeLabel(line.text)),
-        hasIndexBlock: (blocks ?? []).some((block) => block?.type === "index"),
+        lines: pageTextLines(source, lines, blocks),
+        hasIndexBlock: hasIndexBlock(blocks),
         covered: native.length > 0 || blocks !== undefined,
       });
     }
     const located = locateTocPages(inputs);
+    let coveredPrefix = 0;
+    for (const input of inputs) {
+      if (!input.covered) break;
+      coveredPrefix += 1;
+    }
     return {
       hits: located.hits,
-      pages: located.pages.filter((page) => page <= document.pageCount),
-      covered: located.covered && inputs.length >= windowEnd,
+      pages: located.pages.filter((page) => page <= coveredPrefix),
+      adjudicated: shouldYieldToOutline(
+        inputs.map(({ page, hasIndexBlock }) => ({ page, hasIndexBlock })),
+        coveredPrefix,
+        document.pageCount,
+      ),
     };
   }
 
@@ -908,8 +937,7 @@ export function createBookOutlineModule(
     const native = await document.getNativeLines(page);
     const blocks = options.readRecognizedBlocks?.(bookId, page);
     const { lines, source } = selectPageText(native, blocks);
-    const textLines = (source === "ocr" ? blockTextLines(blocks) : lines.map((line) => normalizeLabel(line.text)))
-      .slice(0, TOC_TEXT_LINE_CAP);
+    const textLines = pageTextLines(source, lines, blocks).slice(0, TOC_TEXT_LINE_CAP);
     return { page, lines: textLines, source: textLines.length === 0 || source === "empty" ? "none" : source };
   }
 
@@ -938,9 +966,9 @@ export function createBookOutlineModule(
       if (!aiCache && options.aiOutline) {
         const located = await locateTocCandidates(bookId, document, signal);
         tocSignalPages = located.hits;
-        // 只在探测窗口可判定且有定位命中时调用模型。未覆盖（OCR 在途/失败）不缓存、
-        // 无定位信号不调模型——缓存里只存模型结论，「无信号」不是结论。
-        if (located.covered && located.pages.length > 0) {
+        // 只在让位判定成立（run-end 或窗口覆盖齐）且有定位命中时调用模型。未裁定
+        // （OCR 在途/失败）不缓存、无定位信号不调模型——缓存里只存模型结论。
+        if (located.adjudicated && located.pages.length > 0) {
           try {
             const result = await generateAiOutline({
               pageCount: document.pageCount,

@@ -36,7 +36,7 @@ import type {
   AgentImageAttachment,
   AppearanceSettings,
   BackgroundJob,
-  BookOutlineStrategy,
+  BookOutline,
   ConversationMessage,
   LibraryBook,
   OpenedPdfBook,
@@ -129,8 +129,7 @@ export function App() {
   const [attachedPassage, setAttachedPassage] = useState<SelectedPassage>();
   const [attachments, setAttachments] = useState<AgentImageAttachment[]>([]);
   const [backgroundJobs, setBackgroundJobs] = useState<BackgroundJob[]>([]);
-  const [generatedOutline, setGeneratedOutline] = useState<OutlineNode[]>();
-  const [outlineStrategy, setOutlineStrategy] = useState<BookOutlineStrategy>("empty");
+  const [generatedOutline, setGeneratedOutline] = useState<BookOutline>();
   const [clearConversationOpen, setClearConversationOpen] = useState(false);
   const [clearingConversation, setClearingConversation] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
@@ -218,8 +217,7 @@ export function App() {
       ]);
       if (activeBookIdRef.current !== bookId) return;
       setBackgroundJobs(jobs);
-      setGeneratedOutline(outline?.nodes);
-      setOutlineStrategy(outline?.strategy ?? "empty");
+      setGeneratedOutline(outline);
     } catch {
       setBackgroundJobs([]);
     }
@@ -288,10 +286,7 @@ export function App() {
       const bookId = activeBookIdRef.current;
       if (!bookId || event.bookId !== bookId) return;
       if (event.kind === "jobs") setBackgroundJobs(event.jobs);
-      else {
-        setGeneratedOutline(event.nodes);
-        setOutlineStrategy(event.strategy);
-      }
+      else setGeneratedOutline({ strategy: event.strategy, nodes: event.nodes ?? [] });
     });
     return () => unsubscribe?.();
   }, []);
@@ -324,7 +319,7 @@ export function App() {
   }, [book]);
 
   // 目录单一来源：主进程解析（内嵌书签过闸落库，或 AI/正文识别生成），经读取快检与推送送达。
-  const effectiveOutline = generatedOutline ?? [];
+  const effectiveOutline = generatedOutline?.nodes ?? [];
   const outlineJob = backgroundJobs.find((job) => job.kind === "outline");
   const outlineEmptyMessage = outlineJob?.status === "running" || outlineJob?.status === "queued"
     ? "正在分析章节结构..."
@@ -332,7 +327,9 @@ export function App() {
       ? "目录补全已暂停。"
       : outlineJob?.status === "failed"
         ? "暂时无法补全目录，请稍后重试。"
-        : "未检测到可用章节，可使用缩略图浏览。";
+        : backgroundJobs.some((job) => job.kind === "ocr" && (job.status === "running" || job.status === "queued"))
+          ? "文字识别进行中，目录将随之生成。"
+          : "未检测到可用章节，可使用缩略图浏览。";
 
   const handleOpenResult = useCallback((result: OpenPdfBookResult, attemptedBookId?: string) => {
     if (result.ok) {
@@ -704,7 +701,7 @@ export function App() {
               </div>
               <div className="sidebar-tabs"><button className={sidebarView === "outline" ? "active" : ""} onClick={() => setSidebarView("outline")}>目录</button><button className={sidebarView === "thumbnails" ? "active" : ""} onClick={() => setSidebarView("thumbnails")}>缩略图</button></div>
               {sidebarView === "outline" ? (
-                <OutlinePanel nodes={effectiveOutline} strategy={outlineStrategy} page={viewerState.page} emptyMessage={outlineEmptyMessage} onGoToPage={(page) => viewerRef.current?.goToPage(page)} />
+                <OutlinePanel nodes={effectiveOutline} strategy={generatedOutline?.strategy ?? "empty"} page={viewerState.page} emptyMessage={outlineEmptyMessage} onGoToPage={(page) => viewerRef.current?.goToPage(page)} />
               ) : (
                 <div className="thumbnail-list">
                   {Array.from({ length: viewerState.pages }, (_, index) => index + 1).map((page) => (
