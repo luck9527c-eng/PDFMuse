@@ -21,7 +21,7 @@ const REPEATED_LABEL_PAGES = 3;
 export type OutlineTextLine = { text: string; size: number; y: number };
 export type OutlineHeading = { label: string; page: number; level: number; explicit: boolean };
 export type TocRow = { label: string; level: 1 | 2 | 3; printedPage: number | undefined };
-export type AssembledOutline = { nodes: BookOutlineNode[]; strategy: "toc" | "empty" };
+export type AssembledOutline = { nodes: BookOutlineNode[]; strategy: BookOutlineStrategy };
 export type AiOutlineCache = { entries: AiOutlineEntry[]; tocPages: number[] };
 
 export type OutlineDocument = {
@@ -486,6 +486,66 @@ export function repairOutlineMonotonicity(nodes: readonly BookOutlineNode[]): Bo
   return walk(nodes);
 }
 
+/** 正文标题准入（第三档）：只收章节序数与公认特名——实测 paragraph_title 混有大量
+ *  「（1）/N.」式列举项，无序数的裸标题也多为正文强调句，宁缺毋滥。 */
+const KNOWN_SECTION_NAME = /^(附录|参考文献|索引|习题|前言|序言|后记|延伸阅读)/;
+const RECOGNIZED_HEADING_TYPES = new Set(["title", "paragraph_title"]);
+
+export function isAdmittedBodyHeading(label: string): boolean {
+  return explicitLevel(label) !== undefined || KNOWN_SECTION_NAME.test(label);
+}
+
+/** OCR 页标题候选：布局模型标记的标题块直接判定（T57-06），替代「块高假装字号」的比值检测；
+ *  header/footer/aside_text 等噪声块按类型整体排除。 */
+export function detectRecognizedHeadings(page: number, blocks: ReadonlyArray<MineruBlock> | undefined): OutlineHeading[] {
+  if (!blocks || !Array.isArray(blocks)) return [];
+  return blocks.flatMap((block) => {
+    if (!block || typeof block.text !== "string" || !RECOGNIZED_HEADING_TYPES.has(block.type)) return [];
+    const label = normalizeLabel(block.text);
+    if (label.length < 2 || label.length > 100) return [];
+    const level = explicitLevel(label) ?? (KNOWN_SECTION_NAME.test(label) ? 1 : undefined);
+    if (level === undefined) return [];
+    return [{ label, page, level, explicit: true }];
+  });
+}
+
+const MIN_BODY_OUTLINE_ROOTS = 3;
+
+/** 第三档：无印刷目录时用正文标题聚树——页码即标题所在页，不经偏移解算。
+ *  序数身份沿页序形成脊柱且严格递增（幸存页眉的倒挂签名直接否决），特名落顶层；
+ *  顶层序数章不足时宁缺毋滥输出空。 */
+export function assembleBodyHeadingOutline(headings: readonly OutlineHeading[]): AssembledOutline {
+  const usable = suppressRunningHeaders(headings).filter((heading) => isAdmittedBodyHeading(heading.label));
+  const roots: BookOutlineNode[] = [];
+  const orphans: BookOutlineNode[] = [];
+  const stack: BookOutlineNode[] = [];
+  let sequence = 0;
+  for (const heading of usable) {
+    const level = explicitLevel(heading.label) ?? 1;
+    const node: BookOutlineNode = { id: `body-${++sequence}`, label: heading.label, page: heading.page, children: [] };
+    while (stack.length >= level) stack.pop();
+    if (stack.length > 0) {
+      stack[stack.length - 1]!.children.push(node);
+      stack.push(node);
+    } else if (level === 1) {
+      roots.push(node);
+      stack.push(node);
+    } else {
+      orphans.push(node);
+    }
+  }
+  if (orphans.length > 0 && roots.length > 0) roots[0]!.children = [...orphans, ...roots[0]!.children];
+  const spine = roots
+    .map((root) => parseOutlineOrdinal(root.label))
+    .filter((ordinal): ordinal is NonNullable<typeof ordinal> => ordinal !== undefined)
+    .map((ordinal) => (ordinal.type === "section" ? (ordinal.scope ?? 0) * 1000 + ordinal.ordinal : ordinal.ordinal));
+  const monotonic = spine.every((value, index) => index === 0 || value > spine[index - 1]!);
+  if (roots.length < MIN_BODY_OUTLINE_ROOTS || spine.length < MIN_BODY_OUTLINE_ROOTS || !monotonic) {
+    return { nodes: [], strategy: "empty" };
+  }
+  return { nodes: repairOutlineMonotonicity(roots), strategy: "body_headings" };
+}
+
 /** 全书装配：AI 目录行 + 正文锚点投票解算偏移；偏移不可信（锚点不足）时输出空目录等 OCR 补全后重算。 */
 export function assembleOutline(
   headings: readonly OutlineHeading[],
@@ -498,7 +558,7 @@ export function assembleOutline(
   const anchors = collectAnchors(bodyHeadings);
   const offset = resolvePageOffset(tocRows, anchors, printedVotes);
   if (offset === undefined) return { nodes: [], strategy: "empty" };
-  return { nodes: repairOutlineMonotonicity(buildTocNodes(tocRows, offset, pageCount, anchors)), strategy: "toc" };
+  return { nodes: repairOutlineMonotonicity(buildTocNodes(tocRows, offset, pageCount, anchors)), strategy: "ai_toc" };
 }
 
 function recognizedLines(blocks: ReadonlyArray<MineruBlock> | undefined): OutlineTextLine[] {
@@ -948,7 +1008,12 @@ export function createBookOutlineModule(
           }
         }
         // 目录页不参与正文标题锚点——否则章/节锚点会全落在目录页本身。
-        const headings = tocPageSet.has(page) ? [] : detectHeadingCandidates(page, lines);
+        // OCR 页标题候选走布局模型判定（T57-06），原生页维持字号检测。
+        const headings = tocPageSet.has(page)
+          ? []
+          : source === "ocr"
+            ? detectRecognizedHeadings(page, blocks)
+            : detectHeadingCandidates(page, lines);
         upsert.run(bookId, page, JSON.stringify({ v: OUTLINE_VERSION, headings, printed: pagePrinted }), source, new Date().toISOString());
         processedPages = page;
         onProgress?.(processedPages, document.pageCount);
@@ -968,8 +1033,18 @@ export function createBookOutlineModule(
         for (const printed of payload.printed) printedVotes.push({ page: row.page, printed });
       }
       const assembled = assembleOutline(headings, aiCache?.entries ?? [], document.pageCount, printedVotes);
-      const nodes = assembled.nodes;
-      persistOutline(bookId, nodes, document.pageCount, assembled.strategy === "toc" ? "ai_toc" : "empty");
+      let nodes = assembled.nodes;
+      let strategy: BookOutlineStrategy = assembled.strategy;
+      if (strategy === "empty") {
+        // 第三档（T57-06）：第二档无产出（无目录信号、模型判无目录、偏移不可信）时，
+        // 用正文标题聚树兜底；质量闸门不过宁缺毋滥，维持空目录。
+        const fallback = assembleBodyHeadingOutline(headings);
+        if (fallback.strategy === "body_headings") {
+          nodes = fallback.nodes;
+          strategy = "body_headings";
+        }
+      }
+      persistOutline(bookId, nodes, document.pageCount, strategy);
       options.onOutlineChange?.(bookId);
       return { status: "generated" as const, nodes, processedPages, totalPages: document.pageCount };
     } finally {

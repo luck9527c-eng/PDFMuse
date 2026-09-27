@@ -4,9 +4,11 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  assembleBodyHeadingOutline,
   assembleOutline,
   createBookOutlineModule,
   detectHeadingCandidates,
+  detectRecognizedHeadings,
   evaluateEmbeddedOutline,
   findOutlineChapterRange,
   findOutlineSectionPath,
@@ -166,7 +168,7 @@ describe("book outline", () => {
         const heading = input.page === 2 ? "第一章 扫描内容" : "1.1 识别小节";
         return {
           blocks: [
-            { type: "text", text: heading, bbox: [0.01, 0.01, 0.5, 0.05] },
+            { type: "paragraph_title", text: heading, bbox: [0.01, 0.01, 0.5, 0.05] },
             { type: "text", text: "这是扫描页正文。", bbox: [0.01, 0.1, 0.5, 0.118] },
           ],
           markdown: heading,
@@ -433,7 +435,7 @@ describe("book outline", () => {
     // 每页一块的印刷页码（page_number 块 / 孤立数字行）：全书页脚与目录页码同源投票。
     const printedVotes = Array.from({ length: 10 }, (_, index) => ({ page: 18 + index, printed: 1 + index }));
     const result = assembleOutline(headings, tocRows, 150, printedVotes);
-    expect(result.strategy).toBe("toc");
+    expect(result.strategy).toBe("ai_toc");
     expect(result.nodes).toMatchObject([
       { label: "第一章 函数与极限", page: 18, children: [{ label: "第一节 映射与函数", page: 19 }] },
     ]);
@@ -458,6 +460,61 @@ describe("book outline", () => {
     ]);
   });
 
+  it("admits only ordinal or known-name paragraph titles as recognized headings", () => {
+    const blocks = [
+      { type: "paragraph_title", text: "1.2 计算机的硬件组成", bbox: [0.1, 0.1, 0.9, 0.16] },
+      { type: "paragraph_title", text: "1.2.1 计算机的主要部件", bbox: [0.1, 0.2, 0.9, 0.26] },
+      { type: "paragraph_title", text: "1. 输入设备", bbox: [0.1, 0.3, 0.9, 0.36] },
+      { type: "paragraph_title", text: "（1）字编址", bbox: [0.1, 0.4, 0.9, 0.46] },
+      { type: "paragraph_title", text: "指令系统", bbox: [0.1, 0.5, 0.9, 0.56] },
+      { type: "paragraph_title", text: "参考文献", bbox: [0.1, 0.6, 0.9, 0.66] },
+      { type: "header", text: "第一章 页眉", bbox: [0.1, 0.01, 0.9, 0.05] },
+      { type: "text", text: "第一章 伪装标题", bbox: [0.1, 0.7, 0.9, 0.76] },
+    ];
+    expect(detectRecognizedHeadings(7, blocks)).toEqual([
+      { label: "1.2 计算机的硬件组成", page: 7, level: 2, explicit: true },
+      { label: "1.2.1 计算机的主要部件", page: 7, level: 3, explicit: true },
+      { label: "参考文献", page: 7, level: 1, explicit: true },
+    ]);
+  });
+
+  it("builds a body-heading tree with a strictly increasing chapter spine", () => {
+    const headings: OutlineHeading[] = [
+      { label: "第一章 起点", page: 10, level: 1, explicit: true },
+      { label: "1.1 内容", page: 12, level: 2, explicit: true },
+      { label: "1.1.1 背景", page: 13, level: 3, explicit: true },
+      { label: "第二章 转折", page: 20, level: 1, explicit: true },
+      { label: "第三章 收束", page: 30, level: 1, explicit: true },
+      { label: "参考文献", page: 40, level: 1, explicit: true },
+    ];
+    const result = assembleBodyHeadingOutline(headings);
+    expect(result.strategy).toBe("body_headings");
+    expect(result.nodes).toMatchObject([
+      {
+        label: "第一章 起点", page: 10,
+        children: [{ label: "1.1 内容", page: 12, children: [{ label: "1.1.1 背景", page: 13 }] }],
+      },
+      { label: "第二章 转折", page: 20 },
+      { label: "第三章 收束", page: 30 },
+      { label: "参考文献", page: 40 },
+    ]);
+  });
+
+  it("rejects body-heading trees without enough ordinal chapters or with a broken spine", () => {
+    // 序数章不足：特名凑数不算脊柱。
+    expect(assembleBodyHeadingOutline([
+      { label: "第一章 起点", page: 10, level: 1, explicit: true },
+      { label: "1.1 内容", page: 12, level: 2, explicit: true },
+      { label: "参考文献", page: 40, level: 1, explicit: true },
+    ]).strategy).toBe("empty");
+    // 章序数倒挂（页眉噪声幸存者的签名）。
+    expect(assembleBodyHeadingOutline([
+      { label: "第二章 转折", page: 10, level: 1, explicit: true },
+      { label: "第一章 起点", page: 20, level: 1, explicit: true },
+      { label: "第三章 收束", page: 30, level: 1, explicit: true },
+    ]).strategy).toBe("empty");
+  });
+
   it("resolves the printed-to-pdf offset by voting and clips out-of-range entries", () => {
     const tocRows: TocRow[] = [
       { label: "第一章 函数与极限", level: 1, printedPage: 1 },
@@ -476,7 +533,7 @@ describe("book outline", () => {
       { label: "第二章 导数与微分", page: 77, level: 1, explicit: true },
     ];
     const result = assembleOutline(headings, tocRows, 150);
-    expect(result.strategy).toBe("toc");
+    expect(result.strategy).toBe("ai_toc");
     expect(result.nodes).toMatchObject([
       {
         label: "第一章 函数与极限", page: 18,
@@ -504,7 +561,7 @@ describe("book outline", () => {
       { label: "3.2 有页码", page: 25, level: 2, explicit: true },
     ];
     const result = assembleOutline(headings, tocRows, 150);
-    expect(result.strategy).toBe("toc");
+    expect(result.strategy).toBe("ai_toc");
     expect(result.nodes).toMatchObject([
       { label: "第三章 无锚", page: 22, children: [{ label: "3.1 有页码", page: 22 }, { label: "3.2 有页码", page: 25 }] },
     ]);
@@ -522,7 +579,7 @@ describe("book outline", () => {
       { label: "小苗与大树的对话", page: 12, level: 1, explicit: false },
     ];
     const result = assembleOutline(headings, tocRows, 189);
-    expect(result.strategy).toBe("toc");
+    expect(result.strategy).toBe("ai_toc");
     expect(result.nodes).toMatchObject([
       {
         label: "第一组", page: 6,
@@ -625,7 +682,7 @@ describe("book outline", () => {
       { label: "1.2 目标", page: 14, level: 2, explicit: true },
     ];
     const result = assembleOutline(headings, tocRows, 100);
-    expect(result.strategy).toBe("toc");
+    expect(result.strategy).toBe("ai_toc");
     expect(result.nodes).toMatchObject([
       {
         label: "第1章 绪论", page: 11,
@@ -783,6 +840,51 @@ describe("book outline", () => {
     // （4-1=3、5-2=3、6-3=3）把它抬成多数派，第二节由偏移落到 p.5。
     expect(outline.get(BOOK_ID)).toMatchObject([
       { label: "第一章 测试目录", page: 4, children: [{ label: "第一节 测试内容", page: 5 }] },
+    ]);
+  });
+
+  it("falls back to a body-heading tree when no toc signal exists", async () => {
+    closeOcr?.();
+    const engine: MineruEngine = {
+      name: "测试 OCR",
+      model: "测试模型",
+      async recognizePage(input) {
+        const titles: Record<number, string> = { 2: "第一章 起点", 3: "1.1 内容", 4: "第二章 转折", 5: "第三章 收束" };
+        const title = titles[input.page];
+        const blocks = [{ type: "text", text: `第${input.page}页正文，内容长度足够参与统计。`, bbox: [0.1, 0.2, 0.9, 0.24] }];
+        if (title) blocks.unshift({ type: "paragraph_title", text: title, bbox: [0.1, 0.05, 0.9, 0.12] });
+        return { blocks, markdown: "" };
+      },
+    };
+    const ocr = createOcrModule(dataHome, engine, {
+      resolvePdfPath: (bookId) => (bookId === BOOK_ID ? { path: "C:/book.pdf", encrypted: false } : undefined),
+    });
+    closeOcr = ocr.close;
+    for (const page of [1, 2, 3, 4, 5]) {
+      await ocr.recognizePage({ bookId: BOOK_ID, page });
+    }
+    let aiCalls = 0;
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource([[], [], [], [], []]),
+      aiOutline: {
+        renderPage: async () => ({ imageData: "aW1n" }),
+        complete: async () => {
+          aiCalls += 1;
+          return '{"hasToc":false,"entries":[],"continuesAt":null}';
+        },
+      },
+      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+    });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    // 无目录信号 → 零 AI 调用；正文标题树兜底（页码即标题所在页）。
+    expect(aiCalls).toBe(0);
+    expect(result.status).toBe("generated");
+    expect(outline.strategy(BOOK_ID)).toBe("body_headings");
+    expect(outline.get(BOOK_ID)).toMatchObject([
+      { label: "第一章 起点", page: 2, children: [{ label: "1.1 内容", page: 3 }] },
+      { label: "第二章 转折", page: 4 },
+      { label: "第三章 收束", page: 5 },
     ]);
   });
 
