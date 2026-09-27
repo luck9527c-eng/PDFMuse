@@ -1,6 +1,8 @@
 // AI 目录提取：把「任意排版目录的解析」从规则代码交给视觉模型。
 // 书籍排版千差万别（章/节、组/课文、竖排组标、点线页码），词表枚举不完；
-// 模型看目录页图片直接输出结构化 JSON，本模块只负责分批取图、提示词与输出校验。
+// 目录候选页由文本信号（index 块 / 密度兜底）先行定位，模型同时拿到页面截图与
+// 逐页识别文字——原生文本逐字照抄，OCR 文字与图冲突时以图为准——本模块只负责
+// 分批取图取文、提示词与输出校验。
 
 import type { CompleteSimpleFn, TextContent, UserMessage } from "./openclaw-core.js";
 import {
@@ -9,7 +11,7 @@ import {
   toLlmModel,
 } from "./model-runtime.js";
 
-export type AiOutlineEntry = { label: string; level: 1 | 2; printedPage: number | undefined };
+export type AiOutlineEntry = { label: string; level: 1 | 2 | 3; printedPage: number | undefined };
 
 export type AiOutlineResult = {
   hasToc: boolean;
@@ -25,36 +27,49 @@ export function aiOutlineEntryKey(entry: { level: number; label: string }) {
   return `${entry.level}|${entry.label.toLocaleLowerCase()}`;
 }
 
+/** 一次视觉调用里随图附带的逐页识别文字；source 决定提示词里的真值语义。 */
+export type TocPageText = { page: number; lines: string[]; source: "native" | "ocr" | "none" };
+
 export type AiOutlineCompleteInput = {
   pages: number[];
+  texts: TocPageText[];
   images: Array<{ data: string; mimeType: string }>;
 };
 
 export type AiOutlineComplete = (input: AiOutlineCompleteInput) => Promise<string>;
 
 export const AI_OUTLINE_BATCH_SIZE = 12;
-export const AI_OUTLINE_MAX_PAGES = 24;
+export const AI_OUTLINE_MAX_BATCHES = 4;
+/** 页数上限 = 探测窗口 30 页 + 续批余量。 */
+export const AI_OUTLINE_PAGE_LIMIT = 48;
 export const AI_OUTLINE_RENDER_SCALE = 1.5;
 const MAX_ENTRIES = 400;
 
-const SYSTEM_PROMPT = `你是 PDF 书籍的目录提取器。用户会提供一本书前若干页的截图，每页按顺序编号。
+const SYSTEM_PROMPT = `你是 PDF 书籍的目录提取器。用户会提供这本书的目录候选页截图，每页按顺序编号，并附每页的识别文字。
 
-任务：找到其中的印刷目录页（逐条列出章节标题与页码的页面），把目录条目提取为 JSON。
+任务：判断其中哪些页面是印刷目录页（逐条列出章节标题与页码的页面），把目录条目提取为 JSON。
 
 规则：
-1. 只提取目录页上的条目；封面、版权页、前言、正文不是目录。如果所有图片中都没有目录页，返回 {"hasToc": false, "entries": [], "tocPages": [], "continuesAt": null}。
-2. 目录一般分两级：顶层（章/单元/部分）level=1，次级（节/小节/课文）level=2。目录只有一级时全部用 level=1。
+1. 候选页里可能混有非目录页（封面、版权页、前言、正文、图目录、表目录、图表清单）；只从印刷目录页提取条目——图目录、表目录、图表清单不是目录。如果所有图片中都没有印刷目录页，返回 {"hasToc": false, "entries": [], "tocPages": [], "continuesAt": null}。
+2. 目录最多分三级：顶层（章/单元/部分）level=1，次级（节/小节/课文）level=2，三级（小节下的条目，如 1.2.1）level=3。目录只有一级时全部用 level=1。
 3. label 保留条目的完整标题文字（含「第一章」「第1节」「1 窃读记」这类编号前缀与「2*」这类标记），去掉引导点线和行尾页码。
-4. printedPage 是该条目行尾的印刷页码（整数）——这是书内印刷页码，不是截图序号；页码不可辨认时填 null。
-5. tocPages 列出目录内容出现在哪些页，用上面文字里给出的书籍页码（如 16、17），不要用图片序号；哪怕某页只有目录的一小部分也要列出。
-6. 如果目录在最后一张截图对应页之后还会延续，continuesAt 填目录延续到的下一个页码（按截图页码推算），否则填 null。
+4. printedPage 是该条目行尾的印刷页码（整数）——这是书内印刷页码，不是图片序号；页码不可辨认时填 null。
+5. tocPages 列出目录内容出现在哪些页，用页面文字里给出的书籍页码，不要用图片序号；哪怕某页只有目录的一小部分也要列出。
+6. 如果目录在最后一张图片对应页之后还会延续，continuesAt 填目录延续到的下一个页码（按页面文字里的页码推算），否则填 null。
 7. 只输出一个 JSON 对象，不要输出任何其他文字：
 {"hasToc": true, "tocPages": [3, 4, 5], "entries": [{"label": "第一章 函数与极限", "level": 1, "printedPage": 1}, {"label": "第一节 映射与函数", "level": 2, "printedPage": 2}], "continuesAt": null}`;
 
-function userPrompt(pages: readonly number[]) {
-  const first = pages[0]!;
-  const last = pages.at(-1)!;
-  return `以下是这本书第 ${first} 到 ${last} 页的截图，按顺序对应各张图片（第 ${first} 页 = 第 1 张图，以此类推）。请提取其中的目录。`;
+function userPrompt(pages: readonly number[], texts: readonly TocPageText[]) {
+  const sections = pages.map((page, index) => {
+    const text = texts.find((candidate) => candidate.page === page);
+    const lines = text?.lines ?? [];
+    if (text === undefined || text.source === "none" || lines.length === 0) {
+      return `第 ${page} 页（第 ${index + 1} 张图）：`;
+    }
+    const sourceLabel = text.source === "native" ? "原生文本，逐字精确" : "OCR 识别，可能有识别错误";
+    return `第 ${page} 页（第 ${index + 1} 张图）·${sourceLabel}：\n${lines.join("\n")}`;
+  });
+  return `以下是这本书的目录候选页，按顺序对应各张图片（第 1 张图 = 第 ${pages[0]} 页，以此类推）。每页附有识别文字：标注「原生文本」的请直接照抄；标注「OCR 识别」的与图片冲突时以图片为准。\n\n${sections.join("\n\n")}\n\n请提取其中的目录。`;
 }
 
 function extractJsonObject(text: string): string | undefined {
@@ -72,7 +87,7 @@ function toEntry(value: unknown): AiOutlineEntry | undefined {
   if (typeof raw.label !== "string") return undefined;
   const label = raw.label.replace(/\s+/g, " ").trim();
   if (label.length < 2 || label.length > 80) return undefined;
-  const level = raw.level === 2 ? 2 : raw.level === 1 ? 1 : undefined;
+  const level = raw.level === 2 ? 2 : raw.level === 3 ? 3 : raw.level === 1 ? 1 : undefined;
   if (level === undefined) return undefined;
   const rawPage = raw.printedPage ?? raw.page;
   let printedPage: number | undefined;
@@ -108,7 +123,7 @@ export function parseAiOutlineResponse(text: string): {
     : [];
   const tocPages = Array.isArray(value.tocPages)
     ? [...new Set(value.tocPages.flatMap((page) => (
-      typeof page === "number" && Number.isInteger(page) && page >= 1 && page <= AI_OUTLINE_MAX_PAGES ? [page] : []
+      typeof page === "number" && Number.isInteger(page) && page >= 1 && page <= AI_OUTLINE_PAGE_LIMIT ? [page] : []
     )))].sort((left, right) => left - right)
     : [];
   let continuesAt: number | undefined;
@@ -120,31 +135,42 @@ export function parseAiOutlineResponse(text: string): {
 
 export type AiOutlineDeps = {
   pageCount: number;
+  /** 定位命中的目录候选页（含 ±1 边距，已按页数截断）：只看这些页，盲扫退役。 */
+  candidatePages: readonly number[];
+  readPageText(page: number): Promise<TocPageText>;
   renderPage(page: number, scale: number): Promise<{ imageData: string }>;
   complete: AiOutlineComplete;
   signal?: AbortSignal;
 };
 
-/** 分批渲染前 N 页并让视觉模型提取目录；最多两批（目录在前 24 页内）。 */
+/** 分批渲染候选页并让视觉模型提取目录；模型回报续点时向窗口外续批（每批内页数受批大小约束）。 */
 export async function generateAiOutline(deps: AiOutlineDeps): Promise<AiOutlineResult> {
-  const limit = Math.min(deps.pageCount, AI_OUTLINE_MAX_PAGES);
+  const limit = Math.min(deps.pageCount, AI_OUTLINE_PAGE_LIMIT);
+  const visited = new Set<number>();
+  const queue = [...new Set(deps.candidatePages)]
+    .filter((page) => page >= 1 && page <= limit)
+    .sort((left, right) => left - right);
+  for (const page of queue) visited.add(page);
   const collected: AiOutlineEntry[] = [];
   const tocPages = new Set<number>();
   const seen = new Set<string>();
   const aborted = () => deps.signal?.aborted === true;
-  let nextStart = 1;
-  for (let batch = 0; batch < 2 && nextStart <= limit; batch += 1) {
-    const pages: number[] = [];
-    for (let page = nextStart; page < nextStart + AI_OUTLINE_BATCH_SIZE && page <= limit; page += 1) pages.push(page);
+  let batch = 0;
+  while (queue.length > 0 && batch < AI_OUTLINE_MAX_BATCHES) {
+    batch += 1;
+    const pages = queue.splice(0, AI_OUTLINE_BATCH_SIZE);
+    if (aborted()) break;
+    const texts: TocPageText[] = [];
     const images: Array<{ data: string; mimeType: string }> = [];
     let interrupted = false;
     for (const page of pages) {
       if (aborted()) { interrupted = true; break; }
+      texts.push(await deps.readPageText(page));
       const rendered = await deps.renderPage(page, AI_OUTLINE_RENDER_SCALE);
       images.push({ data: rendered.imageData, mimeType: "image/png" });
     }
     if (interrupted) break;
-    const text = await deps.complete({ pages, images });
+    const text = await deps.complete({ pages, texts, images });
     if (aborted()) break;
     // 解析失败等同模型故障（抛错、不缓存），不能固化成「无目录」结论。
     const parsed = parseAiOutlineResponse(text);
@@ -156,15 +182,22 @@ export async function generateAiOutline(deps: AiOutlineDeps): Promise<AiOutlineR
       seen.add(key);
       collected.push(entry);
     }
-    // 模型偶发把 tocPages 写成批内图片序号：全部落在批大小内且批次起点更晚时按批起点换算。
+    // 模型偶发把 tocPages 写成批内图片序号：全部落在批大小内且批起点更晚时按批起点换算。
     const localIndices = parsed.tocPages.length > 0
       && parsed.tocPages.every((page) => page <= images.length)
       && pages[0]! > images.length;
     const pageBase = localIndices ? pages[0]! - 1 : 0;
     for (const page of parsed.tocPages) tocPages.add(page + pageBase);
     const lastPage = pages.at(-1)!;
-    if (parsed.continuesAt === undefined || parsed.continuesAt <= lastPage || lastPage >= limit) break;
-    nextStart = Math.min(parsed.continuesAt, limit);
+    if (parsed.continuesAt !== undefined && parsed.continuesAt > lastPage && lastPage < limit) {
+      const continuationEnd = Math.min(parsed.continuesAt + AI_OUTLINE_BATCH_SIZE - 1, limit);
+      for (let page = parsed.continuesAt; page <= continuationEnd; page += 1) {
+        if (visited.has(page)) continue;
+        visited.add(page);
+        queue.push(page);
+      }
+      queue.sort((left, right) => left - right);
+    }
   }
   if (aborted()) {
     return { hasToc: collected.length > 0, entries: collected, tocPages: [...tocPages], aborted: true };
@@ -191,7 +224,7 @@ export function buildAiOutlineCompleter(options: {
       role: "user",
       timestamp: Date.now(),
       content: [
-        { type: "text", text: userPrompt(input.pages) },
+        { type: "text", text: userPrompt(input.pages, input.texts) },
         ...input.images.map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
       ],
     };
