@@ -227,10 +227,10 @@ app.whenReady().then(async () => {
       ocr: async (job, context) => {
         const book = library.list().find((item) => item.id === job.bookId);
         if (!book) throw new Error("当前 PDF 书籍不可用。");
-        const { focusPage, completed } = ingestion.decodeOcrCheckpoint(job.checkpoint);
-        const pages = prioritizedPageOrder(book.pageCount, focusPage);
+        const { completed } = ingestion.decodeOcrCheckpoint(job.checkpoint);
+        const pages = prioritizedPageOrder(book.pageCount);
         // 弹性池动态派页（T49）：至多 N 页在途；断点只推进连续前沿——前沿之前必然已落库，
-        // 前沿之后的在途页崩溃后按缓存缺失自然重扫，旧格式断点沿用同一编码无损续扫。
+        // 前沿之后的在途页崩溃后按缓存缺失自然重扫。线性页序（T57-02）下断点即「已扫到第几页」。
         const limit = mineruEngine.concurrency;
         const frontier = ingestion.createOcrFrontier(completed);
         let written = completed;
@@ -255,7 +255,7 @@ app.whenReady().then(async () => {
               const reached = frontier.complete(index);
               if (reached > written) {
                 written = reached;
-                context.checkpoint(ingestion.encodeOcrCheckpoint(focusPage, reached), reached, book.pageCount);
+                context.checkpoint(ingestion.encodeOcrCheckpoint(reached), reached, book.pageCount);
               }
             })().finally(() => {
               inFlight.delete(task);
@@ -513,9 +513,6 @@ app.whenReady().then(async () => {
         total: book.pageCount,
         inputVersion: value.inputVersion,
         maxAttempts: value.maxAttempts,
-        ...(Number.isSafeInteger(value.startPage) && value.startPage! > 0
-          ? { checkpoint: ingestion.encodeOcrCheckpoint(value.startPage!, 0) }
-          : {}),
       });
     });
     ipcMain.handle("background-jobs:pause", (_event, jobId: unknown) => mutateOwnedJob(jobId, "pause"));

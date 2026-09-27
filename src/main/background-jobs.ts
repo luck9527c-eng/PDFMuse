@@ -44,7 +44,7 @@ export type JobExecutorContext = {
 export type JobExecutor = (job: BackgroundJob, context: JobExecutorContext) => Promise<void>;
 
 /** 调度入参：断点是不透明字符串，格式由各任务的执行方定义，调度模块不理解其内容。 */
-export type ScheduleJobInput = Omit<ScheduleBackgroundJobInput, "startPage"> & { checkpoint?: string };
+export type ScheduleJobInput = ScheduleBackgroundJobInput & { checkpoint?: string };
 
 function toJob(row: JobRow): BackgroundJob {
   return {

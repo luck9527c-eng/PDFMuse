@@ -66,16 +66,19 @@ describe("recognized text ingestion", () => {
     expect(calls).toEqual(["schedule:outline:5:120"]);
   });
 
-  it("encodes and decodes OCR book checkpoints across current and legacy formats", () => {
+  it("encodes and decodes linear OCR checkpoints and treats legacy formats as stale", () => {
     const { ingestion } = createHarness();
-    expect(ingestion.encodeOcrCheckpoint(6, 12)).toBe("ocr-order:6:12");
-    expect(ingestion.decodeOcrCheckpoint("ocr-order:6:12")).toEqual({ focusPage: 6, completed: 12 });
-    expect(ingestion.decodeOcrCheckpoint("start:9")).toEqual({ focusPage: 9, completed: 0 });
-    expect(ingestion.decodeOcrCheckpoint("page:4")).toEqual({ focusPage: 4, completed: 0 });
-    expect(ingestion.decodeOcrCheckpoint(undefined)).toEqual({ focusPage: 1, completed: 0 });
-    expect(ingestion.decodeOcrCheckpoint("无法解析的断点")).toEqual({ focusPage: 1, completed: 0 });
-    expect(ingestion.decodeOcrCheckpoint(ingestion.encodeOcrCheckpoint(3, 0))).toEqual({ focusPage: 3, completed: 0 });
-    expect(ingestion.decodeOcrCheckpoint(ingestion.encodeOcrCheckpoint(1, 40))).toEqual({ focusPage: 1, completed: 40 });
+    expect(ingestion.encodeOcrCheckpoint(12)).toBe("ocr-linear:12");
+    expect(ingestion.decodeOcrCheckpoint("ocr-linear:12")).toEqual({ completed: 12 });
+    // 旧格式断点（从开书页扩散的页序语义）一律判过期从头重扫：线性序下的 completed
+    // 前缀与旧扩散序前缀不可混读，兼容检查让重扫对已识别页近乎零成本。
+    expect(ingestion.decodeOcrCheckpoint("ocr-order:6:12")).toEqual({ completed: 0 });
+    expect(ingestion.decodeOcrCheckpoint("start:9")).toEqual({ completed: 0 });
+    expect(ingestion.decodeOcrCheckpoint("page:4")).toEqual({ completed: 0 });
+    expect(ingestion.decodeOcrCheckpoint(undefined)).toEqual({ completed: 0 });
+    expect(ingestion.decodeOcrCheckpoint("无法解析的断点")).toEqual({ completed: 0 });
+    expect(ingestion.decodeOcrCheckpoint(ingestion.encodeOcrCheckpoint(0))).toEqual({ completed: 0 });
+    expect(ingestion.decodeOcrCheckpoint(ingestion.encodeOcrCheckpoint(40))).toEqual({ completed: 40 });
   });
 
   it("完成前沿只计连续前缀：乱序完成不推进，补齐后跳到新前沿", () => {

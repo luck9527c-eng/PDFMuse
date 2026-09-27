@@ -53,7 +53,7 @@ export function useBookText(options: {
       await api.scheduleBackgroundJob({ bookId: book.id, kind: "outline", priority: 5, total: book.pageCount });
       const preflight = await loadStartupPreflight();
       if (preflight?.ok && !ocrResourcesMissing(preflight)) {
-        await api.scheduleBackgroundJob({ bookId: book.id, kind: "ocr", priority: 20, total: book.pageCount, maxAttempts: 3, inputVersion: MINERU_INPUT_VERSION, startPage: book.currentPage });
+        await api.scheduleBackgroundJob({ bookId: book.id, kind: "ocr", priority: 20, total: book.pageCount, maxAttempts: 3, inputVersion: MINERU_INPUT_VERSION });
       }
       const embedding = await api.getEmbeddingConnection();
       if (embedding.baseUrl && embedding.model) {

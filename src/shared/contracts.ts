@@ -321,7 +321,6 @@ export type ScheduleBackgroundJobInput = {
   total?: number;
   inputVersion?: string;
   maxAttempts?: number;
-  startPage?: number;
 };
 export type BackgroundJobMutationResult =
   | { ok: true; job: BackgroundJob }

@@ -176,6 +176,6 @@ describe("useBookText", () => {
       ["embedding", 0],
     ]);
     const ocrJob = env.scheduled.find((job) => job.kind === "ocr");
-    expect(ocrJob).toMatchObject({ startPage: BOOK.currentPage, maxAttempts: 3, inputVersion: MINERU_INPUT_VERSION });
+    expect(ocrJob).toMatchObject({ maxAttempts: 3, inputVersion: MINERU_INPUT_VERSION });
   });
 });

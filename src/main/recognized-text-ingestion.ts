@@ -8,7 +8,7 @@ import type {
 
 export type IngestSource = "background" | "interactive";
 
-export type OcrBookCheckpoint = { focusPage: number; completed: number };
+export type OcrBookCheckpoint = { completed: number };
 
 export type RecognizedTextIngestionDependencies = {
   indexRecognizedPage(bookId: string, page: number, lines: readonly RecognizedBlockLike[]): void;
@@ -53,16 +53,15 @@ export function createRecognizedTextIngestion(dependencies: RecognizedTextIngest
         total: dependencies.loadPageCount(bookId),
       });
     },
-    encodeOcrCheckpoint(focusPage: number, completed: number) {
-      return `ocr-order:${focusPage}:${completed}`;
+    /** 线性页序的断点：completed = 已连续扫完的页数（页 1..completed）。 */
+    encodeOcrCheckpoint(completed: number) {
+      return `ocr-linear:${Math.max(0, Math.floor(completed) || 0)}`;
     },
+    /** 旧格式断点（从开书页扩散的页序语义）与线性序前缀不可混读，一律判过期从头重扫——
+     *  兼容检查让重扫对已识别页近乎零成本，崩溃/升级后按缓存缺失自然补齐。 */
     decodeOcrCheckpoint(raw: string | undefined): OcrBookCheckpoint {
-      const order = raw?.match(/^ocr-order:(\d+):(\d+)$/);
-      const legacy = raw?.match(/^(?:start|page):(\d+)$/);
-      return {
-        focusPage: Math.max(1, Number(order?.[1] ?? legacy?.[1] ?? 1) || 1),
-        completed: Math.max(0, Number(order?.[2] ?? 0) || 0),
-      };
+      const linear = raw?.match(/^ocr-linear:(\d+)$/);
+      return { completed: linear ? Math.max(0, Number(linear[1]) || 0) : 0 };
     },
     /**
      * 并发识别的断点前沿：完成页集合受 checkpoint 长度上限约束无法整集编码，
