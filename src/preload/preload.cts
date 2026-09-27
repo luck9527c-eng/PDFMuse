@@ -33,7 +33,6 @@ const api: PDFMuseApi = {
   exportBookConversation: (bookId) => ipcRenderer.invoke("agent:export-conversation", bookId),
   recognizePage: (input) => ipcRenderer.invoke("ocr:recognize-page", input),
   getRecognizedPage: (bookId, page) => ipcRenderer.invoke("ocr:get-page", bookId, page),
-  searchBook: (bookId, query, limit) => ipcRenderer.invoke("book:search", bookId, query, limit),
   getBookOutline: (bookId) => ipcRenderer.invoke("outline:get", bookId),
   listBackgroundJobs: (bookId) => ipcRenderer.invoke("background-jobs:list", bookId),
   scheduleBackgroundJob: (input) => ipcRenderer.invoke("background-jobs:schedule", input),

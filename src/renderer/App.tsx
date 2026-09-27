@@ -6,7 +6,6 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  ChevronsLeft,
   ChevronsRight,
   Copy,
   FilePlus2,
@@ -114,8 +113,6 @@ export function App() {
     scrollTop: 0,
     zoomMode: "page-width",
     outline: [],
-    findCurrent: 0,
-    findTotal: 0,
     renderRevision: 0,
   });
   const [viewerError, setViewerError] = useState("");
@@ -125,9 +122,7 @@ export function App() {
   const [rightWidth, setRightWidth] = useState(360);
   const [sidebarView, setSidebarView] = useState<"outline" | "thumbnails">("outline");
   const [passwordRequest, setPasswordRequest] = useState<PasswordRequest>();
-  const [findOpen, setFindOpen] = useState(false);
   const [panMode, setPanMode] = useState(false);
-  const [findQuery, setFindQuery] = useState("");
   const [passage, setPassage] = useState<PassagePopover>();
   const [selectionFeedback, setSelectionFeedback] = useState<{ message: string; tone: "success" | "error" }>();
   const [draft, setDraft] = useState("");
@@ -256,17 +251,6 @@ export function App() {
       .catch((error: unknown) => setViewerError(error instanceof Error ? error.message : String(error)));
   }, []);
 
-  useEffect(() => {
-    const handleShortcut = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f" && book) {
-        event.preventDefault();
-        setFindOpen(true);
-      }
-    };
-    window.addEventListener("keydown", handleShortcut);
-    return () => window.removeEventListener("keydown", handleShortcut);
-  }, [book]);
-
   const activateBook = useCallback((openedBook: OpenedPdfBook) => {
     activeBookIdRef.current = openedBook.id;
     setViewerState({
@@ -276,8 +260,6 @@ export function App() {
       scrollTop: openedBook.readingState.scrollTop,
       zoomMode: openedBook.readingState.zoomMode,
       outline: [],
-      findCurrent: 0,
-      findTotal: 0,
       renderRevision: 0,
     });
     setLeftOpen(openedBook.readingState.leftSidebarOpen);
@@ -497,23 +479,6 @@ export function App() {
       setLibraryError("无法删除本书数据，请稍后重试。");
     }
   }, [refreshLibrary]);
-
-  const findInBook = useCallback(async (query: string, previous = false) => {
-    const normalized = query.trim();
-    viewerRef.current?.find(normalized, previous);
-    if (!normalized || !book || !window.pdfMuse) return;
-    try {
-      const result = await window.pdfMuse.searchBook(book.id, normalized, 20);
-      const pages = result.hits.filter((hit) => hit.source === "pdf" && typeof hit.page === "number").map((hit) => hit.page as number);
-      if (pages.length > 0 && !pages.includes(viewerState.page)) {
-        viewerRef.current?.goToPage(previous ? pages[pages.length - 1]! : pages[0]!);
-      }
-      if (pages.length > 0 && result.note) setOcrNotice(result.note);
-      else if (pages.length > 0 && viewerState.findTotal === 0) setOcrNotice(`识别文字命中 ${pages.length} 页，已跳转到${previous ? "最后" : "第一"}个结果。`);
-    } catch {
-      // PDF.js 原生查找仍然可用，索引查询失败不阻断阅读。
-    }
-  }, [book, viewerState.findTotal, viewerState.page]);
 
   const showLibrary = useCallback(() => {
     activeBookIdRef.current = undefined;
@@ -769,11 +734,9 @@ export function App() {
             <IconButton label="缩小" onClick={() => viewerRef.current?.zoomOut()}><Minus /></IconButton>
             <span className="zoom-value">{viewerState.scale}%</span>
             <IconButton label="放大" onClick={() => viewerRef.current?.zoomIn()}><Plus /></IconButton>
-            <IconButton label="适合宽度" onClick={() => viewerRef.current?.fitWidth()}><ChevronsLeft /></IconButton>
-            <IconButton label="适合页面" onClick={() => viewerRef.current?.fitPage()}><Focus /></IconButton>
+            <IconButton label="适合宽度" onClick={() => viewerRef.current?.fitWidth()}><Focus /></IconButton>
             <span className="toolbar-divider" />
             <IconButton aria-pressed={panMode} label={panMode ? "关闭拖拽浏览" : "开启拖拽浏览"} onClick={() => setPanMode((value) => !value)}><Hand /></IconButton>
-            <IconButton label="在 PDF 中查找" onClick={() => setFindOpen((value) => !value)}><Search /></IconButton>
             <IconButton label={ocrLoading ? "正在识别当前页" : "识别当前页文字"} disabled={ocrLoading} onClick={() => void recognizeCurrentPage}><ScanText /></IconButton>
           </div>
           {visibleBackgroundJobs.length > 0 && (
@@ -806,16 +769,6 @@ export function App() {
                 <span className="background-job-overflow">+{visibleBackgroundJobs.length - 3}</span>
               )}
             </div>
-          )}
-          {findOpen && (
-            <form className="find-bar" onSubmit={(event) => { event.preventDefault(); void findInBook(findQuery); }}>
-              <Search size={15} />
-              <input autoFocus value={findQuery} onChange={(event) => setFindQuery(event.target.value)} placeholder="查找文字" />
-              <span className="find-count">{viewerState.findTotal > 0 ? `${viewerState.findCurrent} / ${viewerState.findTotal}` : "0 / 0"}</span>
-              <IconButton type="button" label="上一个结果" onClick={() => void findInBook(findQuery, true)}><ChevronLeft /></IconButton>
-              <IconButton type="submit" label="下一个结果"><ChevronRight /></IconButton>
-              <IconButton type="button" label="关闭查找" onClick={() => { viewerRef.current?.find(""); setFindQuery(""); setFindOpen(false); }}><X /></IconButton>
-            </form>
           )}
           {ocrNotice && <div className="reader-notice" role="status"><span>{ocrNotice}</span><button aria-label="关闭识别提示" onClick={() => setOcrNotice("")}><X size={14} /></button></div>}
           {viewerError ? <div className="viewer-error"><strong>无法打开 PDF 书籍</strong><span>{viewerError}</span></div> : <PdfViewer ref={viewerRef} book={book} panMode={panMode} recognizedPage={recognizedPage} onStateChange={handleViewerState} onSelectionChange={handleViewerSelection} onError={setViewerError} />}

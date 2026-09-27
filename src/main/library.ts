@@ -83,7 +83,8 @@ function toReadingState(row: BookRow): ReadingState {
   return {
     page: row.current_page,
     scrollTop: row.scroll_top,
-    zoomMode: row.zoom_mode,
+    // 历史行里可能存有已退役的 "page-fit"，读出时归一到适合宽度。
+    zoomMode: row.zoom_mode === "custom" ? "custom" : "page-width",
     zoomScale: row.zoom_scale,
     leftSidebarOpen: row.left_sidebar_open === 1,
     rightSidebarOpen: row.right_sidebar_open === 1,
@@ -91,7 +92,7 @@ function toReadingState(row: BookRow): ReadingState {
 }
 
 function isZoomMode(value: unknown): value is ReadingZoomMode {
-  return value === "page-width" || value === "page-fit" || value === "custom";
+  return value === "page-width" || value === "custom";
 }
 
 function isReadingState(value: unknown): value is ReadingState {

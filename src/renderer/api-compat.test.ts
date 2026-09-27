@@ -11,7 +11,7 @@ const ALL_METHODS = [
   "openLibraryBook", "relocateLibraryBook", "removeLibraryBook", "deleteLibraryBookData", "unlockPdfBook",
   "updateLibraryBookState", "getModelConnection", "saveModelConnection", "testModelConnection",
   "getEmbeddingConnection", "saveEmbeddingConnection", "testEmbeddingConnection", "getBookConversation",
-  "getRunDiagnostics", "clearBookConversation", "exportBookConversation", "recognizePage", "getRecognizedPage", "searchBook", "getBookOutline",
+  "getRunDiagnostics", "clearBookConversation", "exportBookConversation", "recognizePage", "getRecognizedPage", "getBookOutline",
   "listBackgroundJobs", "scheduleBackgroundJob", "pauseBackgroundJob", "resumeBackgroundJob",
   "cancelBackgroundJob", "startAgentRun", "cancelAgentRun",
   "onAgentEvent", "onBackgroundEvent", "getReaderProfile", "saveReaderProfile", "getAppearanceSettings", "saveAppearanceSettings",

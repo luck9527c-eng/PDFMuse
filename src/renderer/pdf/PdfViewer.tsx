@@ -8,7 +8,6 @@ import {
 import * as pdfjs from "pdfjs-dist";
 import {
   EventBus,
-  PDFFindController,
   PDFLinkService,
   PDFViewer,
 } from "pdfjs-dist/web/pdf_viewer.mjs";
@@ -29,8 +28,6 @@ export type ViewerState = {
   scrollTop: number;
   zoomMode: ReadingZoomMode;
   outline: OutlineNode[];
-  findCurrent: number;
-  findTotal: number;
   /** pdfjs 页面重渲染修订：单一事实源在查看器内，页面重绘后递增，消费方据此复查文字层。 */
   renderRevision: number;
 };
@@ -42,8 +39,6 @@ export interface PdfViewerHandle {
   zoomIn(): void;
   zoomOut(): void;
   fitWidth(): void;
-  fitPage(): void;
-  find(query: string, findPrevious?: boolean): void;
   hasNativeText(page: number): Promise<boolean>;
   getThumbnail(page: number): Promise<string | undefined>;
   getPageImage(page: number, scale?: number): Promise<{ data: string; width: number; height: number } | undefined>;
@@ -108,12 +103,10 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
   const adapterRef = useRef<{
     eventBus: EventBus;
     viewer: PDFViewer;
-    findController: PDFFindController;
     fitMode: Exclude<ReadingZoomMode, "custom"> | null;
     currentPage: number;
     document?: pdfjs.PDFDocumentProxy;
     thumbnailCache: Map<number, Promise<string | undefined>>;
-    findQuery: string;
   } | null>(null);
   const panModeRef = useRef(panMode);
   const [loading, setLoading] = useState(true);
@@ -165,29 +158,6 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         adapterRef.current.fitMode = "page-width";
         adapterRef.current.viewer.currentScaleValue = "page-width";
       }
-    },
-    fitPage() {
-      if (adapterRef.current) {
-        adapterRef.current.fitMode = "page-fit";
-        adapterRef.current.viewer.currentScaleValue = "page-fit";
-      }
-    },
-    find(query, findPrevious = false) {
-      const adapter = adapterRef.current;
-      if (!adapter) return;
-      const normalizedQuery = query.trim();
-      const repeatSearch = normalizedQuery === adapter.findQuery;
-      adapter.findQuery = normalizedQuery;
-      adapter.eventBus.dispatch("find", {
-        source: adapter.findController,
-        type: repeatSearch && normalizedQuery ? "again" : "",
-        query: normalizedQuery,
-        caseSensitive: false,
-        entireWord: false,
-        highlightAll: true,
-        findPrevious,
-        matchDiacritics: false,
-      });
     },
     hasNativeText(pageNumber) {
       const adapter = adapterRef.current;
@@ -242,13 +212,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     let disposed = false;
     const eventBus = new EventBus();
     const linkService = new PDFLinkService({ eventBus });
-    const findController = new PDFFindController({ eventBus, linkService });
     const viewer = new PDFViewer({
       container,
       viewer: viewerElement,
       eventBus,
       linkService,
-      findController,
       textLayerMode: 1,
     });
     linkService.setViewer(viewer);
@@ -256,11 +224,9 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     const adapter: NonNullable<typeof adapterRef.current> = {
       eventBus,
       viewer,
-      findController,
       fitMode: restoredZoomMode === "custom" ? null : restoredZoomMode,
       currentPage: book.currentPage,
       thumbnailCache: new Map<number, Promise<string | undefined>>(),
-      findQuery: "",
     };
     adapterRef.current = adapter;
 
@@ -273,13 +239,9 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         scrollTop: container.scrollTop,
         zoomMode: adapter.fitMode ?? "custom",
         outline,
-        findCurrent,
-        findTotal,
         renderRevision: renderRevisionRef.current,
       });
     };
-    let findCurrent = 0;
-    let findTotal = 0;
     eventBus.on("pagechanging", (event: { pageNumber: number }) => {
       adapter.currentPage = event.pageNumber;
       reportState();
@@ -291,13 +253,6 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     };
     eventBus.on("pagerendered", reportPageRendered);
     eventBus.on("scalechanging", () => reportState());
-    const updateFindState = (event: { matchesCount?: { current?: number; total?: number } }) => {
-      findCurrent = event.matchesCount?.current ?? 0;
-      findTotal = event.matchesCount?.total ?? 0;
-      reportState();
-    };
-    eventBus.on("updatefindmatchescount", updateFindState);
-    eventBus.on("updatefindcontrolstate", updateFindState);
     eventBus.on("pagesinit", () => {
       if (adapter.fitMode) viewer.currentScaleValue = adapter.fitMode;
       else viewer.currentScale = book.readingState.zoomScale / 100;

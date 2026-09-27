@@ -29,7 +29,6 @@ const REQUIRED_API_METHODS = {
   exportBookConversation: true,
   recognizePage: true,
   getRecognizedPage: true,
-  searchBook: true,
   getBookOutline: true,
   listBackgroundJobs: true,
   scheduleBackgroundJob: true,

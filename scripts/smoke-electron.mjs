@@ -537,21 +537,6 @@ try {
   assert.equal(thumbnails.count, 3, "page thumbnail navigation is incomplete");
   assert.ok(thumbnails.rendered >= 1, "visible page thumbnails were not rendered");
   await evaluate(page.webSocketDebuggerUrl, `document.querySelector('.sidebar-tabs button:first-child')?.click()`);
-  await evaluate(
-    page.webSocketDebuggerUrl,
-    `new Promise((resolve) => {
-      document.querySelector('[aria-label="在 PDF 中查找"]')?.click();
-      setTimeout(() => {
-        const input = document.querySelector('.find-bar input');
-        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'PDFMuse search target');
-        input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
-        input.form.requestSubmit();
-        resolve(true);
-      }, 50);
-    })`,
-  );
-  const findText = await waitForText(page.webSocketDebuggerUrl, "1 / 9");
-  assert.match(findText, /1 \/ 9/, "PDF search result position and total are unavailable");
   assert.equal(
     await selectPdfText(page.webSocketDebuggerUrl, 1, "Chapter One", 1, "PDFMuse search target."),
     true,

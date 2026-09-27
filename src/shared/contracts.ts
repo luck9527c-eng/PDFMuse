@@ -30,7 +30,7 @@ export type OpenedPdfBook = {
   password?: string;
 };
 
-export type ReadingZoomMode = "page-width" | "page-fit" | "custom";
+export type ReadingZoomMode = "page-width" | "custom";
 
 export type ReadingState = {
   page: number;
@@ -294,14 +294,6 @@ export type BookOutlineNode = {
   label: string;
   page?: number;
   children: BookOutlineNode[];
-};
-
-export type PdfSearchResult = {
-  status: "ok" | "partial" | "unavailable";
-  hits: Array<{ page?: number; snippet: string; source?: "pdf" | "conversation" }>;
-  indexedPages: number;
-  totalPages: number;
-  note?: string;
 };
 
 export type BackgroundJobKind = "ocr" | "embedding" | "index" | "outline";
@@ -594,7 +586,6 @@ export interface PDFMuseApi {
   exportBookConversation(bookId: string): Promise<ExportConversationResult>;
   recognizePage(input: OcrPageRequest): Promise<OcrPageResult>;
   getRecognizedPage(bookId: string, page: number): Promise<RecognizedPageText | undefined>;
-  searchBook(bookId: string, query: string, limit?: number): Promise<PdfSearchResult>;
   getBookOutline(bookId: string): Promise<BookOutlineNode[] | undefined>;
   listBackgroundJobs(bookId?: string): Promise<BackgroundJob[]>;
   scheduleBackgroundJob(input: ScheduleBackgroundJobInput): Promise<BackgroundJobMutationResult>;

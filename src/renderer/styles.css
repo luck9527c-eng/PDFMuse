@@ -117,9 +117,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .page-control { height: 30px; display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .page-control input { width: 35px; height: 26px; padding: 0 4px; border: 1px solid var(--line); border-radius: 4px; background: white; text-align: center; color: var(--ink); font-size: 10px; }
 .zoom-value { width: 43px; text-align: center; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
-.find-bar { position: absolute; z-index: 13; top: 61px; left: 50%; transform: translateX(-50%); height: 42px; display: flex; align-items: center; gap: 3px; padding: 4px 5px 4px 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--paper); box-shadow: 0 7px 20px rgba(43,42,37,.12); color: var(--muted); }
-.find-bar input { width: 190px; height: 30px; border: 0; outline: 0; background: transparent; font-size: 12px; }
-.find-count { width: 54px; flex: none; text-align: center; font-size: 10px; font-variant-numeric: tabular-nums; }
 .pdf-container { position: absolute; inset: 0; overflow: auto; padding: 72px 24px 80px; }
 .pdf-container.pan-mode { cursor: grab; }
 .pdf-container.pan-mode.is-panning { cursor: grabbing; }
