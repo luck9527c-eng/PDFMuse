@@ -13,9 +13,9 @@ import {
 } from "pdfjs-dist/web/pdf_viewer.mjs";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
-import type { BookOutlineNode, OpenedPdfBook, ReadingZoomMode, RecognizedPageText, SelectedPassage } from "../../shared/contracts";
-import { normalizePageRects, ocrAnchorRect, type Rectangle } from "./selection-geometry";
-import { mountRecognizedTextLayer } from "./ocr-text-layer";
+import type { BookOutlineNode, NormalizedPageRect, OpenedPdfBook, ReadingZoomMode, RecognizedPageText, SelectedPassage } from "../../shared/contracts";
+import { evaluatePageSelection, normalizePageRects, ocrAnchorRect, toRectangle, type Rectangle } from "./selection-geometry";
+import { collectOcrLayerBlocks, isWholeBlockClickSelection, mountRecognizedTextLayer } from "./ocr-text-layer";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -267,23 +267,26 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
 
     let scrollFrame = 0;
     let selectionVisible = false;
-    // 扫描页块选中的高亮：实心 bbox 框（MinerU 可视化样式），替代拟合文字的 ::selection 条带。
+    // 扫描页选区高亮：单块实心 bbox 框（MinerU 可视化样式）；T56 量化多块描边——
+    // MinerU 块 bbox 彼此重叠，实心叠加会糊成整页色块，描边保持每块边界可见。
     const clearOcrBlockHighlight = () => {
       viewerElement.querySelectorAll("[data-pdfmuse-block-highlight]").forEach((node) => node.remove());
     };
-    const showOcrBlockHighlight = (pageEl: HTMLElement, rect: Rectangle) => {
+    const showOcrBlockHighlight = (pageEl: HTMLElement, rects: Rectangle[]) => {
       clearOcrBlockHighlight();
       const pageRect = pageEl.getBoundingClientRect();
       if (pageRect.width <= 0 || pageRect.height <= 0) return;
       const clampPct = (value: number) => Math.max(0, Math.min(100, value));
-      const div = document.createElement("div");
-      div.dataset.pdfmuseBlockHighlight = "true";
-      div.className = "ocr-block-highlight";
-      div.style.left = `${clampPct(((rect.left - pageRect.left) / pageRect.width) * 100)}%`;
-      div.style.top = `${clampPct(((rect.top - pageRect.top) / pageRect.height) * 100)}%`;
-      div.style.width = `${clampPct((rect.width / pageRect.width) * 100)}%`;
-      div.style.height = `${clampPct((rect.height / pageRect.height) * 100)}%`;
-      pageEl.appendChild(div);
+      for (const rect of rects) {
+        const div = document.createElement("div");
+        div.dataset.pdfmuseBlockHighlight = "true";
+        div.className = rects.length >= 2 ? "ocr-block-highlight ocr-block-outline" : "ocr-block-highlight";
+        div.style.left = `${clampPct(((rect.left - pageRect.left) / pageRect.width) * 100)}%`;
+        div.style.top = `${clampPct(((rect.top - pageRect.top) / pageRect.height) * 100)}%`;
+        div.style.width = `${clampPct((rect.width / pageRect.width) * 100)}%`;
+        div.style.height = `${clampPct((rect.height / pageRect.height) * 100)}%`;
+        pageEl.appendChild(div);
+      }
     };
     const clearSelectionPopover = () => {
       clearOcrBlockHighlight();
@@ -292,9 +295,13 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       onSelectionChange();
     };
     const reportScroll = () => {
-      clearSelectionPopover();
       cancelAnimationFrame(scrollFrame);
-      scrollFrame = requestAnimationFrame(() => reportState());
+      scrollFrame = requestAnimationFrame(() => {
+        reportState();
+        // Reader 实测反馈（问题二）：滚动不清除选中——原生选区滚动后仍存活，
+        // 重算一次让块高亮与 popover 跟随新视口位置；选区已消失时 reportSelection 自行清场。
+        if (selectionVisible) scheduleSelectionReport();
+      });
     };
     container.addEventListener("scroll", reportScroll, { passive: true });
 
@@ -324,28 +331,38 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         selection.removeAllRanges();
         return;
       }
-      const text = selection.toString().trim();
       const page = Number(startPage.dataset.pageNumber);
       const pageRect = startPage.getBoundingClientRect();
-      // 扫描页选区高亮直接用 MinerU 块 bbox，且只取选区起点所在块——
-      // "所有相交块"会因块 bbox 彼此重叠叠成整页色块（Reader 截图复盘）。
-      const ocrRect = ocrAnchorRect(startPage, range);
-      const rects = normalizePageRects(pageRect, ocrRect ? [ocrRect] : Array.from(range.getClientRects()));
-      const selectionRect = ocrRect ?? range.getBoundingClientRect();
-      if (ocrRect) showOcrBlockHighlight(startPage, ocrRect);
+      // T56 选中链路三分支收敛为一次纯函数求值：量化（块全文拼接+描边+并集锚）、
+      // 纯噪声抑制（null）、单块/原生路径（起点块实心 + 字符级文本，块内精细选择不动）。
+      const evaluation = evaluatePageSelection({
+        selectionRects: Array.from(range.getClientRects()).map(toRectangle),
+        ocrBlocks: collectOcrLayerBlocks(startPage),
+        startBlockRect: ocrAnchorRect(startPage, range),
+        nativeText: selection.toString().trim(),
+        nativeSelectionRect: toRectangle(range.getBoundingClientRect()),
+        // R1-Q6 守卫：点击合成的整块选区不参与量化——被点块 bbox 与邻块重叠时防止点击升级成多块。
+        wholeBlockClick: isWholeBlockClickSelection(range, startPage),
+      });
+      if (!evaluation) {
+        clearSelectionPopover();
+        return;
+      }
+      if (evaluation.highlightRects.length > 0) showOcrBlockHighlight(startPage, evaluation.highlightRects);
       else clearOcrBlockHighlight();
-      if (!text || !Number.isSafeInteger(page) || page < 1 || rects.length === 0
-        || selectionRect.width <= 0 || selectionRect.height <= 0) {
+      const rects = normalizePageRects(pageRect, [...evaluation.passageRects]);
+      if (!evaluation.text || !Number.isSafeInteger(page) || page < 1 || rects.length === 0
+        || evaluation.popoverRect.width <= 0 || evaluation.popoverRect.height <= 0) {
         clearSelectionPopover();
         return;
       }
       selectionVisible = true;
       onSelectionChange({
         kind: "selected",
-        passage: { bookId: book.id, page, text, rects },
+        passage: { bookId: book.id, page, text: evaluation.text, rects },
         popover: {
-          x: selectionRect.left + selectionRect.width / 2,
-          y: selectionRect.top,
+          x: evaluation.popoverRect.left + evaluation.popoverRect.width / 2,
+          y: evaluation.popoverRect.top,
         },
       });
     };

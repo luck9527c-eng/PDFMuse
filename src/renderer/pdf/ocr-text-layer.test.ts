@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { RecognizedPageText } from "../../shared/contracts";
-import { fitSpanFontSize, mountRecognizedTextLayer } from "./ocr-text-layer";
+import { collectOcrLayerBlocks, fitSpanFontSize, isWholeBlockClickSelection, mountRecognizedTextLayer } from "./ocr-text-layer";
 import { ocrAnchorRect } from "./selection-geometry";
 
 function recognizedPageWith(blocks: RecognizedPageText["blocks"]): RecognizedPageText {
@@ -132,51 +132,51 @@ describe("fitSpanFontSize", () => {
   });
 });
 
-describe("点击选整块", () => {
-  // jsdom 的 Selection 是残缺桩（addRange 不生效），装一个受控假选区：
-  // 真实 Range 照常创建，选区状态由桩记录，处理逻辑经真实 DOM 事件驱动。
-  function installFakeSelection() {
-    let current: { range: Range } | null = null;
-    const selection = {
-      get isCollapsed() {
-        return current === null;
-      },
-      get rangeCount() {
-        return current === null ? 0 : 1;
-      },
-      getRangeAt(index: number) {
-        if (current === null || index !== 0) throw new Error("Invalid range index.");
-        return current.range;
-      },
-      removeAllRanges() {
-        current = null;
-      },
-      addRange(range: Range) {
-        current = { range };
-      },
-    };
-    vi.stubGlobal("getSelection", () => selection);
-    return selection;
-  }
+// jsdom 的 Selection 是残缺桩（addRange 不生效），装一个受控假选区：
+// 真实 Range 照常创建，选区状态由桩记录，处理逻辑经真实 DOM 事件驱动。
+function installFakeSelection() {
+  let current: { range: Range } | null = null;
+  const selection = {
+    get isCollapsed() {
+      return current === null;
+    },
+    get rangeCount() {
+      return current === null ? 0 : 1;
+    },
+    getRangeAt(index: number) {
+      if (current === null || index !== 0) throw new Error("Invalid range index.");
+      return current.range;
+    },
+    removeAllRanges() {
+      current = null;
+    },
+    addRange(range: Range) {
+      current = { range };
+    },
+  };
+  vi.stubGlobal("getSelection", () => selection);
+  return selection;
+}
 
+function mountTwoBlocks() {
+  const recognizedPage = recognizedPageWith([
+    { type: "text", text: "第一块全文", bbox: [0.1, 0.1, 0.5, 0.2] },
+    { type: "text", text: "第二块全文", bbox: [0.55, 0.1, 0.9, 0.2] },
+  ]);
+  const viewer = document.createElement("div");
+  const page = document.createElement("div");
+  page.className = "page";
+  page.dataset.pageNumber = "2";
+  viewer.appendChild(page);
+  mountRecognizedTextLayer(viewer, recognizedPage);
+  const spans = Array.from(page.querySelectorAll<HTMLElement>(".ocr-text-layer span"));
+  return { spans };
+}
+
+describe("点击选整块", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
-
-  function mountTwoBlocks() {
-    const recognizedPage = recognizedPageWith([
-      { type: "text", text: "第一块全文", bbox: [0.1, 0.1, 0.5, 0.2] },
-      { type: "text", text: "第二块全文", bbox: [0.55, 0.1, 0.9, 0.2] },
-    ]);
-    const viewer = document.createElement("div");
-    const page = document.createElement("div");
-    page.className = "page";
-    page.dataset.pageNumber = "2";
-    viewer.appendChild(page);
-    mountRecognizedTextLayer(viewer, recognizedPage);
-    const spans = Array.from(page.querySelectorAll<HTMLElement>(".ocr-text-layer span"));
-    return { spans };
-  }
 
   it("点击块合成整块选区", () => {
     const selection = installFakeSelection();
@@ -249,5 +249,134 @@ describe("OCR 块选区矩形（高亮只取选区起点所在块）", () => {
   it("页面没有 OCR 文字层时返回 null", () => {
     const page = document.createElement("div");
     expect(ocrAnchorRect(page, fakeRangeAt(page))).toBeNull();
+  });
+});
+
+describe("collectOcrLayerBlocks（T56 量化候选收集）", () => {
+  function mountBlockSpans(blocks: Array<{ type: string; text: string; rect?: { left: number; top: number; right: number; bottom: number; width: number; height: number } }>) {
+    const page = document.createElement("div");
+    const layer = document.createElement("div");
+    layer.className = "ocr-text-layer";
+    page.appendChild(layer);
+    for (const block of blocks) {
+      const span = document.createElement("span");
+      span.textContent = block.text;
+      span.dataset.ocrType = block.type;
+      layer.appendChild(span);
+      if (block.rect) vi.spyOn(span, "getBoundingClientRect").mockReturnValue(block.rect as DOMRect);
+    }
+    return page;
+  }
+
+  it("OCR 层 span 收集为候选：视口矩形、块全文、类型标签，保持 DOM 序", () => {
+    const headerRect = { left: 10, top: 20, right: 110, bottom: 40, width: 100, height: 20 };
+    const textRect = { left: 10, top: 60, right: 310, bottom: 100, width: 300, height: 40 };
+    const page = mountBlockSpans([
+      { type: "header", text: "页眉", rect: headerRect },
+      { type: "text", text: "正文块全文", rect: textRect },
+    ]);
+    expect(collectOcrLayerBlocks(page)).toEqual([
+      { type: "header", text: "页眉", rect: headerRect },
+      { type: "text", text: "正文块全文", rect: textRect },
+    ]);
+  });
+
+  it("页面没有 OCR 文字层时返回空数组（调用方走原生路径）", () => {
+    const page = document.createElement("div");
+    expect(collectOcrLayerBlocks(page)).toEqual([]);
+  });
+});
+
+describe("isWholeBlockClickSelection（T56 R1-Q6 点击守卫）", () => {
+  function mountTwoBlocks() {
+    const page = document.createElement("div");
+    const layer = document.createElement("div");
+    layer.className = "ocr-text-layer";
+    page.appendChild(layer);
+    for (const text of ["第一块全文", "第二块全文"]) {
+      const span = document.createElement("span");
+      span.textContent = text;
+      layer.appendChild(span);
+    }
+    const spans = Array.from(page.querySelectorAll<HTMLElement>(".ocr-text-layer span"));
+    return { page, spans };
+  }
+
+  it("点击合成形状（selectNodeContents：边界容器为 span 本身）识别为整块点击", () => {
+    const { page, spans } = mountTwoBlocks();
+    const range = document.createRange();
+    range.selectNodeContents(spans[0]!);
+    expect(isWholeBlockClickSelection(range, page)).toBe(true);
+  });
+
+  it("块内拖选/双击选词形状（边界容器为文本节点）不识别为整块点击", () => {
+    const { page, spans } = mountTwoBlocks();
+    const range = document.createRange();
+    range.selectNodeContents(spans[0]!);
+    range.setStart(spans[0]!.firstChild!, 1);
+    range.setEnd(spans[0]!.firstChild!, 3);
+    expect(isWholeBlockClickSelection(range, page)).toBe(false);
+  });
+
+  it("跨块选区（起止容器不同）不识别为整块点击", () => {
+    const { page, spans } = mountTwoBlocks();
+    const range = document.createRange();
+    range.setStartBefore(spans[0]!);
+    range.setEndAfter(spans[1]!);
+    expect(isWholeBlockClickSelection(range, page)).toBe(false);
+  });
+
+  it("span 不在给定页面内时不识别", () => {
+    const { spans } = mountTwoBlocks();
+    const otherPage = document.createElement("div");
+    const range = document.createRange();
+    range.selectNodeContents(spans[0]!);
+    expect(isWholeBlockClickSelection(range, otherPage)).toBe(false);
+  });
+});
+
+describe("mousedown 续选塌陷（Reader 实测反馈·问题一）", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("mousedown 落点 span 被当前整块选区完整覆盖时塌陷（解除点击后无法续拖的文本拖拽陷阱）", () => {
+    const selection = installFakeSelection();
+    const { spans } = mountTwoBlocks();
+    const range = document.createRange();
+    range.selectNodeContents(spans[0]!);
+    selection.addRange(range);
+    spans[0]!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    expect(selection.isCollapsed).toBe(true);
+  });
+
+  it("mousedown 落点 span 仅被部分覆盖（双击选词）时不塌陷，尊重守卫不变", () => {
+    const selection = installFakeSelection();
+    const { spans } = mountTwoBlocks();
+    const range = document.createRange();
+    range.selectNodeContents(spans[0]!);
+    range.setStart(spans[0]!.firstChild!, 1);
+    range.setEnd(spans[0]!.firstChild!, 3);
+    selection.addRange(range);
+    spans[0]!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    expect(selection.isCollapsed).toBe(false);
+  });
+
+  it("跨块选区完整覆盖落点 span 时塌陷（拖选后从途经块内续拖可用）", () => {
+    const selection = installFakeSelection();
+    const { spans } = mountTwoBlocks();
+    const range = document.createRange();
+    range.setStartBefore(spans[0]!);
+    range.setEndAfter(spans[1]!);
+    selection.addRange(range);
+    spans[1]!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    expect(selection.isCollapsed).toBe(true);
+  });
+
+  it("文字层拖拽手势一律拦截（透明文本拖放无意义且抢选区手势）", () => {
+    const { spans } = mountTwoBlocks();
+    const event = new Event("dragstart", { bubbles: true, cancelable: true });
+    spans[0]!.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
   });
 });

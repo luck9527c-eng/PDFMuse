@@ -600,7 +600,7 @@ try {
       container.dispatchEvent(new Event('scroll'));
     })()`,
   );
-  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover", false), false, "scrolling did not dismiss Selected Passage actions");
+  assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover"), true, "scrolling dismissed Selected Passage actions (selection should survive scroll)");
   await selectPdfText(page.webSocketDebuggerUrl, 1, "Chapter One", 1, "PDFMuse search target.");
   assert.equal(await waitForSelector(page.webSocketDebuggerUrl, ".selection-popover"), true, "Selected Passage actions did not reopen before cancellation");
   await evaluate(

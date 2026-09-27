@@ -1,4 +1,5 @@
 import type { MineruBlock, RecognizedPageText } from "../../shared/contracts";
+import type { OcrBlockCandidate } from "./selection-geometry";
 
 const BLOCK_TYPE_LABELS: Record<string, string> = {
   text: "文本",
@@ -96,8 +97,54 @@ export function mountRecognizedTextLayer(viewer: HTMLElement, recognizedPage?: R
     selection.removeAllRanges();
     selection.addRange(range);
   });
+  // 续选塌陷（Reader 实测反馈问题一）：点击整块后从块内再拖，浏览器把手势当作文本拖拽
+  // （drag-and-drop）而非新选区。mousedown 落点 span 被当前选区完整覆盖（点击整块或跨块拖选
+  // 的组成块）时先塌陷，让本次手势从落点重新起选；块内部分选区（双击选词）不含整块 span，
+  // 不塌陷，2026-09-23 尊重守卫不变。
+  layer.addEventListener("mousedown", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const span = target.closest<HTMLElement>("span");
+    if (!span || !layer.contains(span)) return;
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+    const active = selection.getRangeAt(0);
+    const spanRange = document.createRange();
+    spanRange.selectNodeContents(span);
+    if (active.compareBoundaryPoints(Range.START_TO_START, spanRange) <= 0
+      && active.compareBoundaryPoints(Range.END_TO_END, spanRange) >= 0) {
+      selection.removeAllRanges();
+    }
+  });
+  // 透明文字层上拖放文本无意义且与选区手势抢事件——一律拦截。
+  layer.addEventListener("dragstart", (event) => event.preventDefault());
   page.appendChild(layer);
   // 布局就绪后逐块拟合字号；测试与隐藏页无布局，fitSpanFontSize 内部自行跳过。
   for (const span of layer.querySelectorAll<HTMLElement>("span")) fitSpanFontSize(span);
   return true;
+}
+
+/**
+ * OCR 层 span → 量化候选（T56）：视口矩形、块全文、类型标签，保持 DOM 序（MinerU 输出序即阅读序）。
+ * 随 selectionchange 每帧现查，无缓存失效问题；无层页面返回空数组，调用方走原生路径。
+ */
+export function collectOcrLayerBlocks(page: HTMLElement): OcrBlockCandidate[] {
+  return Array.from(page.querySelectorAll<HTMLElement>(".ocr-text-layer span")).map((span) => ({
+    rect: span.getBoundingClientRect(),
+    text: span.textContent ?? "",
+    type: span.dataset.ocrType ?? "",
+  }));
+}
+
+/**
+ * 选区是否为「点击选整块」程序化合成的形状（T56 R1-Q6 守卫）：selectNodeContents 后
+ * startContainer 与 endContainer 恒为该 span 且 offset 覆盖其全部子节点——拖选/双击选词的
+ * 边界容器是文本节点，形状不同。此类选区不参与块级量化，防止被点块 bbox 与邻块重叠时
+ * 点击被升级成多块选区（2026-09-23 点击语义冻结）。
+ */
+export function isWholeBlockClickSelection(range: Range, page: HTMLElement): boolean {
+  if (range.startContainer !== range.endContainer || !(range.startContainer instanceof Element)) return false;
+  const span = range.startContainer.closest<HTMLElement>(".ocr-text-layer span");
+  if (!span || !page.contains(span)) return false;
+  return range.startOffset === 0 && range.endOffset === span.childNodes.length;
 }
