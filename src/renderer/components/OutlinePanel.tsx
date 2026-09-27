@@ -1,9 +1,15 @@
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { BookOutlineNode } from "../../shared/contracts";
+import type { BookOutlineNode, BookOutlineStrategy } from "../../shared/contracts";
 
 type OutlineNode = BookOutlineNode;
+
+const STRATEGY_LABEL: Record<Exclude<BookOutlineStrategy, "empty">, string> = {
+  embedded: "来源：内嵌书签",
+  ai_toc: "来源：AI 识别",
+  body_headings: "来源：正文识别",
+};
 
 function flattenOutline(nodes: OutlineNode[]): OutlineNode[] {
   return nodes.flatMap((node) => [node, ...flattenOutline(node.children)]);
@@ -59,7 +65,7 @@ function OutlineTree({
   );
 }
 
-export function OutlinePanel({ nodes, page, emptyMessage, onGoToPage }: { nodes: OutlineNode[]; page: number; emptyMessage: string; onGoToPage(page: number): void }) {
+export function OutlinePanel({ nodes, strategy, page, emptyMessage, onGoToPage }: { nodes: OutlineNode[]; strategy: BookOutlineStrategy; page: number; emptyMessage: string; onGoToPage(page: number): void }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const activeId = useMemo(() => {
@@ -99,6 +105,7 @@ export function OutlinePanel({ nodes, page, emptyMessage, onGoToPage }: { nodes:
 
   return (
     <div className="outline-panel" ref={rootRef}>
+      {strategy !== "empty" && <p className="outline-source">{STRATEGY_LABEL[strategy]}</p>}
       <OutlineTree
         nodes={nodes}
         activeId={activeId}

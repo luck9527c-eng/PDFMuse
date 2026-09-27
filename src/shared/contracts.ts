@@ -289,6 +289,9 @@ export type MineruWorkerResponse =
   | { id: string; ok: true; result: MineruPageData }
   | { id: string; ok: false; message: string };
 
+/** 目录来源（T57-05 落库元信息，面板可见）：empty 表示尚无目录或无可识别结构。 */
+export type BookOutlineStrategy = "embedded" | "ai_toc" | "body_headings" | "empty";
+export type BookOutline = { strategy: BookOutlineStrategy; nodes: BookOutlineNode[] };
 export type BookOutlineNode = {
   id: string;
   label: string;
@@ -373,7 +376,7 @@ export type ExportConversationResult =
 /** 后台状态推送（ADR-0008）：任务与生成目录的变更以完整状态分片 + 单调 revision 推送，渲染层订阅而非轮询。 */
 export type BackgroundStateEvent =
   | { revision: number; kind: "jobs"; bookId: string; jobs: BackgroundJob[] }
-  | { revision: number; kind: "outline"; bookId: string; nodes: BookOutlineNode[] | undefined };
+  | { revision: number; kind: "outline"; bookId: string; strategy: BookOutlineStrategy; nodes: BookOutlineNode[] | undefined };
 
 export type AgentStreamEvent =
   | {
@@ -585,7 +588,7 @@ export interface PDFMuseApi {
   exportBookConversation(bookId: string): Promise<ExportConversationResult>;
   recognizePage(input: OcrPageRequest): Promise<OcrPageResult>;
   getRecognizedPage(bookId: string, page: number): Promise<RecognizedPageText | undefined>;
-  getBookOutline(bookId: string): Promise<BookOutlineNode[] | undefined>;
+  getBookOutline(bookId: string): Promise<BookOutline | undefined>;
   listBackgroundJobs(bookId?: string): Promise<BackgroundJob[]>;
   scheduleBackgroundJob(input: ScheduleBackgroundJobInput): Promise<BackgroundJobMutationResult>;
   pauseBackgroundJob(jobId: string): Promise<BackgroundJobMutationResult>;

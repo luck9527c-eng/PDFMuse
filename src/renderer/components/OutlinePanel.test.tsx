@@ -75,6 +75,7 @@ describe("OutlinePanel", () => {
 
   const baseProps = (nodes: BookOutlineNode[], page: number): PanelProps => ({
     nodes,
+    strategy: "embedded",
     page,
     emptyMessage: "未检测到可用章节。",
     onGoToPage: () => undefined,

@@ -196,7 +196,7 @@ app.whenReady().then(async () => {
         renderPage: pageRenderer.renderPage,
         complete: buildAiOutlineCompleter({ loadConnection: loadChatConnection }),
       },
-      onOutlineChange: (bookId) => broadcastBackgroundState({ kind: "outline", bookId, nodes: bookOutline.get(bookId) }),
+      onOutlineChange: (bookId) => broadcastBackgroundState({ kind: "outline", bookId, strategy: bookOutline.strategy(bookId), nodes: bookOutline.get(bookId) }),
     });
     closeBookOutline = bookOutline.close;
     const scheduleOptionalEmbedding = (input: Omit<ScheduleBackgroundJobInput, "kind">) => (

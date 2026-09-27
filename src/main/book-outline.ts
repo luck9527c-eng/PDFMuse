@@ -10,10 +10,10 @@ import {
   type AiOutlineEntry,
   type TocPageText,
 } from "./agent/outline-ai.js";
-import type { BookOutlineNode, MineruBlock } from "../shared/contracts.js";
+import type { BookOutlineNode, BookOutlineStrategy, MineruBlock } from "../shared/contracts.js";
 
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
-const OUTLINE_VERSION = 3;
+const OUTLINE_VERSION = 4;
 const MAX_HEADINGS = 240;
 const MIN_OFFSET_VOTES = 2;
 const REPEATED_LABEL_PAGES = 3;
@@ -287,12 +287,25 @@ function collectAnchors(bodyHeadings: readonly OutlineHeading[]): OutlineAnchors
   return { byKey, byTitle };
 }
 
-/** 印刷页码 → PDF 页码偏移：正文锚点（真标题页）减去目录行印刷页码，按出现次数投票。
+export type PrintedPageVote = { page: number; printed: number };
+
+/** 印刷页码 → PDF 页码偏移投票：印刷页码观测（每页一块的 page_number 块、原生孤立数字行）
+ *  与正文锚点（真标题页减目录行印刷页码）汇入同一多数派——密集页脚票主导，锚点票补位，
+ *  章节重启页码产生的杂音被「多数派 + 最少票数阈值」吸收；目录页自身的页码块也是合法票。
  *  锚点两路：序数身份（章/节 key）优先，剥前缀标题（「窃(qiè)读记」对「1 窃读记」）兜底；
  *  每行只投一票——序数票与标题票同源时不是独立观测。 */
-function resolvePageOffset(tocRows: readonly TocRow[], anchors: OutlineAnchors): number | undefined {
+function resolvePageOffset(
+  tocRows: readonly TocRow[],
+  anchors: OutlineAnchors,
+  printedVotes: readonly PrintedPageVote[] = [],
+): number | undefined {
   const votes = new Map<number, number>();
   const vote = (offset: number) => votes.set(offset, (votes.get(offset) ?? 0) + 1);
+  for (const observed of printedVotes) {
+    if (Number.isSafeInteger(observed.printed) && observed.printed >= 0 && observed.page >= 1) {
+      vote(observed.page - observed.printed);
+    }
+  }
   let chapterScope = 0;
   for (const row of tocRows) {
     const ordinal = parseOutlineOrdinal(row.label);
@@ -461,18 +474,31 @@ export function shouldYieldToOutline(
   return true;
 }
 
+/** 单调性修复：目录条目页码沿阅读序应非递减，错锚/偏移漂移造成的倒挂按前值下限钳制。 */
+export function repairOutlineMonotonicity(nodes: readonly BookOutlineNode[]): BookOutlineNode[] {
+  let last = 0;
+  const walk = (list: readonly BookOutlineNode[]): BookOutlineNode[] => list.map((node) => {
+    let current = node;
+    if (current.page !== undefined && current.page < last) current = { ...current, page: last };
+    if (current.page !== undefined && current.page > last) last = current.page;
+    return { ...current, children: walk(current.children) };
+  });
+  return walk(nodes);
+}
+
 /** 全书装配：AI 目录行 + 正文锚点投票解算偏移；偏移不可信（锚点不足）时输出空目录等 OCR 补全后重算。 */
 export function assembleOutline(
   headings: readonly OutlineHeading[],
   tocRows: readonly TocRow[],
   pageCount: number,
+  printedVotes: readonly PrintedPageVote[] = [],
 ): AssembledOutline {
   const bodyHeadings = suppressRunningHeaders(headings);
   if (tocRows.length === 0) return { nodes: [], strategy: "empty" };
   const anchors = collectAnchors(bodyHeadings);
-  const offset = resolvePageOffset(tocRows, anchors);
+  const offset = resolvePageOffset(tocRows, anchors, printedVotes);
   if (offset === undefined) return { nodes: [], strategy: "empty" };
-  return { nodes: buildTocNodes(tocRows, offset, pageCount, anchors), strategy: "toc" };
+  return { nodes: repairOutlineMonotonicity(buildTocNodes(tocRows, offset, pageCount, anchors)), strategy: "toc" };
 }
 
 function recognizedLines(blocks: ReadonlyArray<MineruBlock> | undefined): OutlineTextLine[] {
@@ -644,14 +670,20 @@ function isStalePagePayload(json: string): boolean {
   }
 }
 
-/** 页候选载荷解析：当前版本为 {v, headings}，过期/损坏载荷按空处理。 */
-function parsePageHeadings(json: string): OutlineHeading[] {
-  if (isStalePagePayload(json)) return [];
+/** 页候选载荷解析：当前版本为 {v, headings, printed}，过期/损坏载荷按空处理。
+ *  printed 是该页的印刷页码观测（page_number 块 / 原生孤立数字行），偏移投票的密集信号。 */
+function parsePagePayload(json: string): { headings: OutlineHeading[]; printed: number[] } {
+  if (isStalePagePayload(json)) return { headings: [], printed: [] };
   try {
-    const payload = JSON.parse(json) as { headings?: unknown };
-    return Array.isArray(payload.headings) ? payload.headings.filter(isOutlineHeading) : [];
+    const payload = JSON.parse(json) as { headings?: unknown; printed?: unknown };
+    return {
+      headings: Array.isArray(payload.headings) ? payload.headings.filter(isOutlineHeading) : [],
+      printed: Array.isArray(payload.printed)
+        ? payload.printed.filter((value): value is number => Number.isSafeInteger(value) && value >= 0 && value <= 9999)
+        : [],
+    };
   } catch {
-    return [];
+    return { headings: [], printed: [] };
   }
 }
 
@@ -688,6 +720,7 @@ export function createBookOutlineModule(
       version INTEGER NOT NULL,
       nodes_json TEXT NOT NULL,
       total_pages INTEGER NOT NULL,
+      strategy TEXT NOT NULL DEFAULT '',
       updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS book_outline_ai (
@@ -697,6 +730,11 @@ export function createBookOutlineModule(
       updated_at TEXT NOT NULL
     );
   `);
+  // 既有库补列：目录来源（T57-05）。
+  const outlineColumns = database.prepare("PRAGMA table_info(book_outlines)").all() as Array<{ name: string }>;
+  if (!outlineColumns.some((column) => column.name === "strategy")) {
+    database.exec("ALTER TABLE book_outlines ADD COLUMN strategy TEXT NOT NULL DEFAULT ''");
+  }
   const openDocument = options.openDocument ?? openPdfOutlineDocument;
 
   function get(bookId: string): BookOutlineNode[] | undefined {
@@ -741,16 +779,26 @@ export function createBookOutlineModule(
     `).run(bookId, OUTLINE_VERSION, JSON.stringify(cache), new Date().toISOString());
   }
 
-  function persistOutline(bookId: string, nodes: BookOutlineNode[], totalPages: number) {
+  function persistOutline(bookId: string, nodes: BookOutlineNode[], totalPages: number, strategy: BookOutlineStrategy) {
     database.prepare(`
-      INSERT INTO book_outlines (book_id, version, nodes_json, total_pages, updated_at)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO book_outlines (book_id, version, nodes_json, total_pages, strategy, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(book_id) DO UPDATE SET
       version = excluded.version,
       nodes_json = excluded.nodes_json,
       total_pages = excluded.total_pages,
+      strategy = excluded.strategy,
       updated_at = excluded.updated_at
-    `).run(bookId, OUTLINE_VERSION, JSON.stringify(nodes), totalPages, new Date().toISOString());
+    `).run(bookId, OUTLINE_VERSION, JSON.stringify(nodes), totalPages, strategy, new Date().toISOString());
+  }
+
+  /** 目录来源（落库元信息，面板可见）：无记录或版本不符返回 "empty"。 */
+  function outlineStrategy(bookId: string): BookOutlineStrategy {
+    if (!BOOK_ID_PATTERN.test(bookId)) return "empty";
+    const row = database.prepare("SELECT strategy FROM book_outlines WHERE book_id = ? AND version = ?")
+      .get(bookId, OUTLINE_VERSION) as { strategy: string } | undefined;
+    const value = row?.strategy;
+    return value === "embedded" || value === "ai_toc" || value === "body_headings" ? value : "empty";
   }
 
   function invalidate(bookId: string, page?: number) {
@@ -819,7 +867,7 @@ export function createBookOutlineModule(
         invalidate(bookId);
         // 内嵌书签落库为可读目录：检索的所在章加权只读 book_outlines，
         // 不落库的书对「先验」是隐身书，恰是最该吃到加权的结构良好的书。
-        persistOutline(bookId, embeddedNodes, document.pageCount);
+        persistOutline(bookId, embeddedNodes, document.pageCount, "embedded");
         options.onOutlineChange?.(bookId);
         return { status: "embedded" as const, nodes: embeddedNodes, processedPages: 0, totalPages: document.pageCount };
       }
@@ -885,9 +933,23 @@ export function createBookOutlineModule(
         const native = await document.getNativeLines(page);
         const blocks = options.readRecognizedBlocks?.(bookId, page);
         const { lines, source } = selectPageText(native, blocks);
+        // 印刷页码观测（T57-05）：OCR 的 page_number 块与原生孤立数字行——偏移投票的密集信号。
+        const pagePrinted: number[] = [];
+        if (source === "ocr") {
+          for (const block of blocks ?? []) {
+            if (block?.type !== "page_number") continue;
+            const parsed = Number(String(block.text ?? "").match(/\d{1,4}/)?.[0]);
+            if (Number.isSafeInteger(parsed)) pagePrinted.push(parsed);
+          }
+        } else if (source === "native") {
+          for (const line of lines) {
+            const text = normalizeLabel(line.text);
+            if (/^\d{1,4}$/.test(text)) pagePrinted.push(Number(text));
+          }
+        }
         // 目录页不参与正文标题锚点——否则章/节锚点会全落在目录页本身。
         const headings = tocPageSet.has(page) ? [] : detectHeadingCandidates(page, lines);
-        upsert.run(bookId, page, JSON.stringify({ v: OUTLINE_VERSION, headings }), source, new Date().toISOString());
+        upsert.run(bookId, page, JSON.stringify({ v: OUTLINE_VERSION, headings, printed: pagePrinted }), source, new Date().toISOString());
         processedPages = page;
         onProgress?.(processedPages, document.pageCount);
       }
@@ -898,12 +960,16 @@ export function createBookOutlineModule(
         SELECT page, candidates_json FROM book_outline_pages
         WHERE book_id = ? ORDER BY page ASC
       `).all(bookId) as CandidateRow[];
-      const headings = rows
-        .sort((left, right) => left.page - right.page)
-        .flatMap((row) => parsePageHeadings(row.candidates_json));
-      const assembled = assembleOutline(headings, aiCache?.entries ?? [], document.pageCount);
+      const headings: OutlineHeading[] = [];
+      const printedVotes: PrintedPageVote[] = [];
+      for (const row of rows) {
+        const payload = parsePagePayload(row.candidates_json);
+        headings.push(...payload.headings);
+        for (const printed of payload.printed) printedVotes.push({ page: row.page, printed });
+      }
+      const assembled = assembleOutline(headings, aiCache?.entries ?? [], document.pageCount, printedVotes);
       const nodes = assembled.nodes;
-      persistOutline(bookId, nodes, document.pageCount);
+      persistOutline(bookId, nodes, document.pageCount, assembled.strategy === "toc" ? "ai_toc" : "empty");
       options.onOutlineChange?.(bookId);
       return { status: "generated" as const, nodes, processedPages, totalPages: document.pageCount };
     } finally {
@@ -928,7 +994,7 @@ export function createBookOutlineModule(
     try {
       const nodes = await document.getEmbeddedNodes();
       if (!evaluateEmbeddedOutline(nodes, document.pageCount).accepted) return undefined;
-      persistOutline(bookId, nodes, document.pageCount);
+      persistOutline(bookId, nodes, document.pageCount, "embedded");
       options.onOutlineChange?.(bookId);
       return nodes;
     } finally {
@@ -938,6 +1004,7 @@ export function createBookOutlineModule(
 
   return {
     get,
+    strategy: outlineStrategy,
     invalidate,
     rebuild,
     ensureEmbedded,

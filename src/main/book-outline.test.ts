@@ -11,6 +11,7 @@ import {
   findOutlineChapterRange,
   findOutlineSectionPath,
   locateTocPages,
+  repairOutlineMonotonicity,
   shouldYieldToOutline,
   type BookOutlineAiDeps,
   type OpenOutlineDocument,
@@ -144,6 +145,7 @@ describe("book outline", () => {
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(result).toMatchObject({ status: "embedded", nodes: embeddedNodes });
     expect(outline.get(BOOK_ID)).toEqual(embeddedNodes);
+    expect(outline.strategy(BOOK_ID)).toBe("embedded");
   });
 
   it("assembles the outline from ai entries and body anchors", async () => {
@@ -191,6 +193,7 @@ describe("book outline", () => {
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(result.status).toBe("generated");
     expect(ai.completeCalls).toBe(1);
+    expect(outline.strategy(BOOK_ID)).toBe("ai_toc");
     // 第一章 锚定到正文页 p.2，而不是目录页 p.1。
     expect(outline.get(BOOK_ID)).toMatchObject([
       { label: "第一章 扫描内容", page: 2, children: [{ label: "1.1 识别小节", page: 3 }] },
@@ -417,6 +420,42 @@ describe("book outline", () => {
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes }));
     expect(result).toMatchObject({ status: "generated", nodes: [] });
     expect(outline.get(BOOK_ID)).toEqual([]);
+  });
+
+  it("resolves the offset from dense printed-page votes when body anchors are few", () => {
+    const tocRows: TocRow[] = [
+      { label: "第一章 函数与极限", level: 1, printedPage: 1 },
+      { label: "第一节 映射与函数", level: 2, printedPage: 2 },
+    ];
+    const headings: OutlineHeading[] = [
+      { label: "第一章 函数与极限", page: 18, level: 1, explicit: true },
+    ];
+    // 每页一块的印刷页码（page_number 块 / 孤立数字行）：全书页脚与目录页码同源投票。
+    const printedVotes = Array.from({ length: 10 }, (_, index) => ({ page: 18 + index, printed: 1 + index }));
+    const result = assembleOutline(headings, tocRows, 150, printedVotes);
+    expect(result.strategy).toBe("toc");
+    expect(result.nodes).toMatchObject([
+      { label: "第一章 函数与极限", page: 18, children: [{ label: "第一节 映射与函数", page: 19 }] },
+    ]);
+  });
+
+  it("clamps out-of-order pages along reading order", () => {
+    const nodes: BookOutlineNode[] = [
+      {
+        id: "1", label: "第一章", page: 50, children: [
+          { id: "2", label: "第一节", page: 30, children: [] },
+          { id: "3", label: "第二节", page: 60, children: [] },
+        ],
+      },
+    ];
+    expect(repairOutlineMonotonicity(nodes)).toEqual([
+      {
+        id: "1", label: "第一章", page: 50, children: [
+          { id: "2", label: "第一节", page: 50, children: [] },
+          { id: "3", label: "第二节", page: 60, children: [] },
+        ],
+      },
+    ]);
   });
 
   it("resolves the printed-to-pdf offset by voting and clips out-of-range entries", () => {
@@ -682,6 +721,69 @@ describe("book outline", () => {
     expect(calls).toBe(1);
     await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(calls).toBe(1);
+  });
+
+  it("feeds page_number blocks into the offset vote for scanned books", async () => {
+    closeOcr?.();
+    const engine: MineruEngine = {
+      name: "测试 OCR",
+      model: "测试模型",
+      async recognizePage(input) {
+        if (input.page === 2) {
+          return {
+            blocks: [{ type: "index", text: "第一章 测试目录…………………………1\n第一节 测试内容…………………………2", bbox: [0.1, 0.1, 0.9, 0.5] }],
+            markdown: "目录",
+          };
+        }
+        if (input.page === 4) {
+          return {
+            blocks: [
+              { type: "title", text: "第一章 测试目录", bbox: [0.1, 0.05, 0.9, 0.12] },
+              { type: "page_number", text: "1", bbox: [0.4, 0.95, 0.6, 0.98] },
+              { type: "text", text: "正文内容，长度足够参与统计。", bbox: [0.1, 0.2, 0.9, 0.24] },
+            ],
+            markdown: "",
+          };
+        }
+        if (input.page === 5 || input.page === 6) {
+          return {
+            blocks: [
+              { type: "text", text: `第${input.page}页正文，内容长度足够参与统计。`, bbox: [0.1, 0.1, 0.9, 0.16] },
+              { type: "page_number", text: String(input.page - 3), bbox: [0.4, 0.95, 0.6, 0.98] },
+            ],
+            markdown: "",
+          };
+        }
+        return {
+          blocks: [{ type: "text", text: `第${input.page}页正文，内容长度足够参与统计。`, bbox: [0.1, 0.1, 0.9, 0.16] }],
+          markdown: "",
+        };
+      },
+    };
+    const ocr = createOcrModule(dataHome, engine, {
+      resolvePdfPath: (bookId) => (bookId === BOOK_ID ? { path: "C:/book.pdf", encrypted: false } : undefined),
+    });
+    closeOcr = ocr.close;
+    for (const page of [1, 2, 3, 4, 5, 6]) {
+      await ocr.recognizePage({ bookId: BOOK_ID, page });
+    }
+    const ai = aiOutlineDeps([
+      { label: "第一章 测试目录", level: 1, printedPage: 1 },
+      { label: "第一节 测试内容", level: 2, printedPage: 2 },
+    ], [2]);
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource([[], [], [], [], [], []]),
+      aiOutline: ai.deps,
+      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+    });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(result.status).toBe("generated");
+    // 唯一正文锚点（第一章@4，票 4-1=3）不足以过最少票数阈值；page_number 块
+    // （4-1=3、5-2=3、6-3=3）把它抬成多数派，第二节由偏移落到 p.5。
+    expect(outline.get(BOOK_ID)).toMatchObject([
+      { label: "第一章 测试目录", page: 4, children: [{ label: "第一节 测试内容", page: 5 }] },
+    ]);
   });
 
   it("finds the deepest section path for a reading page", () => {

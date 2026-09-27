@@ -36,6 +36,7 @@ import type {
   AgentImageAttachment,
   AppearanceSettings,
   BackgroundJob,
+  BookOutlineStrategy,
   ConversationMessage,
   LibraryBook,
   OpenedPdfBook,
@@ -129,6 +130,7 @@ export function App() {
   const [attachments, setAttachments] = useState<AgentImageAttachment[]>([]);
   const [backgroundJobs, setBackgroundJobs] = useState<BackgroundJob[]>([]);
   const [generatedOutline, setGeneratedOutline] = useState<OutlineNode[]>();
+  const [outlineStrategy, setOutlineStrategy] = useState<BookOutlineStrategy>("empty");
   const [clearConversationOpen, setClearConversationOpen] = useState(false);
   const [clearingConversation, setClearingConversation] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
@@ -216,7 +218,8 @@ export function App() {
       ]);
       if (activeBookIdRef.current !== bookId) return;
       setBackgroundJobs(jobs);
-      setGeneratedOutline(outline);
+      setGeneratedOutline(outline?.nodes);
+      setOutlineStrategy(outline?.strategy ?? "empty");
     } catch {
       setBackgroundJobs([]);
     }
@@ -285,7 +288,10 @@ export function App() {
       const bookId = activeBookIdRef.current;
       if (!bookId || event.bookId !== bookId) return;
       if (event.kind === "jobs") setBackgroundJobs(event.jobs);
-      else setGeneratedOutline(event.nodes);
+      else {
+        setGeneratedOutline(event.nodes);
+        setOutlineStrategy(event.strategy);
+      }
     });
     return () => unsubscribe?.();
   }, []);
@@ -698,7 +704,7 @@ export function App() {
               </div>
               <div className="sidebar-tabs"><button className={sidebarView === "outline" ? "active" : ""} onClick={() => setSidebarView("outline")}>目录</button><button className={sidebarView === "thumbnails" ? "active" : ""} onClick={() => setSidebarView("thumbnails")}>缩略图</button></div>
               {sidebarView === "outline" ? (
-                <OutlinePanel nodes={effectiveOutline} page={viewerState.page} emptyMessage={outlineEmptyMessage} onGoToPage={(page) => viewerRef.current?.goToPage(page)} />
+                <OutlinePanel nodes={effectiveOutline} strategy={outlineStrategy} page={viewerState.page} emptyMessage={outlineEmptyMessage} onGoToPage={(page) => viewerRef.current?.goToPage(page)} />
               ) : (
                 <div className="thumbnail-list">
                   {Array.from({ length: viewerState.pages }, (_, index) => index + 1).map((page) => (
