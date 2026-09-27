@@ -481,9 +481,11 @@ app.whenReady().then(async () => {
       }
       return result;
     });
-    ipcMain.handle("outline:get", (_event, bookId: unknown) => (
-      isOwnedBook(bookId) ? bookOutline.get(bookId) : undefined
-    ));
+    ipcMain.handle("outline:get", async (_event, bookId: unknown) => {
+      if (!isOwnedBook(bookId)) return undefined;
+      // 读路径快检：缓存未命中时同步解析内嵌书签（不渲染页面），第一档开书即得。
+      return bookOutline.ensureEmbedded(bookId, () => bookIndex.loadBookByBookId(bookId));
+    });
     const invalidBackgroundJob = (): BackgroundJobMutationResult => ({
       ok: false,
       code: "NOT_FOUND",

@@ -272,7 +272,7 @@ describe("Library Module", () => {
       resolvePdfPath: (id) => (id === bookId ? { path: sourcePath, encrypted: false } : undefined),
     });
     const outline = createBookOutlineModule(dataHome, {
-      openDocument: async () => ({ pageCount: 1, hasValidEmbeddedOutline: false, getNativeLines: async () => [], close: async () => undefined }),
+      openDocument: async () => ({ pageCount: 1, getEmbeddedNodes: async () => [], getNativeLines: async () => [], close: async () => undefined }),
     });
     const jobs = createBackgroundJobModule(dataHome, { index: async () => undefined });
     // 与 main 组装根一致的注册顺序：各模块清理自己的表，Library 只遍历注册者（ADR 0007）。

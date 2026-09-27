@@ -7,6 +7,7 @@ import {
   assembleOutline,
   createBookOutlineModule,
   detectHeadingCandidates,
+  evaluateEmbeddedOutline,
   findOutlineChapterRange,
   findOutlineSectionPath,
   type BookOutlineAiDeps,
@@ -25,17 +26,22 @@ const NO_OUTLINE_FIXTURE = path.resolve(import.meta.dirname, "fixtures/three-pag
 
 function documentSource(
   pages: OutlineTextLine[][],
-  options: { embedded?: boolean; visited?: number[] } = {},
+  options: { embeddedNodes?: BookOutlineNode[]; visited?: number[]; onOpen?: () => void } = {},
 ): OpenOutlineDocument {
-  return async () => ({
-    pageCount: pages.length,
-    hasValidEmbeddedOutline: options.embedded ?? false,
-    async getNativeLines(page) {
-      options.visited?.push(page);
-      return pages[page - 1] ?? [];
-    },
-    async close() { return undefined; },
-  });
+  return async () => {
+    options.onOpen?.();
+    return {
+      pageCount: pages.length,
+      async getEmbeddedNodes() {
+        return options.embeddedNodes ?? [];
+      },
+      async getNativeLines(page) {
+        options.visited?.push(page);
+        return pages[page - 1] ?? [];
+      },
+      async close() { return undefined; },
+    };
+  };
 }
 
 function aiOutlineDeps(
@@ -123,14 +129,19 @@ describe("book outline", () => {
     ]);
   });
 
-  it("keeps a valid embedded outline authoritative", async () => {
+  it("keeps a valid embedded outline authoritative and persists its nodes", async () => {
+    const embeddedNodes: BookOutlineNode[] = [
+      { id: "e-1", label: "Chapter One", page: 1, children: [] },
+      { id: "e-2", label: "Chapter Two", page: 2, children: [] },
+      { id: "e-3", label: "Chapter Three", page: 4, children: [] },
+    ];
     const outline = createBookOutlineModule(dataHome, {
-      openDocument: documentSource([[{ text: "Generated Heading", size: 24, y: 700 }]], { embedded: true }),
+      openDocument: documentSource([[], [], [], [], []], { embeddedNodes }),
     });
     closeOutline = outline.close;
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
-    expect(result).toMatchObject({ status: "embedded", nodes: [] });
-    expect(outline.get(BOOK_ID)).toBeUndefined();
+    expect(result).toMatchObject({ status: "embedded", nodes: embeddedNodes });
+    expect(outline.get(BOOK_ID)).toEqual(embeddedNodes);
   });
 
   it("assembles the outline from ai entries and body anchors", async () => {
@@ -297,14 +308,68 @@ describe("book outline", () => {
     expect(nodes?.[0]?.children[0]).toMatchObject({ label: "Section One", page: 1 });
   });
 
-  it("embedded outline without node accessors still persists nothing", async () => {
+  it("falls through to ai generation when the embedded outline is per-page junk", async () => {
+    const junk = [1, 2, 3].map((page) => ({ id: `j-${page}`, label: `第${page}页`, page, children: [] }));
+    const ai = aiOutlineDeps([{ label: "第一章 正文生成", level: 1, printedPage: 1 }]);
     const outline = createBookOutlineModule(dataHome, {
-      openDocument: documentSource([[{ text: "Generated Heading", size: 24, y: 700 }]], { embedded: true }),
+      openDocument: documentSource([[], [], []], { embeddedNodes: junk }),
+      aiOutline: ai.deps,
     });
     closeOutline = outline.close;
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
-    expect(result.status).toBe("embedded");
+    // 3 条逐页书签（页码 1,2,3 严格连续）被闸门拒收后直接弃用，AI 兜底生成。
+    expect(result.status).toBe("generated");
+    expect(ai.completeCalls).toBe(1);
+    expect(outline.get(BOOK_ID)).toEqual([]);
+  });
+
+  it("fast path persists embedded nodes synchronously and skips re-opening on cache hit", async () => {
+    const embeddedNodes: BookOutlineNode[] = [
+      { id: "e-1", label: "Chapter One", page: 1, children: [] },
+      { id: "e-2", label: "Chapter Two", page: 2, children: [] },
+      { id: "e-3", label: "Chapter Three", page: 4, children: [] },
+    ];
+    let opened = 0;
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource([[], [], [], [], []], { embeddedNodes, onOpen: () => { opened += 1; } }),
+    });
+    closeOutline = outline.close;
+    const loadBook = async () => ({ bytes: new Uint8Array() });
+    expect(await outline.ensureEmbedded(BOOK_ID, loadBook)).toEqual(embeddedNodes);
+    expect(outline.get(BOOK_ID)).toEqual(embeddedNodes);
+    expect(await outline.ensureEmbedded(BOOK_ID, loadBook)).toEqual(embeddedNodes);
+    expect(opened).toBe(1);
+  });
+
+  it("fast path skips re-opening once the pipeline has adjudicated tier one", async () => {
+    const ai = aiOutlineDeps([{ label: "第一章 在途", level: 1, printedPage: 1 }]);
+    const pages: OutlineTextLine[][] = [
+      [{ text: "第一章 在途", size: 24, y: 700 }, { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 }],
+    ];
+    let opened = 0;
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource(pages, { onOpen: () => { opened += 1; } }),
+      aiOutline: ai.deps,
+    });
+    closeOutline = outline.close;
+    const loadBook = async () => ({ bytes: new Uint8Array() });
+    await outline.rebuild(BOOK_ID, loadBook);
+    expect(opened).toBe(1);
+    // 页级失效只删 book_outlines 行与单页候选，AI 缓存仍在——管线已裁决第一档，快检不再开书。
+    outline.invalidate(BOOK_ID, 1);
+    expect(await outline.ensureEmbedded(BOOK_ID, loadBook)).toBeUndefined();
+    expect(opened).toBe(1);
+  });
+
+  it("fast path returns undefined without persisting for books without a usable embedded outline", async () => {
+    let opened = 0;
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource([[{ text: "第一章 无书签", size: 24, y: 700 }]], { onOpen: () => { opened += 1; } }),
+    });
+    closeOutline = outline.close;
+    expect(await outline.ensureEmbedded(BOOK_ID, async () => ({ bytes: new Uint8Array() }))).toBeUndefined();
     expect(outline.get(BOOK_ID)).toBeUndefined();
+    expect(opened).toBe(1);
   });
 
   it("does not turn a repeated page header into a generated outline", async () => {
@@ -490,5 +555,68 @@ describe("book outline", () => {
     expect(findOutlineChapterRange(nodes, 200, 200)).toEqual({ from: 120, to: 200 });
     expect(findOutlineChapterRange(nodes, 2, 200)).toBeUndefined();
     expect(findOutlineChapterRange([], 5, 200)).toBeUndefined();
+  });
+});
+
+describe("embedded outline gate", () => {
+  function node(label: string, page: number | undefined, children: BookOutlineNode[] = []): BookOutlineNode {
+    return { id: label, label, ...(page === undefined ? {} : { page }), children };
+  }
+
+  it("accepts a real chapter tree including section duplicates and sparse pages", () => {
+    const navigationLike = [
+      node("Chapter One", 1, [node("Section One", 1)]),
+      node("Chapter Two", 2, [node("Section Two", 2)]),
+      node("Chapter Three", 3, [node("Section Three", 3)]),
+    ];
+    expect(evaluateEmbeddedOutline(navigationLike, 3)).toMatchObject({ accepted: true, entryCount: 6, distinctPages: 3 });
+    const sparse = [
+      node("第一章 基础", 10),
+      node("第二章 进阶", 20),
+      node("第三章 高级", 30),
+      node("第四章 专题", 40),
+      node("第五章 前沿", 50),
+    ];
+    expect(evaluateEmbeddedOutline(sparse, 100).accepted).toBe(true);
+    const minorityUnresolvable = [node("A", 1), node("B", 2), node("C", undefined), node("D", undefined)];
+    expect(evaluateEmbeddedOutline(minorityUnresolvable, 100).accepted).toBe(true);
+  });
+
+  it("rejects thin, unresolvable, or single-page trees", () => {
+    expect(evaluateEmbeddedOutline([node("A", 1), node("B", 2)], 100).accepted).toBe(false);
+    expect(evaluateEmbeddedOutline(
+      [node("A", 1), node("B", undefined), node("C", undefined), node("D", undefined)],
+      100,
+    ).accepted).toBe(false);
+    expect(evaluateEmbeddedOutline([node("A", 1), node("B", 1), node("C", 1)], 100).accepted).toBe(false);
+  });
+
+  it("rejects garbage labels", () => {
+    expect(evaluateEmbeddedOutline([node("A", 5), node("A", 9), node("A", 13)], 100).accepted).toBe(false);
+    expect(evaluateEmbeddedOutline(
+      [node("未命名章节 1", 5), node("未命名章节 2", 9), node("未命名章节 3", 13)],
+      100,
+    ).accepted).toBe(false);
+    expect(evaluateEmbeddedOutline([node("1", 5), node("2", 9), node("3", 13)], 100).accepted).toBe(false);
+  });
+
+  it("rejects the per-page bookmark junk pattern but not real trees with duplicates", () => {
+    const perPage = [
+      node("第一章 基础", 1),
+      node("第二章 进阶", 2),
+      node("第三章 高级", 3),
+      node("第四章 专题", 4),
+      node("第五章 前沿", 5),
+    ];
+    expect(evaluateEmbeddedOutline(perPage, 5).accepted).toBe(false);
+    // 与逐页垃圾同页数，但分节带来的重复页打破严格连续——真实结构放行。
+    expect(evaluateEmbeddedOutline(
+      [
+        node("第一章 基础", 1, [node("1.1 概念", 1)]),
+        node("第二章 进阶", 2, [node("2.1 模型", 2)]),
+        node("第三章 高级", 3, [node("3.1 实践", 3)]),
+      ],
+      3,
+    ).accepted).toBe(true);
   });
 });

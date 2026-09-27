@@ -27,7 +27,6 @@ export type ViewerState = {
   scale: number;
   scrollTop: number;
   zoomMode: ReadingZoomMode;
-  outline: OutlineNode[];
   /** pdfjs 页面重渲染修订：单一事实源在查看器内，页面重绘后递增，消费方据此复查文字层。 */
   renderRevision: number;
 };
@@ -64,35 +63,7 @@ type Props = {
   recognizedPage?: RecognizedPageText;
 };
 
-async function resolveOutline(
-  document: pdfjs.PDFDocumentProxy,
-  items: Awaited<ReturnType<pdfjs.PDFDocumentProxy["getOutline"]>>,
-  lineage = "outline",
-): Promise<OutlineNode[]> {
-  if (!items) return [];
-
-  return Promise.all(
-    items.map(async (item, index) => {
-      const id = `${lineage}-${index}`;
-      let page: number | undefined;
-      try {
-        const destination = typeof item.dest === "string" ? await document.getDestination(item.dest) : item.dest;
-        const pageReference = destination?.[0];
-        if (typeof pageReference === "number") page = pageReference + 1;
-        else if (pageReference) page = (await document.getPageIndex(pageReference)) + 1;
-      } catch {
-        page = undefined;
-      }
-
-      return {
-        id,
-        label: item.title || `未命名章节 ${index + 1}`,
-        page,
-        children: await resolveOutline(document, item.items, id),
-      };
-    }),
-  );
-}
+// 目录由主进程唯一解析（质量闸门 + 读路径快检），查看器不再自解析 PDF 大纲。
 
 export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
   { book, panMode, onStateChange, onSelectionChange, onError, recognizedPage },
@@ -230,7 +201,6 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     };
     adapterRef.current = adapter;
 
-    let outline: OutlineNode[] = [];
     const reportState = (page = adapter.currentPage) => {
       onStateChange({
         page,
@@ -238,7 +208,6 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         scale: Math.round((viewer.currentScale || 1) * 100),
         scrollTop: container.scrollTop,
         zoomMode: adapter.fitMode ?? "custom",
-        outline,
         renderRevision: renderRevisionRef.current,
       });
     };
@@ -475,8 +444,6 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         adapter.document = document;
         viewer.setDocument(document);
         linkService.setDocument(document);
-        outline = await resolveOutline(document, await document.getOutline());
-        reportState();
       })
       .catch((error: unknown) => {
         if (!disposed) onError(error instanceof Error ? error.message : String(error));

@@ -25,10 +25,9 @@ export type AiOutlineCache = { entries: AiOutlineEntry[]; tocPages: number[] };
 
 export type OutlineDocument = {
   pageCount: number;
-  hasValidEmbeddedOutline: boolean;
   getNativeLines(page: number): Promise<OutlineTextLine[]>;
-  /** 内嵌书签（PDF 大纲）：渲染端已直接消费；这里落库一份供检索的章节范围加权。 */
-  getEmbeddedNodes?(): Promise<BookOutlineNode[]>;
+  /** 内嵌书签节点树（已解析跳转目标，无书签为空数组）。主进程是唯一解析点，有效性由质量闸门从节点推导。 */
+  getEmbeddedNodes(): Promise<BookOutlineNode[]>;
   close(): Promise<void>;
 };
 
@@ -406,28 +405,46 @@ function recognizedLines(blocks: ReadonlyArray<MineruBlock> | undefined): Outlin
 type PdfDocument = Awaited<ReturnType<typeof getDocument>["promise"]>;
 type PdfOutlineItem = NonNullable<Awaited<ReturnType<PdfDocument["getOutline"]>>>[number];
 
-async function hasValidOutline(document: PdfDocument, items: PdfOutlineItem[] | null): Promise<boolean> {
-  if (!items) return false;
-  for (const item of items) {
-    if (item.title.trim() && item.dest) {
-      try {
-        const destination = typeof item.dest === "string" ? await document.getDestination(item.dest) : item.dest;
-        const target = destination?.[0];
-        if (typeof target === "number") return true;
-        if (target) {
-          await document.getPageIndex(target);
-          return true;
-        }
-      } catch {
-        // Continue checking other entries before deciding the outline is unusable.
-      }
-    }
-    if (await hasValidOutline(document, item.items)) return true;
-  }
-  return false;
+export type EmbeddedOutlineVerdict = {
+  accepted: boolean;
+  entryCount: number;
+  resolvableCount: number;
+  distinctPages: number;
+};
+
+const MIN_EMBEDDED_ENTRIES = 3;
+const MIN_EMBEDDED_DISTINCT_PAGES = 2;
+const MIN_EMBEDDED_RESOLVABLE_RATIO = 0.5;
+
+function flattenOutlineNodes(nodes: readonly BookOutlineNode[]): BookOutlineNode[] {
+  return nodes.flatMap((node) => [node, ...flattenOutlineNodes(node.children)]);
 }
 
-/** PDF 大纲 → BookOutlineNode 树（与渲染端 resolveOutline 同构）：只留可解析页码的条目。 */
+/** 内嵌书签质量闸门：「有书签」不等于「书签可用」。信号不足（条目太少、页码解析率低、
+ *  全部指向同页）或垃圾模式（全部同题/未命名/纯数字、逐页连续书签）拒收，降第二档；
+ *  被拒的书签树直接弃用，不留兜底。分节带来的重复页会打破「严格连续」，真实结构不受逐页判定误伤。 */
+export function evaluateEmbeddedOutline(nodes: readonly BookOutlineNode[], pageCount: number): EmbeddedOutlineVerdict {
+  const entries = flattenOutlineNodes(nodes);
+  const resolvable = entries.filter((entry) => entry.page !== undefined && entry.page >= 1 && entry.page <= pageCount);
+  const distinctPages = new Set(resolvable.map((entry) => entry.page)).size;
+  const labels = entries.map((entry) => entry.label.trim()).filter(Boolean);
+  const labelsGarbage = labels.length === 0
+    || labels.every((label) => label === labels[0])
+    || labels.every((label) => label.startsWith("未命名"))
+    || labels.every((label) => /^\d+$/.test(label));
+  const pages = resolvable.map((entry) => entry.page!);
+  const perPageJunk = pages.length >= Math.max(3, pageCount)
+    && pages.every((page, index) => index === 0 || page === pages[index - 1]! + 1);
+  const accepted = entries.length >= MIN_EMBEDDED_ENTRIES
+    && resolvable.length >= 2
+    && resolvable.length / entries.length >= MIN_EMBEDDED_RESOLVABLE_RATIO
+    && distinctPages >= MIN_EMBEDDED_DISTINCT_PAGES
+    && !labelsGarbage
+    && !perPageJunk;
+  return { accepted, entryCount: entries.length, resolvableCount: resolvable.length, distinctPages };
+}
+
+/** PDF 大纲 → BookOutlineNode 树：主进程唯一解析点，一次遍历同时解析跳转目标；有效性由质量闸门从节点推导。 */
 async function resolveEmbeddedNodes(
   document: PdfDocument,
   items: PdfOutlineItem[] | null,
@@ -462,7 +479,6 @@ async function openPdfOutlineDocument(source: { bytes: Uint8Array; password?: st
   const document = await loadingTask.promise;
   return {
     pageCount: document.numPages,
-    hasValidEmbeddedOutline: await hasValidOutline(document, await document.getOutline()),
     async getEmbeddedNodes() {
       return resolveEmbeddedNodes(document, await document.getOutline());
     },
@@ -618,6 +634,18 @@ export function createBookOutlineModule(
     `).run(bookId, OUTLINE_VERSION, JSON.stringify(cache), new Date().toISOString());
   }
 
+  function persistOutline(bookId: string, nodes: BookOutlineNode[], totalPages: number) {
+    database.prepare(`
+      INSERT INTO book_outlines (book_id, version, nodes_json, total_pages, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(book_id) DO UPDATE SET
+      version = excluded.version,
+      nodes_json = excluded.nodes_json,
+      total_pages = excluded.total_pages,
+      updated_at = excluded.updated_at
+    `).run(bookId, OUTLINE_VERSION, JSON.stringify(nodes), totalPages, new Date().toISOString());
+  }
+
   function invalidate(bookId: string, page?: number) {
     if (!BOOK_ID_PATTERN.test(bookId)) return;
     database.prepare("DELETE FROM book_outlines WHERE book_id = ?").run(bookId);
@@ -639,25 +667,16 @@ export function createBookOutlineModule(
     if (!BOOK_ID_PATTERN.test(bookId)) throw new Error("书籍目录任务参数无效。");
     const document = await openDocument(await loadBook());
     try {
-      if (document.hasValidEmbeddedOutline) {
+      const embeddedNodes = await document.getEmbeddedNodes();
+      if (evaluateEmbeddedOutline(embeddedNodes, document.pageCount).accepted) {
         invalidate(bookId);
-        // 内嵌书签落库为可读目录（渲染端仍直接消费 PDF 大纲）：检索的所在章加权
-        // 只读 book_outlines，不落库的书对「先验」是隐身书，恰是最该吃到加权的结构良好的书。
-        if (document.getEmbeddedNodes) {
-          const nodes = await document.getEmbeddedNodes();
-          database.prepare(`
-            INSERT INTO book_outlines (book_id, version, nodes_json, total_pages, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(book_id) DO UPDATE SET
-            version = excluded.version,
-            nodes_json = excluded.nodes_json,
-            total_pages = excluded.total_pages,
-            updated_at = excluded.updated_at
-          `).run(bookId, OUTLINE_VERSION, JSON.stringify(nodes), document.pageCount, new Date().toISOString());
-          options.onOutlineChange?.(bookId);
-        }
-        return { status: "embedded" as const, nodes: [], processedPages: 0, totalPages: document.pageCount };
+        // 内嵌书签落库为可读目录：检索的所在章加权只读 book_outlines，
+        // 不落库的书对「先验」是隐身书，恰是最该吃到加权的结构良好的书。
+        persistOutline(bookId, embeddedNodes, document.pageCount);
+        options.onOutlineChange?.(bookId);
+        return { status: "embedded" as const, nodes: embeddedNodes, processedPages: 0, totalPages: document.pageCount };
       }
+      // 闸门拒收（无书签或垃圾书签）的书签树直接弃用不留兜底，降第二档。
       // AI 目录：成功结论（含「无目录」）入库缓存；失败（无模型/网络）不缓存，下次打开自动重试。
       let aiCache = readAiEntries(bookId);
       if (!aiCache && options.aiOutline) {
@@ -732,18 +751,34 @@ export function createBookOutlineModule(
         .flatMap((row) => parsePageHeadings(row.candidates_json));
       const assembled = assembleOutline(headings, aiCache?.entries ?? [], document.pageCount);
       const nodes = assembled.nodes;
-      const timestamp = new Date().toISOString();
-      database.prepare(`
-        INSERT INTO book_outlines (book_id, version, nodes_json, total_pages, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(book_id) DO UPDATE SET
-        version = excluded.version,
-        nodes_json = excluded.nodes_json,
-        total_pages = excluded.total_pages,
-        updated_at = excluded.updated_at
-      `).run(bookId, OUTLINE_VERSION, JSON.stringify(nodes), document.pageCount, timestamp);
+      persistOutline(bookId, nodes, document.pageCount);
       options.onOutlineChange?.(bookId);
       return { status: "generated" as const, nodes, processedPages, totalPages: document.pageCount };
+    } finally {
+      await document.close();
+    }
+  }
+
+  /** 读路径快检（第一档开书即得）：缓存未命中时同步解析内嵌书签（不渲染页面），
+   *  过质量闸门即落库返回；无内嵌或垃圾书签返回 undefined。目录管线已越过第一档
+   *  （AI 缓存或页候选在库）时不再重复开书——内嵌有无已被裁决。 */
+  async function ensureEmbedded(
+    bookId: string,
+    loadBook: () => Promise<{ bytes: Uint8Array; password?: string }>,
+  ): Promise<BookOutlineNode[] | undefined> {
+    if (!BOOK_ID_PATTERN.test(bookId)) return undefined;
+    const cached = get(bookId);
+    if (cached !== undefined) return cached;
+    const adjudicated = readAiEntries(bookId) !== undefined
+      || ((database.prepare("SELECT COUNT(*) AS count FROM book_outline_pages WHERE book_id = ?").get(bookId) as { count: number }).count > 0);
+    if (adjudicated) return undefined;
+    const document = await openDocument(await loadBook());
+    try {
+      const nodes = await document.getEmbeddedNodes();
+      if (!evaluateEmbeddedOutline(nodes, document.pageCount).accepted) return undefined;
+      persistOutline(bookId, nodes, document.pageCount);
+      options.onOutlineChange?.(bookId);
+      return nodes;
     } finally {
       await document.close();
     }
@@ -753,6 +788,7 @@ export function createBookOutlineModule(
     get,
     invalidate,
     rebuild,
+    ensureEmbedded,
 
     /** 每书数据清理钩子：在调用方提供的连接上删除本书生成目录、页候选与 AI 目录缓存。 */
     deleteBookData(bookId: string, connection: DatabaseSync) {

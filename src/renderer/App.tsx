@@ -112,7 +112,6 @@ export function App() {
     scale: 100,
     scrollTop: 0,
     zoomMode: "page-width",
-    outline: [],
     renderRevision: 0,
   });
   const [viewerError, setViewerError] = useState("");
@@ -259,7 +258,6 @@ export function App() {
       scale: openedBook.readingState.zoomScale,
       scrollTop: openedBook.readingState.scrollTop,
       zoomMode: openedBook.readingState.zoomMode,
-      outline: [],
       renderRevision: 0,
     });
     setLeftOpen(openedBook.readingState.leftSidebarOpen);
@@ -319,8 +317,8 @@ export function App() {
     await method(job.id);
   }, [book]);
 
-  // 内嵌书签现在也会落库一份（供检索加权），渲染端仍以 PDF 大纲为显示首选；两侧同源不会冲突。
-  const effectiveOutline = viewerState.outline.length > 0 ? viewerState.outline : generatedOutline ?? [];
+  // 目录单一来源：主进程解析（内嵌书签过闸落库，或 AI/正文识别生成），经读取快检与推送送达。
+  const effectiveOutline = generatedOutline ?? [];
   const outlineJob = backgroundJobs.find((job) => job.kind === "outline");
   const outlineEmptyMessage = outlineJob?.status === "running" || outlineJob?.status === "queued"
     ? "正在分析章节结构..."

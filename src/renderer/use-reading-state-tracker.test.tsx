@@ -29,7 +29,7 @@ const BOOK_B = makeBook("b".repeat(64), {
 function viewerState(overrides: Partial<ViewerState> = {}): ViewerState {
   return {
     page: 5, pages: 10, scale: 150, scrollTop: 99, zoomMode: "page-width",
-    outline: [], renderRevision: 0,
+    renderRevision: 0,
     ...overrides,
   };
 }
