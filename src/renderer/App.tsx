@@ -287,18 +287,18 @@ export function App() {
       const bookId = activeBookIdRef.current;
       if (!bookId || event.bookId !== bookId) return;
       if (event.kind === "jobs") setBackgroundJobs(event.jobs);
-      else setGeneratedOutline({ strategy: event.strategy, nodes: event.nodes ?? [] });
+      else setGeneratedOutline({ strategy: event.strategy, nodes: event.nodes ?? [], calibrated: event.calibrated });
     });
     return () => unsubscribe?.();
   }, []);
 
-  // 目录空态文案（T58）：扫描书目录时点 = 整书识别完成——识别进行中/已暂停各有其提示。
+  // 目录空态文案（T58-03 统一目录流）：目录在目录区扫过或整书完成后落地——识别进行中/已暂停各有其提示。
   const resolveOutlineEmptyMessage = (outlineStatus: BackgroundJobStatus | undefined, ocrStatuses: BackgroundJobStatus[]) => {
     if (outlineStatus === "running" || outlineStatus === "queued") return "正在分析章节结构...";
     if (outlineStatus === "paused") return "目录补全已暂停。";
     if (outlineStatus === "failed") return "暂时无法补全目录，请稍后重试。";
-    if (ocrStatuses.some((status) => status === "running" || status === "queued")) return "整书文字识别中，完成后生成目录。";
-    if (ocrStatuses.some((status) => status === "paused")) return "文字识别已暂停，恢复后完成即可生成目录。";
+    if (ocrStatuses.some((status) => status === "running" || status === "queued")) return "文字识别中，目录将随后生成。";
+    if (ocrStatuses.some((status) => status === "paused")) return "文字识别已暂停，恢复后生成目录。";
     return "未检测到可用章节，可使用缩略图浏览。";
   };
 
@@ -707,7 +707,7 @@ export function App() {
               </div>
               <div className="sidebar-tabs"><button className={sidebarView === "outline" ? "active" : ""} onClick={() => setSidebarView("outline")}>目录</button><button className={sidebarView === "thumbnails" ? "active" : ""} onClick={() => setSidebarView("thumbnails")}>缩略图</button></div>
               {sidebarView === "outline" ? (
-                <OutlinePanel nodes={effectiveOutline} strategy={generatedOutline?.strategy ?? "empty"} page={viewerState.page} emptyMessage={outlineEmptyMessage} onGoToPage={(page, anchorTop) => viewerRef.current?.goToPage(page, anchorTop)} />
+                <OutlinePanel nodes={effectiveOutline} strategy={generatedOutline?.strategy ?? "empty"} calibrated={generatedOutline?.calibrated} page={viewerState.page} emptyMessage={outlineEmptyMessage} onGoToPage={(page, anchorTop) => viewerRef.current?.goToPage(page, anchorTop)} />
               ) : (
                 <div className="thumbnail-list">
                   {Array.from({ length: viewerState.pages }, (_, index) => index + 1).map((page) => (

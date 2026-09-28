@@ -65,7 +65,7 @@ function OutlineTree({
   );
 }
 
-export function OutlinePanel({ nodes, strategy, page, emptyMessage, onGoToPage }: { nodes: OutlineNode[]; strategy: BookOutlineStrategy; page: number; emptyMessage: string; onGoToPage(page: number, anchorTop?: number): void }) {
+export function OutlinePanel({ nodes, strategy, calibrated, page, emptyMessage, onGoToPage }: { nodes: OutlineNode[]; strategy: BookOutlineStrategy; calibrated?: boolean; page: number; emptyMessage: string; onGoToPage(page: number, anchorTop?: number): void }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const activeId = useMemo(() => {
@@ -105,7 +105,12 @@ export function OutlinePanel({ nodes, strategy, page, emptyMessage, onGoToPage }
 
   return (
     <div className="outline-panel" ref={rootRef}>
-      {strategy !== "empty" && <p className="outline-source">{STRATEGY_LABEL[strategy]}</p>}
+      {strategy !== "empty" && (
+        <p className="outline-source">
+          {STRATEGY_LABEL[strategy]}
+          {strategy === "ai_toc" && calibrated === false && <span className="outline-calibrating">页码校准中</span>}
+        </p>
+      )}
       <OutlineTree
         nodes={nodes}
         activeId={activeId}

@@ -49,6 +49,14 @@ function documentSource(
   };
 }
 
+/** 模拟 MinerU 已扫过目录区：指定页给出 index 块（index 唯一定位信号，T58-03）。 */
+function indexBlocksProvider(indexPages: number[]) {
+  const marked = new Set(indexPages);
+  return (_bookId: string, page: number) => (
+    marked.has(page) ? [{ type: "index", text: "第一章 ……………… 1", bbox: [0.1, 0.1, 0.9, 0.5] }] : undefined
+  );
+}
+
 function aiOutlineDeps(
   entries: Array<{ label: string; level: 1 | 2; printedPage: number | null }>,
   tocPages: number[] = [],
@@ -216,7 +224,7 @@ describe("book outline", () => {
       ],
       [{ text: "第一章 缓存", size: 24, y: 700 }, { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 }],
     ];
-    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages), aiOutline: ai.deps });
+    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages), aiOutline: ai.deps, readRecognizedBlocks: indexBlocksProvider([1]) });
     closeOutline = outline.close;
     await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
@@ -231,6 +239,7 @@ describe("book outline", () => {
     const outline = createBookOutlineModule(dataHome, {
       openDocument: documentSource([[{ text: "第一章 无目录", size: 24, y: 700 }]]),
       aiOutline: ai.deps,
+      readRecognizedBlocks: indexBlocksProvider([1]),
     });
     closeOutline = outline.close;
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
@@ -258,6 +267,7 @@ describe("book outline", () => {
     const outline = createBookOutlineModule(dataHome, {
       openDocument: documentSource(pages),
       aiOutline: deps,
+      readRecognizedBlocks: indexBlocksProvider([1]),
     });
     closeOutline = outline.close;
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
@@ -278,7 +288,7 @@ describe("book outline", () => {
         { text: "第三节 中止延伸…………………………4", size: 14, y: 580 },
       ],
     ];
-    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages), aiOutline: ai.deps });
+    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages), aiOutline: ai.deps, readRecognizedBlocks: indexBlocksProvider([1]) });
     closeOutline = outline.close;
     const controller = new AbortController();
     controller.abort();
@@ -376,6 +386,7 @@ describe("book outline", () => {
     const outline = createBookOutlineModule(dataHome, {
       openDocument: documentSource([tocPage, tocPage, tocPage], { embeddedNodes: junk }),
       aiOutline: ai.deps,
+      readRecognizedBlocks: indexBlocksProvider([1]),
     });
     closeOutline = outline.close;
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
@@ -857,7 +868,7 @@ describe("book outline", () => {
       [{ text: "第一章 清理", size: 24, y: 700 }, { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 }],
       [{ text: "1.1 小节", size: 18, y: 700 }, { text: "小节正文内容，长度足够参与统计。", size: 12, y: 650 }],
     ];
-    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages), aiOutline: ai.deps });
+    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages), aiOutline: ai.deps, readRecognizedBlocks: indexBlocksProvider([1]) });
     closeOutline = outline.close;
     await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     await outline.rebuild(otherBookId, async () => ({ bytes: new Uint8Array() }));
@@ -893,6 +904,7 @@ describe("book outline", () => {
     const outline = createBookOutlineModule(dataHome, {
       openDocument: documentSource(pages),
       aiOutline: ai.deps,
+      readRecognizedBlocks: indexBlocksProvider([1]),
       onOutlineChange: (bookId) => notified.push(bookId),
     });
     closeOutline = outline.close;
@@ -932,6 +944,7 @@ describe("book outline", () => {
     const outline = createBookOutlineModule(dataHome, {
       openDocument: documentSource(pages),
       aiOutline: ai.deps,
+      readRecognizedBlocks: indexBlocksProvider([1]),
       onOutlineChange: (bookId) => notified.push(bookId),
     });
     closeOutline = outline.close;
@@ -1112,10 +1125,11 @@ describe("book outline", () => {
     expect(calls).toBe(1);
   });
 
-  it("holds the conclusion until the window is covered even when the toc region ended early", async () => {
+  it("extracts at run-end with a partial scan and concludes once the whole book is recognized", async () => {
     closeOcr?.();
-    // 扫描书 10 页：目录区在第 2 页（index 块），OCR 只推进到第 6 页——目录区虽已结束，
-    // 但窗口未覆盖（证据闸门），不出结论不调模型；扫满窗口后才提取。
+    // 扫描书 10 页：目录区在第 2 页（index 块），OCR 推进到第 6 页——run-end（M=2，
+    // gap 页 3、4 已扫且无 index）即提取（候选页 = 命中页 ±1）；无目录结论且装配数据
+    // 不齐时不落库，等整书收尾。
     const engine: MineruEngine = {
       name: "测试 OCR",
       model: "测试模型",
@@ -1154,15 +1168,80 @@ describe("book outline", () => {
     closeOutline = outline.close;
     const early = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(early).toMatchObject({ status: "partial", processedPages: 0 });
-    expect(requested).toEqual([]);
+    // run-end 提取：部分扫描即调用模型；hasToc=false 无目录结论且装配数据不齐 → 不落库。
+    expect(requested).toEqual([[1, 2, 3]]);
     expect(outline.get(BOOK_ID)).toBeUndefined();
-    // 窗口（全书 10 页 ≤ 30）扫满：定位命中 → 提取，候选页 = 命中页 ±1 边距。
+    // 整书识别完成：结论已缓存（不二次调用），第三档/空结论此时才落库。
     for (const page of [7, 8, 9, 10]) {
       await ocr.recognizePage({ bookId: BOOK_ID, page });
     }
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(result.status).toBe("generated");
     expect(requested).toEqual([[1, 2, 3]]);
+  });
+
+  it("persists a calibrated page-level outline at the trigger and finalizes after the whole book", async () => {
+    closeOcr?.();
+    // 扫描书 10 页：目录区 p2（index 块），正文锚点与页脚票在前 7 页——run-end 提取 +
+    // 偏移可解 ⇒ 校准态页级目录（calibrated=false）；整书完成后收尾转正。
+    const engine: MineruEngine = {
+      name: "测试 OCR",
+      model: "测试模型",
+      async recognizePage(input) {
+        if (input.page === 2) {
+          return { blocks: [{ type: "index", text: "第一章 起点…………………………1", bbox: [0.1, 0.1, 0.9, 0.5] }], markdown: "" };
+        }
+        if (input.page === 4) {
+          return {
+            blocks: [
+              { type: "paragraph_title", text: "第一章 起点", bbox: [0.1, 0.05, 0.9, 0.12] },
+              { type: "page_number", text: "1", bbox: [0.4, 0.95, 0.6, 0.98] },
+              { type: "text", text: "正文内容，长度足够参与统计。", bbox: [0.1, 0.2, 0.9, 0.24] },
+            ],
+            markdown: "",
+          };
+        }
+        if (input.page === 5 || input.page === 6) {
+          return {
+            blocks: [
+              { type: "text", text: `第${input.page}页正文，内容长度足够参与统计。`, bbox: [0.1, 0.1, 0.9, 0.16] },
+              { type: "page_number", text: String(input.page - 3), bbox: [0.4, 0.95, 0.6, 0.98] },
+            ],
+            markdown: "",
+          };
+        }
+        return { blocks: [{ type: "text", text: `第${input.page}页正文，内容长度足够参与统计。`, bbox: [0.1, 0.1, 0.9, 0.16] }], markdown: "" };
+      },
+    };
+    const ocr = createOcrModule(dataHome, engine, {
+      resolvePdfPath: (bookId) => (bookId === BOOK_ID ? { path: "C:/book.pdf", encrypted: false } : undefined),
+    });
+    closeOcr = ocr.close;
+    for (const page of [1, 2, 3, 4, 5, 6, 7]) {
+      await ocr.recognizePage({ bookId: BOOK_ID, page });
+    }
+    const ai = aiOutlineDeps([{ label: "第一章 起点", level: 1, printedPage: 1 }], [2]);
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource(Array.from({ length: 10 }, () => [])),
+      aiOutline: ai.deps,
+      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+    });
+    closeOutline = outline.close;
+    const early = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(early.status).toBe("generated");
+    expect(ai.completeCalls).toBe(1);
+    // 校准态：页级目录已落地（锚点页 4），标记未校准。
+    const calibrated = outline.read(BOOK_ID);
+    expect(calibrated?.strategy).toBe("ai_toc");
+    expect(calibrated?.calibrated).toBe(false);
+    expect(calibrated?.nodes[0]).toMatchObject({ label: "第一章 起点", page: 4 });
+    // 整书识别完成：收尾重排转正（结论缓存，不二次调用）。
+    for (const page of [8, 9, 10]) {
+      await ocr.recognizePage({ bookId: BOOK_ID, page });
+    }
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(ai.completeCalls).toBe(1);
+    expect(outline.read(BOOK_ID)?.calibrated).toBe(true);
   });
 
   it("writes nothing and marks tier one adjudicated when the probe window is uncovered", async () => {
@@ -1383,57 +1462,23 @@ describe("book outline", () => {
 });
 
 describe("toc page locator", () => {
-  const tocLines = [
-    "第一章 函数与极限……………………………………1",
-    "第一节 映射与函数……………………………………2",
-    "第二节 数列的极限……………………………………18",
-    "第二章 导数与微分……………………………………60",
-  ];
-  const bodyLines = [
-    "这是正文的第一行，讲述一个完整的概念。",
-    "第二行继续说明相关内容，没有行尾数字。",
-    "Third line of ordinary body text here.",
-    "第四行内容较短，同样以句号结尾。",
-    "第五行还是普通的正文段落内容。",
-  ];
-
   it("locates pages by index blocks and expands a ±1 margin", () => {
-    const inputs = [
-      { page: 1, lines: bodyLines, hasIndexBlock: false, covered: true },
-      { page: 2, lines: tocLines, hasIndexBlock: true, covered: true },
-      { page: 3, lines: bodyLines, hasIndexBlock: false, covered: true },
-      { page: 4, lines: bodyLines, hasIndexBlock: false, covered: true },
-      { page: 5, lines: tocLines, hasIndexBlock: false, covered: true },
-    ];
-    // 密度只在 index 无命中时兜底：index 命中后别处的密集页（参考文献式）不并选。
+    const inputs = [1, 2, 3, 4, 5].map((page) => ({ page, hasIndexBlock: page === 2, covered: true }));
     expect(locateTocPages(inputs)).toEqual({ hits: [2], pages: [1, 2, 3], covered: true });
   });
 
-  it("locates pages by dot-leader density and by trailing-number density", () => {
-    const inputs = [
-      { page: 1, lines: tocLines, hasIndexBlock: false, covered: true },
-      { page: 2, lines: [
-        "Smith J 2023",
-        "Lee K 2021",
-        "王五 2019",
-        "赵六 2020",
-        "钱七 2022",
-      ], hasIndexBlock: false, covered: true },
-      { page: 3, lines: bodyLines, hasIndexBlock: false, covered: true },
-    ];
-    expect(locateTocPages(inputs)).toEqual({ hits: [1, 2], pages: [1, 2, 3], covered: true });
-  });
-
-  it("does not locate ordinary body pages", () => {
-    const inputs = [1, 2, 3, 4].map((page) => ({ page, lines: bodyLines, hasIndexBlock: false, covered: true }));
+  it("does not locate pages without index blocks (density heuristics retired)", () => {
+    // 密度/字符启发式已退役（T58-03）：无 index 信号即无定位——全角页码、私有区点线
+    // 这类排版由 MinerU 的布局判定兜住，字符形态不再是信号。
+    const inputs = [1, 2, 3, 4].map((page) => ({ page, hasIndexBlock: false, covered: true }));
     expect(locateTocPages(inputs)).toEqual({ hits: [], pages: [], covered: true });
   });
 
   it("reports incomplete coverage when window pages lack both text sources", () => {
     const inputs = [
-      { page: 1, lines: tocLines, hasIndexBlock: false, covered: true },
-      { page: 2, lines: [], hasIndexBlock: false, covered: false },
-      { page: 3, lines: [], hasIndexBlock: false, covered: false },
+      { page: 1, hasIndexBlock: true, covered: true },
+      { page: 2, hasIndexBlock: false, covered: false },
+      { page: 3, hasIndexBlock: false, covered: false },
     ];
     const result = locateTocPages(inputs);
     expect(result.covered).toBe(false);

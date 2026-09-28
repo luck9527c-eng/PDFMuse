@@ -291,7 +291,8 @@ export type MineruWorkerResponse =
 
 /** 目录来源（T57-05 落库元信息，面板可见）：empty 表示尚无目录或无可识别结构。 */
 export type BookOutlineStrategy = "embedded" | "ai_toc" | "body_headings" | "empty";
-export type BookOutline = { strategy: BookOutlineStrategy; nodes: BookOutlineNode[] };
+/** calibrated（T58-03）：false = 扫描书触发点的校准态页级目录（偏移换算先行），整书完成后自动转正；缺省视为已校准。 */
+export type BookOutline = { strategy: BookOutlineStrategy; nodes: BookOutlineNode[]; calibrated?: boolean };
 export type BookOutlineNode = {
   id: string;
   label: string;
@@ -380,7 +381,7 @@ export type ExportConversationResult =
 /** 后台状态推送（ADR-0008）：任务与生成目录的变更以完整状态分片 + 单调 revision 推送，渲染层订阅而非轮询。 */
 export type BackgroundStateEvent =
   | { revision: number; kind: "jobs"; bookId: string; jobs: BackgroundJob[] }
-  | { revision: number; kind: "outline"; bookId: string; strategy: BookOutlineStrategy; nodes: BookOutlineNode[] | undefined };
+  | { revision: number; kind: "outline"; bookId: string; strategy: BookOutlineStrategy; nodes: BookOutlineNode[] | undefined; calibrated?: boolean };
 
 export type AgentStreamEvent =
   | {

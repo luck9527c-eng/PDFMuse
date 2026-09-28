@@ -189,7 +189,13 @@ app.whenReady().then(async () => {
         renderPage: pageRenderer.renderPage,
         complete: buildAiOutlineCompleter({ loadConnection: loadChatConnection }),
       },
-      onOutlineChange: (bookId) => broadcastBackgroundState({ kind: "outline", bookId, strategy: bookOutline.strategy(bookId), nodes: bookOutline.get(bookId) }),
+      onOutlineChange: (bookId) => broadcastBackgroundState({
+        kind: "outline",
+        bookId,
+        strategy: bookOutline.strategy(bookId),
+        nodes: bookOutline.get(bookId),
+        calibrated: bookOutline.calibrated(bookId),
+      }),
     });
     closeBookOutline = bookOutline.close;
     const scheduleOptionalEmbedding = (input: Omit<ScheduleBackgroundJobInput, "kind">) => (
@@ -456,8 +462,10 @@ app.whenReady().then(async () => {
     });
     ipcMain.handle("outline:get", async (_event, bookId: unknown) => {
       if (!isOwnedBook(bookId)) return undefined;
-      // 读路径快检：缓存未命中时同步解析内嵌书签（不渲染页面），第一档开书即得。
-      return bookOutline.ensureEmbedded(bookId, () => bookIndex.loadBookByBookId(bookId));
+      // 读路径快检：缓存未命中时同步解析内嵌书签（不渲染页面），第一档开书即得；
+      // 返回完整读快照（来源 + 校准标记 + 节点），与推送事件同构。
+      await bookOutline.ensureEmbedded(bookId, () => bookIndex.loadBookByBookId(bookId));
+      return bookOutline.read(bookId);
     });
     const invalidBackgroundJob = (): BackgroundJobMutationResult => ({
       ok: false,

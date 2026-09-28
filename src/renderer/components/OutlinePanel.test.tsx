@@ -145,4 +145,15 @@ describe("OutlinePanel", () => {
     act(() => items[1]!.click());
     expect(jumps).toEqual([{ page: 6, anchorTop: undefined }, { page: 6, anchorTop: 263.75 }]);
   });
+
+  it("shows the calibrating badge only for an uncalibrated ai outline", () => {
+    const nodes: BookOutlineNode[] = [{ id: "a", label: "第一章", page: 2, children: [] }];
+    render({ ...baseProps(nodes, 1), strategy: "ai_toc", calibrated: false });
+    expect(container.querySelector(".outline-calibrating")?.textContent).toBe("页码校准中");
+    // 转正后（calibrated 为 true 或缺省）不显示徽标。
+    render({ ...baseProps(structuredClone(nodes), 1), strategy: "ai_toc", calibrated: true });
+    expect(container.querySelector(".outline-calibrating")).toBeNull();
+    render({ ...baseProps(structuredClone(nodes), 1), strategy: "ai_toc" });
+    expect(container.querySelector(".outline-calibrating")).toBeNull();
+  });
 });

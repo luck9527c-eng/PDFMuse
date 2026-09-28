@@ -76,6 +76,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .outline-empty { margin: 18px 7px; color: var(--muted); font-size: var(--sidebar-font-size); line-height: 1.65; }
 .outline-panel { min-height: 0; }
 .outline-source { margin: 10px 7px 0; color: var(--muted); font-size: calc(var(--sidebar-font-size) - 1px); opacity: 0.85; }
+.outline-calibrating { margin-left: 6px; padding: 1px 6px; border-radius: 8px; background: color-mix(in srgb, var(--accent, #8a7a4f) 18%, transparent); font-size: calc(var(--sidebar-font-size) - 2px); }
 .outline-tree .outline-tree { margin-left: 13px; padding-left: 6px; border-left: 1px solid var(--line); }
 .outline-row { min-width: 0; display: flex; align-items: center; border-radius: 4px; }
 .outline-row.current { background: var(--green-soft); color: var(--green); }
