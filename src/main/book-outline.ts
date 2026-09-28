@@ -14,13 +14,15 @@ import {
 import type { BookOutlineNode, BookOutlineStrategy, MineruBlock } from "../shared/contracts.js";
 
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
-const OUTLINE_VERSION = 6;
+const OUTLINE_VERSION = 7;
 const MAX_HEADINGS = 240;
 const MIN_OFFSET_VOTES = 2;
 const REPEATED_LABEL_PAGES = 3;
 
 export type OutlineTextLine = { text: string; size: number; y: number };
-export type OutlineHeading = { label: string; page: number; level: number; explicit: boolean };
+/** 正文标题候选：anchorTop 为该标题行的页内位置（PDF 用户空间 Y，原生行直收、OCR 块换算），
+ *  沿锚点管线写进目录节点供跳转精确定位；拿不到时缺省（跳页顶）。 */
+export type OutlineHeading = { label: string; page: number; level: number; explicit: boolean; anchorTop?: number };
 export type TocRow = { label: string; level: 1 | 2 | 3; printedPage: number | undefined };
 export type AssembledOutline = { nodes: BookOutlineNode[]; strategy: BookOutlineStrategy };
 export type AiOutlineCache = { entries: AiOutlineEntry[]; tocPages: number[] };
@@ -28,7 +30,9 @@ export type AiOutlineCache = { entries: AiOutlineEntry[]; tocPages: number[] };
 export type OutlineDocument = {
   pageCount: number;
   getNativeLines(page: number): Promise<OutlineTextLine[]>;
-  /** 内嵌书签节点树（已解析跳转目标，无书签为空数组）。主进程是唯一解析点，有效性由质量闸门从节点推导。 */
+  /** 页面用户空间高度（OCR 块的归一化 bbox 换算页内锚点用）；不可得时 OCR 标题不带锚点。 */
+  getPageHeight?(page: number): Promise<number>;
+  /** 内嵌书签节点树（已解析跳转目标与页内锚点，无书签为空数组）。主进程是唯一解析点，有效性由质量闸门从节点推导。 */
   getEmbeddedNodes(): Promise<BookOutlineNode[]>;
   close(): Promise<void>;
 };
@@ -146,7 +150,7 @@ export function detectHeadingCandidates(page: number, lines: readonly OutlineTex
       if (countCjk(line.text) < 4 && latin < 6 && !PINYIN_ANNOTATION.test(line.text)) return [];
     }
     const level = explicit ?? (ratio >= 1.7 ? 1 : ratio >= 1.42 ? 2 : 3);
-    return [{ label: line.text, page, level, explicit: explicit !== undefined }];
+    return [{ label: line.text, page, level, explicit: explicit !== undefined, anchorTop: line.y }];
   });
 }
 
@@ -270,26 +274,29 @@ function ordinalKey(ordinal: OutlineOrdinal, contextualScope: number) {
   return ordinal.type === "chapter" ? `c${ordinal.ordinal}` : `s${ordinal.scope ?? contextualScope}.${ordinal.ordinal}`;
 }
 
+/** 锚点命中：正文标题的所在页 + 页内位置（top 为用户空间 Y，来源行拿不到时缺省）。 */
+type OutlineAnchorHit = { page: number; top?: number };
+
 type OutlineAnchors = {
-  /** 序数身份（章/节 key）→ 正文首次出现页。 */
-  byKey: Map<string, number>;
-  /** 剥前缀标题键 → 正文首次出现页（课文标题常带拼音注音，序数身份不可用时兜底）。 */
-  byTitle: Map<string, number>;
+  /** 序数身份（章/节 key）→ 正文首次出现锚点。 */
+  byKey: Map<string, OutlineAnchorHit>;
+  /** 剥前缀标题键 → 正文首次出现锚点（课文标题常带拼音注音，序数身份不可用时兜底）。 */
+  byTitle: Map<string, OutlineAnchorHit>;
 };
 
 function collectAnchors(bodyHeadings: readonly OutlineHeading[]): OutlineAnchors {
-  const byKey = new Map<string, number>();
-  const byTitle = new Map<string, number>();
+  const byKey = new Map<string, OutlineAnchorHit>();
+  const byTitle = new Map<string, OutlineAnchorHit>();
   let chapterScope = 0;
   for (const heading of bodyHeadings) {
     const ordinal = parseOutlineOrdinal(heading.label);
     if (ordinal) {
       if (ordinal.type === "chapter") chapterScope = ordinal.ordinal;
       const key = ordinalKey(ordinal, chapterScope);
-      if (!byKey.has(key)) byKey.set(key, heading.page);
+      if (!byKey.has(key)) byKey.set(key, { page: heading.page, ...(heading.anchorTop !== undefined ? { top: heading.anchorTop } : {}) });
     }
     const title = outlineTitleKey(heading.label);
-    if (title && !byTitle.has(title)) byTitle.set(title, heading.page);
+    if (title && !byTitle.has(title)) byTitle.set(title, { page: heading.page, ...(heading.anchorTop !== undefined ? { top: heading.anchorTop } : {}) });
   }
   return { byKey, byTitle };
 }
@@ -327,8 +334,8 @@ function resolvePageOffset(
     const ordinalAnchor = ordinal ? anchors.byKey.get(ordinalKey(ordinal, chapterScope)) : undefined;
     const title = outlineTitleKey(row.label);
     const titleAnchor = title ? anchors.byTitle.get(title) : undefined;
-    const anchorPage = ordinalAnchor ?? titleAnchor;
-    if (anchorPage !== undefined) tally(anchorPage - row.printedPage, "anchor");
+    const anchorHit = ordinalAnchor ?? titleAnchor;
+    if (anchorHit !== undefined) tally(anchorHit.page - row.printedPage, "anchor");
   }
   // 类内多数簇；平票以锚点票 + 正文票合计破平（锚点/正文裁定时），目录兜底时以目录票破平。
   const pluralityOf = (kind: "anchor" | "body" | "toc"): number | undefined => {
@@ -357,7 +364,7 @@ function resolvePageOffset(
 /** 栈式聚树（两档装配共用）：按 level 弹栈挂父；首个章之前的次级条目（目录排版上
  *  组标/章标常落在其首批条目之后）待首个章落位后归入第一个章，无章时平铺保序。 */
 function assembleLevelTree(
-  entries: ReadonlyArray<{ label: string; page: number; level: number }>,
+  entries: ReadonlyArray<{ label: string; page: number; level: number; anchor?: { top: number } }>,
   idPrefix: string,
 ): BookOutlineNode[] {
   const roots: BookOutlineNode[] = [];
@@ -365,7 +372,13 @@ function assembleLevelTree(
   const stack: BookOutlineNode[] = [];
   let sequence = 0;
   for (const entry of entries) {
-    const node: BookOutlineNode = { id: `${idPrefix}-${++sequence}`, label: entry.label, page: entry.page, children: [] };
+    const node: BookOutlineNode = {
+      id: `${idPrefix}-${++sequence}`,
+      label: entry.label,
+      page: entry.page,
+      children: [],
+      ...(entry.anchor ? { anchor: entry.anchor } : {}),
+    };
     while (stack.length >= entry.level) stack.pop();
     if (stack.length > 0) {
       stack[stack.length - 1]!.children.push(node);
@@ -391,7 +404,7 @@ function buildTocNodes(
   anchors: OutlineAnchors,
 ): BookOutlineNode[] {
   const inRange = (page: number | undefined) => page !== undefined && page >= 1 && page <= pageCount;
-  type Entry = { label: string; page: number | undefined; level: 1 | 2 | 3 };
+  type Entry = { label: string; page: number | undefined; level: 1 | 2 | 3; anchor?: { top: number } };
   const entries: Entry[] = [];
   const seen = new Set<string>();
   let chapterScope = 0;
@@ -404,13 +417,15 @@ function buildTocNodes(
     // 正文锚点页是最直接的观测（组单元页等常没有印刷页码可换算），其次印刷页 + 偏移。
     // 序数身份更精确，优先于标题键——不同小节可能共用相同短标题。
     const title = outlineTitleKey(row.label);
-    const anchorPage = (ordinal ? anchors.byKey.get(ordinalKey(ordinal, chapterScope)) : undefined)
+    const anchorHit = (ordinal ? anchors.byKey.get(ordinalKey(ordinal, chapterScope)) : undefined)
       ?? (title ? anchors.byTitle.get(title) : undefined);
+    const anchored = anchorHit !== undefined && inRange(anchorHit.page);
     const offsetPage = row.printedPage === undefined ? undefined : row.printedPage + offset;
     entries.push({
       label: row.label,
-      page: anchorPage !== undefined && inRange(anchorPage) ? anchorPage : offsetPage,
+      page: anchored ? anchorHit!.page : offsetPage,
       level: row.level,
+      ...(anchored && anchorHit!.top !== undefined ? { anchor: { top: anchorHit!.top } } : {}),
     });
   }
   const resolved = entries.map((entry, index) => {
@@ -426,7 +441,9 @@ function buildTocNodes(
     return entry;
   });
   return assembleLevelTree(
-    resolved.flatMap((entry) => (inRange(entry.page) ? [{ label: entry.label, page: entry.page!, level: entry.level }] : [])),
+    resolved.flatMap((entry) => (
+      inRange(entry.page) ? [{ label: entry.label, page: entry.page!, level: entry.level, ...(entry.anchor ? { anchor: entry.anchor } : {}) }] : []
+    )),
     "toc",
   );
 }
@@ -513,16 +530,26 @@ export function isAdmittedBodyHeading(label: string): boolean {
 }
 
 /** OCR 页标题候选：布局模型标记的标题块直接判定（T57-06），替代「块高假装字号」的比值检测；
- *  header/footer/aside_text 等噪声块按类型整体排除。 */
-export function detectRecognizedHeadings(page: number, blocks: ReadonlyArray<MineruBlock> | undefined): OutlineHeading[] {
+ *  header/footer/aside_text 等噪声块按类型整体排除。anchorTop 由块顶 bbox 按页高换算——
+ *  MinerU bbox 为 y 向下的归一化坐标（y0 = 距页顶比例），用户空间 Y = (1 − y0) × 页高；
+ *  页高未知时不猜（无锚点，跳页顶）。 */
+export function detectRecognizedHeadings(
+  page: number,
+  blocks: ReadonlyArray<MineruBlock> | undefined,
+  pageHeight?: number,
+): OutlineHeading[] {
   if (!blocks || !Array.isArray(blocks)) return [];
+  const height = typeof pageHeight === "number" && Number.isFinite(pageHeight) && pageHeight > 0 ? pageHeight : undefined;
   return blocks.flatMap((block) => {
     if (!block || typeof block.text !== "string" || !RECOGNIZED_HEADING_TYPES.has(block.type)) return [];
     const label = normalizeLabel(block.text);
     if (label.length < 2 || label.length > 100) return [];
     const level = explicitLevel(label) ?? (KNOWN_SECTION_NAME.test(label) ? 1 : undefined);
     if (level === undefined) return [];
-    return [{ label, page, level, explicit: true }];
+    const blockTop = height !== undefined && Array.isArray(block.bbox) && typeof block.bbox[1] === "number" && Number.isFinite(block.bbox[1])
+      ? (1 - block.bbox[1]) * height
+      : undefined;
+    return [{ label, page, level, explicit: true, ...(blockTop !== undefined ? { anchorTop: blockTop } : {}) }];
   });
 }
 
@@ -534,7 +561,12 @@ const MIN_BODY_OUTLINE_ROOTS = 3;
 export function assembleBodyHeadingOutline(headings: readonly OutlineHeading[]): AssembledOutline {
   const usable = suppressRunningHeaders(headings).filter((heading) => isAdmittedBodyHeading(heading.label));
   const roots = assembleLevelTree(
-    usable.map((heading) => ({ label: heading.label, page: heading.page, level: explicitLevel(heading.label) ?? 1 })),
+    usable.map((heading) => ({
+      label: heading.label,
+      page: heading.page,
+      level: explicitLevel(heading.label) ?? 1,
+      ...(heading.anchorTop !== undefined ? { anchor: { top: heading.anchorTop } } : {}),
+    })),
     "body",
   );
   const spine = roots
@@ -720,6 +752,10 @@ async function openPdfOutlineDocument(source: { bytes: Uint8Array; password?: st
     async getEmbeddedNodes() {
       return resolveEmbeddedNodes(document, await document.getOutline());
     },
+    async getPageHeight(pageNumber) {
+      const view = (await document.getPage(pageNumber)).view;
+      return (view[3] ?? 0) - (view[1] ?? 0);
+    },
     async getNativeLines(pageNumber) {
       const page = await document.getPage(pageNumber);
       const content = await page.getTextContent();
@@ -761,7 +797,8 @@ function isOutlineHeading(value: unknown): value is OutlineHeading {
   return typeof heading.label === "string"
     && typeof heading.page === "number"
     && typeof heading.level === "number"
-    && typeof heading.explicit === "boolean";
+    && typeof heading.explicit === "boolean"
+    && (heading.anchorTop === undefined || (typeof heading.anchorTop === "number" && Number.isFinite(heading.anchorTop)));
 }
 
 /** 页候选载荷以 v 字段自报版本；旧格式（数组或缺 v）一概视为过期，不复用。 */
@@ -1098,12 +1135,17 @@ export function createBookOutlineModule(
         if (signal?.aborted) break;
         const snapshot = await readPageTextSnapshot(bookId, document, page);
         // 目录页不参与正文标题锚点——否则章/节锚点会全落在目录页本身。
-        // OCR 页标题候选走布局模型判定（T57-06），原生页维持字号检测。
-        const headings = tocPageSet.has(page)
-          ? []
-          : snapshot.source === "ocr"
-            ? detectRecognizedHeadings(page, snapshot.blocks)
-            : detectHeadingCandidates(page, snapshot.lines);
+        // OCR 页标题候选走布局模型判定（T57-06），原生页维持字号检测；
+        // OCR 块的页内位置需按页高换算（缺页高则该页标题不带锚点）。
+        let headings: OutlineHeading[] = [];
+        if (!tocPageSet.has(page)) {
+          if (snapshot.source === "ocr") {
+            const pageHeight = await document.getPageHeight?.(page);
+            headings = detectRecognizedHeadings(page, snapshot.blocks, pageHeight);
+          } else {
+            headings = detectHeadingCandidates(page, snapshot.lines);
+          }
+        }
         upsert.run(bookId, page, JSON.stringify({ v: OUTLINE_VERSION, headings, printed: snapshot.printedPages }), snapshot.source, new Date().toISOString());
         processedPages = page;
         onProgress?.(processedPages, document.pageCount);

@@ -108,8 +108,8 @@ describe("book outline", () => {
       { text: "1.1 核心概念", size: 16, y: 700 },
       { text: "More body text.", size: 12, y: 650 },
     ]);
-    expect(first[0]).toMatchObject({ label: "第一章 基础", level: 1, explicit: true });
-    expect(second[0]).toMatchObject({ label: "1.1 核心概念", level: 2, explicit: true });
+    expect(first[0]).toMatchObject({ label: "第一章 基础", level: 1, explicit: true, anchorTop: 700 });
+    expect(second[0]).toMatchObject({ label: "1.1 核心概念", level: 2, explicit: true, anchorTop: 700 });
   });
 
   it("drops list items and math fragments but keeps pinyin-annotated titles", () => {
@@ -200,6 +200,8 @@ describe("book outline", () => {
     expect(outline.get(BOOK_ID)).toMatchObject([
       { label: "第一章 扫描内容", page: 2, children: [{ label: "1.1 识别小节", page: 3 }] },
     ]);
+    // documentSource 不提供页高：OCR 标题不带页内锚点（不猜），节点跳页顶。
+    expect(outline.get(BOOK_ID)?.[0]?.anchor).toBeUndefined();
   });
 
   it("caches ai entries across rebuilds and clears them on invalidate", async () => {
@@ -634,6 +636,15 @@ describe("book outline", () => {
     ]);
   });
 
+  it("converts recognized block tops to user-space anchors when the page height is known", () => {
+    const blocks = [{ type: "paragraph_title", text: "第一章 起点", bbox: [0.1, 0.2, 0.9, 0.26] }];
+    // MinerU bbox y 向下（y0 = 距页顶比例）：用户空间 Y = (1 − y0) × 页高。
+    const [heading] = detectRecognizedHeadings(5, blocks, 595.5);
+    expect(heading?.anchorTop).toBeCloseTo((1 - 0.2) * 595.5, 5);
+    // 页高未知不猜：不带锚点（跳页顶）。
+    expect(detectRecognizedHeadings(5, blocks)[0]?.anchorTop).toBeUndefined();
+  });
+
   it("builds a body-heading tree with a strictly increasing chapter spine", () => {
     const headings: OutlineHeading[] = [
       { label: "第一章 起点", page: 10, level: 1, explicit: true },
@@ -671,8 +682,42 @@ describe("book outline", () => {
     ]).strategy).toBe("empty");
   });
 
-  it("keeps the first occurrence of a special-name chapter that doubles as a running header", () => {
-    // 「参考文献」兼作章内页眉（≥3 页重复）：真身先于页眉出现，保留首现页而非整删。
+  it("attaches in-page anchors to body-anchored toc rows only", () => {
+    // 有正文锚点的行连页内位置一起落（标题行 y）；偏移换算的行只有页级精度，不带锚点。
+    const tocRows: TocRow[] = [
+      { label: "第一章 起点", level: 1, printedPage: 1 },
+      { label: "第二章 收束", level: 1, printedPage: 20 },
+    ];
+    const headings: OutlineHeading[] = [
+      { label: "第一章 起点", page: 9, level: 1, explicit: true, anchorTop: 500 },
+    ];
+    const printedVotes = Array.from({ length: 5 }, (_, index) => ({ page: 11 + index, printed: 1 + index }));
+    const result = assembleOutline(headings, tocRows, 100, printedVotes);
+    expect(result.nodes[0]).toMatchObject({ label: "第一章 起点", page: 9, anchor: { top: 500 } });
+    expect(result.nodes[1]).toMatchObject({ label: "第二章 收束", page: 30 });
+    expect(result.nodes[1]?.anchor).toBeUndefined();
+  });
+
+  it("carries heading line positions into body-heading tree anchors", () => {
+    const headings: OutlineHeading[] = [
+      { label: "第一章 起点", page: 10, level: 1, explicit: true, anchorTop: 700 },
+      { label: "1.1 内容", page: 12, level: 2, explicit: true, anchorTop: 650 },
+      { label: "第二章 转折", page: 20, level: 1, explicit: true, anchorTop: 640 },
+      { label: "第三章 收束", page: 30, level: 1, explicit: true, anchorTop: 620 },
+    ];
+    const result = assembleBodyHeadingOutline(headings);
+    expect(result.strategy).toBe("body_headings");
+    expect(result.nodes).toMatchObject([
+      {
+        label: "第一章 起点", page: 10, anchor: { top: 700 },
+        children: [{ label: "1.1 内容", page: 12, anchor: { top: 650 } }],
+      },
+      { label: "第二章 转折", page: 20, anchor: { top: 640 } },
+      { label: "第三章 收束", page: 30, anchor: { top: 620 } },
+    ]);
+  });
+
+  it("keeps the first occurrence of a special-name chapter that doubles as a running header", () => {    // 「参考文献」兼作章内页眉（≥3 页重复）：真身先于页眉出现，保留首现页而非整删。
     const headings: OutlineHeading[] = [
       { label: "第一章 起点", page: 10, level: 1, explicit: true },
       { label: "第二章 转折", page: 20, level: 1, explicit: true },
@@ -1239,6 +1284,25 @@ describe("book outline", () => {
     // （4-1=3、5-2=3、6-3=3）把它抬成多数派，第二节由偏移落到 p.5。
     expect(outline.get(BOOK_ID)).toMatchObject([
       { label: "第一章 测试目录", page: 4, children: [{ label: "第一节 测试内容", page: 5 }] },
+    ]);
+  });
+
+  it("persists native heading line positions through the full pipeline", async () => {
+    // 原生行 y → 页候选 anchorTop → 正文树 node.anchor 全链路往返（含载荷校验）。
+    const pages: OutlineTextLine[][] = [
+      [{ text: "第一章 起点", size: 24, y: 700 }, { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 }],
+      [{ text: "第二章 转折", size: 24, y: 640 }, { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 }],
+      [{ text: "第三章 收束", size: 24, y: 620 }, { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 }],
+    ];
+    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages) });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(result.status).toBe("generated");
+    expect(outline.strategy(BOOK_ID)).toBe("body_headings");
+    expect(outline.get(BOOK_ID)).toMatchObject([
+      { label: "第一章 起点", page: 1, anchor: { top: 700 } },
+      { label: "第二章 转折", page: 2, anchor: { top: 640 } },
+      { label: "第三章 收束", page: 3, anchor: { top: 620 } },
     ]);
   });
 
