@@ -14,13 +14,15 @@ import {
   findOutlineSectionPath,
   locateTocPages,
   repairOutlineMonotonicity,
+  traceWindowSnapshot,
   type BookOutlineAiDeps,
   type OpenOutlineDocument,
   type OutlineHeading,
   type OutlineTextLine,
   type TocRow,
 } from "./book-outline.js";
-import type { BookOutlineNode } from "../shared/contracts.js";
+import type { BookOutlineNode, MineruBlock, PipelineTraceRecord } from "../shared/contracts.js";
+import type { PipelineTracer } from "./pipeline-trace.js";
 import { createOcrModule } from "./ocr.js";
 import type { MineruEngine } from "./mineru.js";
 
@@ -1547,5 +1549,250 @@ describe("embedded outline gate", () => {
       ],
       3,
     ).accepted).toBe(true);
+  });
+});
+
+describe("outline pipeline trace", () => {
+  let dataHome: string;
+  let closeOutline: (() => void) | undefined;
+  let closeOcr: (() => void) | undefined;
+
+  beforeEach(async () => {
+    dataHome = await mkdtemp(path.join(os.tmpdir(), "pdfmuse-outline-trace-"));
+  });
+
+  afterEach(async () => {
+    closeOutline?.();
+    closeOcr?.();
+    closeOutline = undefined;
+    closeOcr = undefined;
+    await rm(dataHome, { recursive: true, force: true });
+  });
+
+  const traced = (): { events: PipelineTraceRecord[]; tracer: PipelineTracer } => {
+    const events: PipelineTraceRecord[] = [];
+    return {
+      events,
+      tracer: { emit: (_bookId, event) => events.push({ ts: "2026-09-28T00:00:00.000+08:00", ...event }) },
+    };
+  };
+
+  /** 扫描书 10 页：目录区 p2（index 块）、p4 章标题锚点 + 页脚票、p5–6 页脚票——
+   *  run-end 提取 + 偏移可解 ⇒ 校准态页级目录。 */
+  function scannedBookEngine(): MineruEngine {
+    return {
+      name: "测试 OCR",
+      model: "测试模型",
+      async recognizePage(input) {
+        if (input.page === 2) {
+          return { blocks: [{ type: "index", text: "第一章 起点…………………………1", bbox: [0.1, 0.1, 0.9, 0.5] }], markdown: "" };
+        }
+        if (input.page === 4) {
+          return {
+            blocks: [
+              { type: "paragraph_title", text: "第一章 起点", bbox: [0.1, 0.05, 0.9, 0.12] },
+              { type: "page_number", text: "1", bbox: [0.4, 0.95, 0.6, 0.98] },
+              { type: "text", text: "正文内容，长度足够参与统计。", bbox: [0.1, 0.2, 0.9, 0.24] },
+            ],
+            markdown: "",
+          };
+        }
+        if (input.page === 5 || input.page === 6) {
+          return {
+            blocks: [
+              { type: "text", text: `第${input.page}页正文，内容长度足够参与统计。`, bbox: [0.1, 0.1, 0.9, 0.16] },
+              { type: "page_number", text: String(input.page - 3), bbox: [0.4, 0.95, 0.6, 0.98] },
+            ],
+            markdown: "",
+          };
+        }
+        return { blocks: [{ type: "text", text: `第${input.page}页正文，内容长度足够参与统计。`, bbox: [0.1, 0.1, 0.9, 0.16] }], markdown: "" };
+      },
+    };
+  }
+
+  async function recognizeScannedBook(ocr: ReturnType<typeof createOcrModule>, pages: number[]) {
+    for (const page of pages) {
+      await ocr.recognizePage({ bookId: BOOK_ID, page });
+    }
+  }
+
+  it("replays the full toc pipeline as trace events with the ai payload captured", async () => {
+    const ocr = createOcrModule(dataHome, scannedBookEngine(), {
+      resolvePdfPath: (bookId) => (bookId === BOOK_ID ? { path: "C:/book.pdf", encrypted: false } : undefined),
+    });
+    closeOcr = ocr.close;
+    await recognizeScannedBook(ocr, [1, 2, 3, 4, 5, 6, 7]);
+    const { events, tracer } = traced();
+    const ai = aiOutlineDeps([{ label: "第一章 起点", level: 1, printedPage: 1 }], [2]);
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource(Array.from({ length: 10 }, () => [])),
+      aiOutline: ai.deps,
+      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+      tracer,
+    });
+    closeOutline = outline.close;
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "embedded_gate", "locate", "ai_call", "assemble_arm", "offset_vote", "persist",
+    ]);
+    expect(events[0]!.data).toEqual({ accepted: false, entryCount: 0, resolvableCount: 0, distinctPages: 0 });
+    // locate：index 真实命中与 ±1 边距候选分开报。
+    expect(events[1]!.data).toEqual({
+      hits: [2],
+      pages: [1, 2, 3],
+      nativeMajority: false,
+      tocRegionAdjudicated: true,
+      windowEnd: 10,
+    });
+    // ai_call：prompt 最终全文（含目录页文本）+ 模型原始返回 + 耗时。
+    const aiCall = events[2]!;
+    expect(aiCall.data).toMatchObject({ outcome: "ok", entriesCount: 1, tocPages: [2] });
+    const exchange = (aiCall.data as { exchanges: Array<{ prompt: string; response: string; durationMs: number }> }).exchanges[0]!;
+    expect(exchange.prompt).toContain("目录候选页");
+    expect(exchange.prompt).toContain("第一章 起点…………………………1");
+    expect(exchange.response).toContain("hasToc");
+    expect(exchange.durationMs).toBeGreaterThanOrEqual(0);
+    // 装配臂：扫描书触发点偏移可解 → 校准态。
+    expect(events[3]!.data).toEqual({ nativeMajority: false, allBlocks: false, hasTocConclusion: true, arm: "calibrated" });
+    // 偏移投票：锚点 1 票 + 正文页脚 3 票同落 offset 3，胜者过闸。
+    expect(events[4]!.data).toEqual({
+      votes: { anchor: { "3": 1 }, body: { "3": 3 }, toc: {} },
+      winner: 3,
+      confirmed: true,
+      threshold: 2,
+    });
+    expect(events[5]!.data).toEqual({ strategy: "ai_toc", calibrated: false, nodeCount: 1, version: 8 });
+
+    // 整书完成后收尾：缓存命中轻量条目 + all-blocks 臂 + 转正落库，不二次调用模型。
+    await recognizeScannedBook(ocr, [8, 9, 10]);
+    events.length = 0;
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(events.map((event) => event.kind)).toEqual([
+      "embedded_gate", "locate", "ai_call", "assemble_arm", "offset_vote", "persist",
+    ]);
+    expect(events[2]!.data).toEqual({ outcome: "cache", exchanges: [], tocPages: [2], entriesCount: 1 });
+    expect(events[3]!.data).toEqual({ nativeMajority: false, allBlocks: true, hasTocConclusion: true, arm: "all-blocks" });
+    expect(events[5]!.data).toEqual({ strategy: "ai_toc", calibrated: true, nodeCount: 1, version: 8 });
+    expect(ai.completeCalls).toBe(1);
+  });
+
+  it("records a failed ai call with the prompt and no conclusion", async () => {
+    const ocr = createOcrModule(dataHome, scannedBookEngine(), {
+      resolvePdfPath: (bookId) => (bookId === BOOK_ID ? { path: "C:/book.pdf", encrypted: false } : undefined),
+    });
+    closeOcr = ocr.close;
+    await recognizeScannedBook(ocr, [1, 2, 3, 4, 5, 6, 7]);
+    const { events, tracer } = traced();
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource(Array.from({ length: 10 }, () => [])),
+      aiOutline: {
+        renderPage: async () => ({ imageData: "aW1n" }),
+        complete: async () => {
+          throw new Error("模型未配置");
+        },
+      },
+      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+      tracer,
+    });
+    closeOutline = outline.close;
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    const aiCall = events.find((event) => event.kind === "ai_call");
+    expect(aiCall).toBeDefined();
+    expect(aiCall!.data).toMatchObject({ outcome: "failed", errorMessage: "模型未配置" });
+    expect((aiCall!.data as { exchanges: Array<{ prompt: string }> }).exchanges[0]!.prompt).toContain("目录候选页");
+    // 失败≠判无：不落库、不下装配结论（装配臂判定在提取成功之后，直接退出等重试）。
+    expect(events.filter((event) => event.kind === "persist")).toEqual([]);
+    expect(events.filter((event) => event.kind === "assemble_arm")).toEqual([]);
+  });
+
+  it("records zero ai_call events for a book without toc signals", async () => {
+    const engine: MineruEngine = {
+      name: "测试 OCR",
+      model: "测试模型",
+      async recognizePage(input) {
+        return {
+          blocks: [{ type: "text", text: `第${input.page}页正文，内容长度足够参与统计。`, bbox: [0.1, 0.1, 0.9, 0.16] }],
+          markdown: "",
+        };
+      },
+    };
+    const ocr = createOcrModule(dataHome, engine, {
+      resolvePdfPath: (bookId) => (bookId === BOOK_ID ? { path: "C:/book.pdf", encrypted: false } : undefined),
+    });
+    closeOcr = ocr.close;
+    await recognizeScannedBook(ocr, [1, 2, 3, 4]);
+    const { events, tracer } = traced();
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource([[], [], [], []]),
+      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+      tracer,
+    });
+    closeOutline = outline.close;
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(events.filter((event) => event.kind === "ai_call")).toEqual([]);
+    // 无目录书路径清晰可见：locate 零命中、all-blocks 臂、空目录照常落库。
+    expect(events.find((event) => event.kind === "locate")!.data).toMatchObject({ hits: [], tocRegionAdjudicated: true, windowEnd: 4 });
+    expect(events.find((event) => event.kind === "assemble_arm")!.data).toMatchObject({ arm: "all-blocks", hasTocConclusion: false });
+    expect(events.find((event) => event.kind === "persist")!.data).toMatchObject({ strategy: "empty" });
+  });
+
+  it("marks tier one adjudicated through the trace when the probe window is uncovered", async () => {
+    // 零识别扫描书开书：目录任务空转退出，只落「第一档已裁决」。
+    const { events, tracer } = traced();
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource(Array.from({ length: 10 }, () => [])),
+      tracer,
+    });
+    closeOutline = outline.close;
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(events.map((event) => event.kind)).toEqual(["embedded_gate", "locate", "assemble_arm", "tier_one_adjudicated"]);
+    expect(events.at(-1)!.data).toEqual({});
+  });
+
+  it("emits the embedded gate verdict with persist for a bookmark-carrying book", async () => {
+    const { events, tracer } = traced();
+    const embeddedNodes: BookOutlineNode[] = [
+      { id: "c1", label: "第一章", page: 2, children: [] },
+      { id: "c2", label: "第二章", page: 5, children: [] },
+      { id: "c3", label: "第三章", page: 8, children: [] },
+    ];
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource(Array.from({ length: 10 }, () => []), { embeddedNodes }),
+      tracer,
+    });
+    closeOutline = outline.close;
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(events.map((event) => event.kind)).toEqual(["embedded_gate", "persist"]);
+    expect(events[0]!.data).toEqual({ accepted: true, entryCount: 3, resolvableCount: 3, distinctPages: 3 });
+    expect(events[1]!.data).toEqual({ strategy: "embedded", calibrated: true, nodeCount: 3, version: 8 });
+  });
+
+  it("computes the probe window snapshot from the block store only", () => {
+    const blocks = new Map<number, MineruBlock[]>([
+      [1, [{ type: "text", text: "扉页", bbox: [0.1, 0.1, 0.9, 0.2] }]],
+      [2, [{ type: "index", text: "目录", bbox: [0.1, 0.1, 0.9, 0.5] }]],
+      [3, [{ type: "text", text: "正文", bbox: [0.1, 0.1, 0.9, 0.2] }]],
+      [4, [{ type: "text", text: "正文", bbox: [0.1, 0.1, 0.9, 0.2] }]],
+    ]);
+    const snapshot = traceWindowSnapshot(10, (page) => blocks.get(page));
+    expect(snapshot.windowEnd).toBe(10);
+    expect(snapshot.scannedCount).toBe(4);
+    expect(snapshot.windowCovered).toBe(false);
+    expect(snapshot.lastIndexPage).toBe(2);
+    expect(snapshot.gapPages).toEqual([3, 4]);
+    expect(snapshot.gapObserved).toBe(true);
+    expect(snapshot.yieldReady).toBe(true);
+    expect(snapshot.pages[1]).toEqual({ page: 2, hasIndexBlock: true, covered: true });
+    expect(snapshot.pages[4]).toEqual({ page: 5, hasIndexBlock: false, covered: false });
+    // 未识别页在探针里按无 index 计。
+    expect(snapshot.pages[9]).toEqual({ page: 10, hasIndexBlock: false, covered: false });
+  });
+
+  it("returns a zeroed snapshot for an unknown book", () => {
+    const snapshot = traceWindowSnapshot(0, () => undefined);
+    expect(snapshot).toMatchObject({ windowEnd: 0, scannedCount: 0, windowCovered: false, yieldReady: false, gapPages: [], gapObserved: false });
+    expect(snapshot.pages).toEqual([]);
   });
 });

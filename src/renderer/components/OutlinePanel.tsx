@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, Search } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { BookOutlineNode, BookOutlineStrategy } from "../../shared/contracts";
@@ -65,7 +65,7 @@ function OutlineTree({
   );
 }
 
-export function OutlinePanel({ nodes, strategy, calibrated, page, emptyMessage, onGoToPage }: { nodes: OutlineNode[]; strategy: BookOutlineStrategy; calibrated?: boolean; page: number; emptyMessage: string; onGoToPage(page: number, anchorTop?: number): void }) {
+export function OutlinePanel({ nodes, strategy, calibrated, page, emptyMessage, onGoToPage, onOpenObserver }: { nodes: OutlineNode[]; strategy: BookOutlineStrategy; calibrated?: boolean; page: number; emptyMessage: string; onGoToPage(page: number, anchorTop?: number): void; /** DEV 专用入口：观测抽屉开关（生产构建不传）。 */ onOpenObserver?: () => void }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const activeId = useMemo(() => {
@@ -101,10 +101,25 @@ export function OutlinePanel({ nodes, strategy, calibrated, page, emptyMessage, 
     });
   }, [activeId, nodes]);
 
-  if (nodes.length === 0) return <p className="outline-empty">{emptyMessage}</p>;
+  // DEV 专用观测入口（生产构建被常量折叠剔除）：空目录态与目录树两种形态共用。
+  const observerEntry = import.meta.env.DEV && onOpenObserver ? (
+    <div className="outline-panel-header">
+      <button className="observer-open" aria-label="打开管线观测面板" title="管线观测（Ctrl+Shift+D）" onClick={onOpenObserver}><Search size={12} /></button>
+    </div>
+  ) : null;
+
+  if (nodes.length === 0) {
+    return (
+      <div className="outline-panel">
+        {observerEntry}
+        <p className="outline-empty">{emptyMessage}</p>
+      </div>
+    );
+  }
 
   return (
     <div className="outline-panel" ref={rootRef}>
+      {observerEntry}
       {strategy !== "empty" && (
         <p className="outline-source">
           {STRATEGY_LABEL[strategy]}

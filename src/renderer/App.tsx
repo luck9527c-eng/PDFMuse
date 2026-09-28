@@ -51,6 +51,7 @@ import { ConversationMessageItem } from "./components/ConversationMessageItem";
 import { DiagnosticsDrawer } from "./components/DiagnosticsDrawer";
 import { MarkdownView } from "./components/MarkdownView";
 import { OutlinePanel } from "./components/OutlinePanel";
+import { PipelineObserverDrawer } from "./components/PipelineObserverDrawer";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { LibraryView } from "./components/LibraryView";
 import { PasswordDialog, type PasswordRequest } from "./components/PasswordDialog";
@@ -652,6 +653,20 @@ export function App() {
     if (debugRunId) void refreshDiagnostics();
   }, [debugRunId, refreshDiagnostics]);
 
+  // 管线观测抽屉（dev 专用）：目录面板 🔍 与 Ctrl+Shift+D 双入口；生产构建零残留。
+  const [observerOpen, setObserverOpen] = useState(false);
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.ctrlKey && event.shiftKey && !event.altKey && (event.key === "D" || event.key === "d")) {
+        event.preventDefault();
+        setObserverOpen((value) => !value);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   // 流式输出期间保持对话底部可见。
   useEffect(() => {
     const container = conversationRef.current;
@@ -707,7 +722,7 @@ export function App() {
               </div>
               <div className="sidebar-tabs"><button className={sidebarView === "outline" ? "active" : ""} onClick={() => setSidebarView("outline")}>目录</button><button className={sidebarView === "thumbnails" ? "active" : ""} onClick={() => setSidebarView("thumbnails")}>缩略图</button></div>
               {sidebarView === "outline" ? (
-                <OutlinePanel nodes={effectiveOutline} strategy={generatedOutline?.strategy ?? "empty"} calibrated={generatedOutline?.calibrated} page={viewerState.page} emptyMessage={outlineEmptyMessage} onGoToPage={(page, anchorTop) => viewerRef.current?.goToPage(page, anchorTop)} />
+                <OutlinePanel nodes={effectiveOutline} strategy={generatedOutline?.strategy ?? "empty"} calibrated={generatedOutline?.calibrated} page={viewerState.page} emptyMessage={outlineEmptyMessage} onGoToPage={(page, anchorTop) => viewerRef.current?.goToPage(page, anchorTop)} onOpenObserver={import.meta.env.DEV ? () => setObserverOpen((value) => !value) : undefined} />
               ) : (
                 <div className="thumbnail-list">
                   {Array.from({ length: viewerState.pages }, (_, index) => index + 1).map((page) => (
@@ -868,6 +883,9 @@ export function App() {
           </div>
         )}
         <PasswordDialog request={passwordRequest} onCancel={() => setPasswordRequest(undefined)} onUnlock={unlockPdf} />
+        {observerOpen && (
+          <PipelineObserverDrawer bookId={book.id} page={viewerState.page} onClose={() => setObserverOpen(false)} />
+        )}
         <Dialog.Root open={clearConversationOpen} onOpenChange={(open) => { if (!clearingConversation) setClearConversationOpen(open); }}>
           <Dialog.Portal>
             <Dialog.Overlay className="dialog-overlay" />

@@ -334,6 +334,134 @@ export type BackgroundJobMutationResult =
   | { ok: true; job: BackgroundJob }
   | { ok: false; code: "VALIDATION_ERROR" | "NOT_FOUND" | "CONFLICT"; message: string };
 
+// ---------------------------------------------------------------------------
+// 管线观测（Pipeline Observer）：决策瞬间的结构化事件（JSONL 落盘）+ 探测窗口状态快照。
+// 只记转移点，未触发的常规触发器评估不记；「窗口此刻什么状态」由 trace:snapshot 现算，
+// 不进事件流（状态与瞬间分家）。
+// ---------------------------------------------------------------------------
+
+/** 事件 kind（spec「事件清单」11 种）：数组形式供通道读取校验与渲染端标签表共用。 */
+export const PIPELINE_TRACE_KINDS = [
+  "embedded_gate",
+  "locate",
+  "ai_call",
+  "assemble_arm",
+  "offset_vote",
+  "persist",
+  "tier_one_adjudicated",
+  "ocr_start",
+  "ocr_yield",
+  "ocr_complete",
+  "ocr_fail",
+] as const;
+export type PipelineTraceKind = (typeof PIPELINE_TRACE_KINDS)[number];
+
+/** 内嵌书签质量闸门裁决：accepted 与依据（evaluateEmbeddedOutline 现成判据）。 */
+export type EmbeddedGateTraceData = {
+  accepted: boolean;
+  entryCount: number;
+  resolvableCount: number;
+  distinctPages: number;
+};
+
+/** 目录页定位结论：hits 为 index 真实命中，pages 含 ±1 边距候选。 */
+export type LocateTraceData = {
+  hits: number[];
+  pages: number[];
+  nativeMajority: boolean;
+  tocRegionAdjudicated: boolean;
+  windowEnd: number;
+};
+
+/** 一次视觉调用的载荷交换：prompt 为拼好的最终全文（含目录页文本），response 为模型原始返回（未解析）。 */
+export type AiCallExchangeTrace = {
+  prompt: string;
+  response?: string;
+  durationMs: number;
+  errorMessage?: string;
+};
+
+/** AI 提取调用：缓存命中只记轻量条目（outcome=cache，无载荷）；新调记全文载荷与结果规模。 */
+export type AiCallTraceData = {
+  outcome: "ok" | "aborted" | "failed" | "cache";
+  exchanges: AiCallExchangeTrace[];
+  tocPages?: number[];
+  entriesCount?: number;
+  errorMessage?: string;
+};
+
+/** 三臂装配判定：arm 说明本次 rebuild 走哪条装配路（wait = 只提取等整书收尾）。 */
+export type AssembleArmTraceData = {
+  nativeMajority: boolean;
+  allBlocks: boolean;
+  hasTocConclusion: boolean;
+  arm: "native-majority" | "all-blocks" | "calibrated" | "wait";
+};
+
+/** 印刷页偏移投票票型：三类票的 offset → 票数分布、裁定胜者与 MIN_OFFSET_VOTES 闸门结果。 */
+export type OffsetVoteTraceData = {
+  votes: { anchor: Record<string, number>; body: Record<string, number>; toc: Record<string, number> };
+  winner?: number;
+  confirmed: boolean;
+  threshold: number;
+};
+
+/** 目录落库：来源档 / 校准标记 / 节点总数 / 载荷版本。 */
+export type PersistTraceData = {
+  strategy: BookOutlineStrategy;
+  calibrated: boolean;
+  nodeCount: number;
+  version: number;
+};
+
+export type OcrStartTraceData = { fromPage: number };
+
+/** OCR 让位成立的触发现场（探针快照）：为什么这时交棒的唯一证据。 */
+export type OcrYieldTraceData = {
+  trigger: "run-end" | "window-covered" | "startup-check";
+  windowEnd: number;
+  scannedCount: number;
+  /** 窗口逐页探针（index 块有无）：index 页与 gap 观测均可由此读出。 */
+  probe: Array<{ page: number; hasIndexBlock: boolean }>;
+};
+
+export type OcrCompleteTraceData = { totalPages: number };
+
+export type OcrFailTraceData = { message: string; progress: number; total: number };
+
+export type PipelineTraceEvent =
+  | { kind: "embedded_gate"; data: EmbeddedGateTraceData }
+  | { kind: "locate"; data: LocateTraceData }
+  | { kind: "ai_call"; data: AiCallTraceData }
+  | { kind: "assemble_arm"; data: AssembleArmTraceData }
+  | { kind: "offset_vote"; data: OffsetVoteTraceData }
+  | { kind: "persist"; data: PersistTraceData }
+  | { kind: "tier_one_adjudicated"; data: Record<string, never> }
+  | { kind: "ocr_start"; data: OcrStartTraceData }
+  | { kind: "ocr_yield"; data: OcrYieldTraceData }
+  | { kind: "ocr_complete"; data: OcrCompleteTraceData }
+  | { kind: "ocr_fail"; data: OcrFailTraceData };
+
+/** JSONL 的一行（trace:get 的搬运单位）：ts 为本地时钟 ISO 串。 */
+export type PipelineTraceRecord = PipelineTraceEvent & { ts: string };
+
+/** 探测窗口状态快照（trace:snapshot 现算，不读事件流）：块库视角——covered 指该页已有识别结果。 */
+export type TraceWindowSnapshot = {
+  windowEnd: number;
+  /** 连续前沿：线性页序上已识别页数。 */
+  scannedCount: number;
+  windowCovered: boolean;
+  pages: Array<{ page: number; hasIndexBlock: boolean; covered: boolean }>;
+  /** 窗口内最后一个 index 页；零命中时缺省。 */
+  lastIndexPage?: number;
+  /** 目录区结束判定观察的 gap 页（lastIndexPage+1 起的观察面）。 */
+  gapPages: number[];
+  /** gap 页已全部扫过且无 index（run-end 结论）。 */
+  gapObserved: boolean;
+  /** 数据触发器现判（run-end 或窗口覆盖，取先）。 */
+  yieldReady: boolean;
+};
+
 /** 当前问题的图片附件；data 仅保存不含 data: 前缀的 Base64。 */
 export type AgentImageAttachment = {
   id: string;
@@ -609,4 +737,9 @@ export interface PDFMuseApi {
   saveAppearanceSettings(input: SaveAppearanceSettingsInput): Promise<SaveAppearanceSettingsResult>;
   getWebSearchConnection(): Promise<WebSearchConnectionState>;
   saveWebSearchConnection(input: SaveWebSearchConnectionInput): Promise<SaveWebSearchConnectionResult>;
+  /** 管线观测（只读）：事件文件逐行搬运（坏行跳过），无此书/无文件返回空态。 */
+  getPipelineTraceEvents(bookId: string): Promise<PipelineTraceRecord[]>;
+  getTraceWindowSnapshot(bookId: string): Promise<TraceWindowSnapshot>;
+  getTracePageBlocks(bookId: string, page: number): Promise<MineruBlock[]>;
+  getTraceJobs(bookId: string): Promise<BackgroundJob[]>;
 }

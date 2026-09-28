@@ -45,6 +45,10 @@ const REQUIRED_API_METHODS = {
   saveAppearanceSettings: true,
   getWebSearchConnection: true,
   saveWebSearchConnection: true,
+  getPipelineTraceEvents: true,
+  getTraceWindowSnapshot: true,
+  getTracePageBlocks: true,
+  getTraceJobs: true,
 } satisfies Record<keyof PDFMuseApi, true>;
 
 /**

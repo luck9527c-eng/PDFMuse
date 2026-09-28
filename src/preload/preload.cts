@@ -57,6 +57,10 @@ const api: PDFMuseApi = {
   saveAppearanceSettings: (input) => ipcRenderer.invoke("appearance-settings:save", input),
   getWebSearchConnection: () => ipcRenderer.invoke("web-search-connection:get"),
   saveWebSearchConnection: (input) => ipcRenderer.invoke("web-search-connection:save", input),
+  getPipelineTraceEvents: (bookId) => ipcRenderer.invoke("trace:get", bookId),
+  getTraceWindowSnapshot: (bookId) => ipcRenderer.invoke("trace:snapshot", bookId),
+  getTracePageBlocks: (bookId, page) => ipcRenderer.invoke("trace:page-blocks", bookId, page),
+  getTraceJobs: (bookId) => ipcRenderer.invoke("trace:jobs", bookId),
 };
 
 contextBridge.exposeInMainWorld("pdfMuse", api);

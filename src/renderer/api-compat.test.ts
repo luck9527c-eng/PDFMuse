@@ -16,6 +16,7 @@ const ALL_METHODS = [
   "cancelBackgroundJob", "startAgentRun", "cancelAgentRun",
   "onAgentEvent", "onBackgroundEvent", "getReaderProfile", "saveReaderProfile", "getAppearanceSettings", "saveAppearanceSettings",
   "getWebSearchConnection", "saveWebSearchConnection",
+  "getPipelineTraceEvents", "getTraceWindowSnapshot", "getTracePageBlocks", "getTraceJobs",
 ];
 
 describe("findMissingApiMethods", () => {

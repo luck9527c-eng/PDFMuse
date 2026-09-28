@@ -37,6 +37,8 @@ export type AiOutlineCompleteInput = {
   pages: number[];
   texts: TocPageText[];
   images: Array<{ data: string; mimeType: string }>;
+  /** 拼好的最终 user prompt 全文（含目录页文本）：与模型实际收到的逐字一致，观测载荷照此捕获。 */
+  prompt: string;
 };
 
 export type AiOutlineComplete = (input: AiOutlineCompleteInput) => Promise<string>;
@@ -173,7 +175,8 @@ export async function generateAiOutline(deps: AiOutlineDeps): Promise<AiOutlineR
       images.push({ data: rendered.imageData, mimeType: "image/png" });
     }
     if (interrupted) break;
-    const text = await deps.complete({ pages, texts, images });
+    const prompt = userPrompt(pages, texts);
+    const text = await deps.complete({ pages, texts, images, prompt });
     if (aborted()) break;
     // 解析失败等同模型故障（抛错、不缓存），不能固化成「无目录」结论。
     const parsed = parseAiOutlineResponse(text);
@@ -227,7 +230,7 @@ export function buildAiOutlineCompleter(options: {
       role: "user",
       timestamp: Date.now(),
       content: [
-        { type: "text", text: userPrompt(input.pages, input.texts) },
+        { type: "text", text: input.prompt },
         ...input.images.map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
       ],
     };

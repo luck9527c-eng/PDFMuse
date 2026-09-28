@@ -156,4 +156,22 @@ describe("OutlinePanel", () => {
     render({ ...baseProps(structuredClone(nodes), 1), strategy: "ai_toc" });
     expect(container.querySelector(".outline-calibrating")).toBeNull();
   });
+
+  it("shows the observer entry only when wired (dev builds) and forwards clicks", () => {
+    // 生产构建不传 onOpenObserver：零残留。
+    render(baseProps(buildTree(), 1));
+    expect(container.querySelector(".observer-open")).toBeNull();
+
+    const clicks: number[] = [];
+    render({ ...baseProps(buildTree(), 1), onOpenObserver: () => clicks.push(1) });
+    const button = container.querySelector<HTMLButtonElement>(".observer-open");
+    expect(button).toBeTruthy();
+    act(() => button!.click());
+    expect(clicks).toEqual([1]);
+
+    // 空目录态同样有入口（空态文案保留）。
+    render({ ...baseProps([], 1), onOpenObserver: () => clicks.push(2) });
+    expect(container.querySelector(".outline-empty")).toBeTruthy();
+    expect(container.querySelector(".observer-open")).toBeTruthy();
+  });
 });

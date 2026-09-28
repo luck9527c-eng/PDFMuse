@@ -28,8 +28,10 @@ import {
   createBookOutlineModule,
   findOutlineChapterRange,
   findOutlineSectionPath,
+  traceWindowSnapshot,
 } from "./book-outline.js";
 import { createOcrJobExecutor } from "./ocr-job.js";
+import { createPipelineTracer, readPipelineTrace } from "./pipeline-trace.js";
 import { createReaderProfileModule } from "./reader-profile.js";
 import { createAppearanceSettingsModule } from "./appearance-settings.js";
 import type {
@@ -131,6 +133,11 @@ app.whenReady().then(async () => {
     const configPath = path.join(startupPreflight.dataHome, "config.json");
     const readerProfile = createReaderProfileModule(startupPreflight.dataHome);
     const appearanceSettings = createAppearanceSettingsModule(startupPreflight.dataHome);
+    // 管线观测 trace（常驻写入不门控 dev；写失败不影响管线）：data/logs/ 下按书分 JSONL。
+    const traceLogDirectory = path.join(startupPreflight.dataHome, "logs");
+    const tracer = createPipelineTracer({ logDirectory: traceLogDirectory });
+    // 识别块直读是多家管线（目录定位、触发探针、观测快照）共用的最小读接口。
+    const readRecognizedBlocks = (bookId: string, page: number) => ocr.getPage(bookId, page)?.blocks;
     const mineruEngine = createWorkerMineruEngine({
       command: path.join(applicationDirectory(), "resources", "mineru-runtime", process.platform === "win32" ? "python.exe" : "python"),
       args: [path.join(applicationDirectory(), "resources", "mineru-worker", "mineru_worker.py")],
@@ -184,7 +191,7 @@ app.whenReady().then(async () => {
         : undefined;
     };
     const bookOutline = createBookOutlineModule(startupPreflight.dataHome, {
-      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+      readRecognizedBlocks,
       aiOutline: {
         renderPage: pageRenderer.renderPage,
         complete: buildAiOutlineCompleter({ loadConnection: loadChatConnection }),
@@ -196,6 +203,7 @@ app.whenReady().then(async () => {
         nodes: bookOutline.get(bookId),
         calibrated: bookOutline.calibrated(bookId),
       }),
+      tracer,
     });
     closeBookOutline = bookOutline.close;
     const scheduleOptionalEmbedding = (input: Omit<ScheduleBackgroundJobInput, "kind">) => (
@@ -238,7 +246,7 @@ app.whenReady().then(async () => {
       // （目录数据就绪即交棒重排）；依赖全注入，模块级测试覆盖触发/断点/续跑。
       ocr: createOcrJobExecutor({
         loadBook: (bookId) => library.list().find((item) => item.id === bookId),
-        getPageBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+        getPageBlocks: readRecognizedBlocks,
         isPageCompatible: (bookId, page) => ocr.isPageCompatible(bookId, page, MINERU_ENGINE_VERSION, MINERU_MODEL, MINERU_INPUT_VERSION),
         recognizePage: (input, signal) => ocr.recognizePage(input, signal),
         ingestPage: (bookId, page, blocks) => ingestion.ingestRecognizedPage(bookId, page, blocks, "background"),
@@ -248,6 +256,7 @@ app.whenReady().then(async () => {
         encodeCheckpoint: ingestion.encodeOcrCheckpoint,
         createFrontier: ingestion.createOcrFrontier,
         concurrency: mineruEngine.concurrency,
+        tracer,
       }),
       outline: async (job, context) => {
         const result = await bookOutline.rebuild(
@@ -467,6 +476,24 @@ app.whenReady().then(async () => {
       await bookOutline.ensureEmbedded(bookId, () => bookIndex.loadBookByBookId(bookId));
       return bookOutline.read(bookId);
     });
+    // 管线观测读通道（只读，注册不门控 dev——面板才是 dev 门控的部分）：
+    // 事件搬运 / 窗口快照现算 / 某页原始识别块 / 该书任务流水；无此书返回空态而非报错。
+    ipcMain.handle("trace:get", (_event, bookId: unknown) => (
+      isOwnedBook(bookId) ? readPipelineTrace(traceLogDirectory, bookId) : []
+    ));
+    ipcMain.handle("trace:snapshot", (_event, bookId: unknown) => {
+      if (!isOwnedBook(bookId)) return traceWindowSnapshot(0, () => undefined);
+      const pageCount = library.getBookSource(bookId)?.pageCount ?? 0;
+      return traceWindowSnapshot(pageCount, (page) => readRecognizedBlocks(bookId, page));
+    });
+    ipcMain.handle("trace:page-blocks", (_event, bookId: unknown, page: unknown) => (
+      isOwnedBook(bookId) && typeof page === "number" && Number.isSafeInteger(page) && page >= 1
+        ? readRecognizedBlocks(bookId, page) ?? []
+        : []
+    ));
+    ipcMain.handle("trace:jobs", (_event, bookId: unknown) => (
+      isOwnedBook(bookId) ? backgroundJobs.list(bookId) : []
+    ));
     const invalidBackgroundJob = (): BackgroundJobMutationResult => ({
       ok: false,
       code: "NOT_FOUND",

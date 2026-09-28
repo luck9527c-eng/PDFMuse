@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { JobExecutorContext } from "./background-jobs.js";
 import { createOcrJobExecutor, type OcrJobDependencies } from "./ocr-job.js";
 import { createRecognizedTextIngestion } from "./recognized-text-ingestion.js";
-import type { BackgroundJob, MineruBlock } from "../shared/contracts.js";
+import type { BackgroundJob, MineruBlock, PipelineTraceRecord } from "../shared/contracts.js";
 
 const BOOK_ID = "a".repeat(64);
 
@@ -178,5 +178,94 @@ describe("ocr job executor", () => {
     harness.deps.loadBook = () => undefined;
     const executor = createOcrJobExecutor(harness.deps);
     await expect(executor(makeJob("job-1"), makeContext().context)).rejects.toThrow("当前 PDF 书籍不可用。");
+  });
+
+  describe("pipeline trace", () => {
+    it("emits ocr_start, run-end yield with the probe snapshot, and ocr_complete", async () => {
+      const events: PipelineTraceRecord[] = [];
+      const harness = makeDeps({ indexPages: [5] });
+      harness.deps.tracer = { emit: (_bookId, event) => events.push({ ts: "2026-09-28T00:00:00.000+08:00", ...event }) };
+      const run = makeContext();
+      await expect(createOcrJobExecutor(harness.deps)(makeJob("job-1"), run.context)).rejects.toThrow("OCR 任务已暂停或取消。");
+      expect(events.map((event) => event.kind)).toEqual(["ocr_start", "ocr_yield"]);
+      expect(events[0]!.data).toEqual({ fromPage: 0 });
+      // 让位现场：run-end 触发、窗口末 40、前沿扫到 ≥7，探针里只有第 5 页有 index。
+      const yieldEvent = events[1]!;
+      expect(yieldEvent.data).toMatchObject({ trigger: "run-end", windowEnd: 30 });
+      const data = yieldEvent.data as { scannedCount: number; probe: Array<{ page: number; hasIndexBlock: boolean }> };
+      expect(data.scannedCount).toBeGreaterThanOrEqual(7);
+      expect(data.scannedCount).toBeLessThanOrEqual(8);
+      expect(data.probe.find((entry) => entry.page === 5)).toEqual({ page: 5, hasIndexBlock: true });
+      expect(data.probe.find((entry) => entry.page === 6)).toEqual({ page: 6, hasIndexBlock: false });
+    });
+
+    it("emits ocr_complete after the whole book finishes", async () => {
+      const events: PipelineTraceRecord[] = [];
+      const harness = makeDeps({ indexPages: [5] });
+      harness.deps.tracer = { emit: (_bookId, event) => events.push({ ts: "2026-09-28T00:00:00.000+08:00", ...event }) };
+      // 交棒登记在 executor 实例闭包：同任务续跑必须复用同一实例（与生产装配一致）。
+      const executor = createOcrJobExecutor(harness.deps);
+      await expect(executor(makeJob("job-1"), makeContext().context)).rejects.toThrow("OCR 任务已暂停或取消。");
+      events.length = 0;
+      await executor(makeJob("job-1", "ocr-linear:7"), makeContext().context);
+      expect(events.map((event) => event.kind)).toEqual(["ocr_start", "ocr_complete"]);
+      expect(events[0]!.data).toEqual({ fromPage: 7 });
+      expect(events[1]!.data).toEqual({ totalPages: 40 });
+      expect(harness.completed()).toBe(true);
+    });
+
+    it("marks the startup handover with the startup-check trigger and window-covered without index pages", async () => {
+      const events: PipelineTraceRecord[] = [];
+      const harness = makeDeps({ indexPages: [5], preRecognized: Array.from({ length: 30 }, (_, index) => index + 1) });
+      harness.deps.tracer = { emit: (_bookId, event) => events.push({ ts: "2026-09-28T00:00:00.000+08:00", ...event }) };
+      // 崩溃恢复越过窗口：启动即检交棒，trigger=startup-check、fromPage=35。
+      await expect(createOcrJobExecutor(harness.deps)(makeJob("job-1", "ocr-linear:35"), makeContext().context)).rejects.toThrow("OCR 任务已暂停或取消。");
+      expect(events.map((event) => event.kind)).toEqual(["ocr_start", "ocr_yield"]);
+      expect(events[0]!.data).toEqual({ fromPage: 35 });
+      expect(events[1]!.data).toMatchObject({ trigger: "startup-check", scannedCount: 35 });
+
+      // 无目录书：窗口扫满覆盖兜底，trigger=window-covered。
+      const plain = makeDeps({});
+      const plainEvents: PipelineTraceRecord[] = [];
+      plain.deps.tracer = { emit: (_bookId, event) => plainEvents.push({ ts: "2026-09-28T00:00:00.000+08:00", ...event }) };
+      await expect(createOcrJobExecutor(plain.deps)(makeJob("job-2"), makeContext().context)).rejects.toThrow("OCR 任务已暂停或取消。");
+      const yieldEvent = plainEvents.find((event) => event.kind === "ocr_yield");
+      expect(yieldEvent!.data).toMatchObject({ trigger: "window-covered" });
+      expect((yieldEvent!.data as { scannedCount: number }).scannedCount).toBeGreaterThanOrEqual(30);
+    });
+
+    it("emits ocr_fail with progress when a recognition fails", async () => {
+      const events: PipelineTraceRecord[] = [];
+      const harness = makeDeps({});
+      harness.deps.recognizePage = async () => ({ ok: false, code: "FAILED", message: "识别 worker 无响应。" });
+      harness.deps.tracer = { emit: (_bookId, event) => events.push({ ts: "2026-09-28T00:00:00.000+08:00", ...event }) };
+      await expect(createOcrJobExecutor(harness.deps)(makeJob("job-1"), makeContext().context)).rejects.toThrow("识别 worker 无响应。");
+      expect(events.map((event) => event.kind)).toEqual(["ocr_start", "ocr_fail"]);
+      expect(events[1]!.data).toEqual({ message: "识别 worker 无响应。", progress: 0, total: 40 });
+      expect(harness.completed()).toBe(false);
+    });
+
+    it("emits ocr_fail when the post-recognition ingestion throws", async () => {
+      const events: PipelineTraceRecord[] = [];
+      const harness = makeDeps({});
+      harness.deps.ingestPage = () => {
+        throw new Error("索引库写入失败。");
+      };
+      harness.deps.tracer = { emit: (_bookId, event) => events.push({ ts: "2026-09-28T00:00:00.000+08:00", ...event }) };
+      await expect(createOcrJobExecutor(harness.deps)(makeJob("job-1"), makeContext().context)).rejects.toThrow("索引库写入失败。");
+      expect(events.map((event) => event.kind)).toEqual(["ocr_start", "ocr_fail"]);
+      expect(events[1]!.data).toEqual({ message: "索引库写入失败。", progress: 0, total: 40 });
+      expect(harness.completed()).toBe(false);
+      expect(harness.reran()).toBe(0);
+    });
+
+    it("does not emit regular trigger evaluations between transfers (noise boundary)", async () => {
+      // 前沿逐页推进都会评估触发器，但只有真正交棒才落事件——其余页零事件。
+      const events: PipelineTraceRecord[] = [];
+      const harness = makeDeps({});
+      harness.deps.tracer = { emit: (_bookId, event) => events.push({ ts: "2026-09-28T00:00:00.000+08:00", ...event }) };
+      await expect(createOcrJobExecutor(harness.deps)(makeJob("job-1"), makeContext().context)).rejects.toThrow("OCR 任务已暂停或取消。");
+      expect(events.filter((event) => event.kind === "ocr_yield")).toHaveLength(1);
+    });
   });
 });

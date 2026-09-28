@@ -4,6 +4,7 @@
 
 import type { JobExecutor } from "./background-jobs.js";
 import { linearPageOrder } from "./ocr-page-order.js";
+import type { PipelineTracer } from "./pipeline-trace.js";
 import {
   outlineYieldProbe,
   shouldYieldToOutline,
@@ -31,6 +32,8 @@ export type OcrJobDependencies = {
   createFrontier(base: number): { frontier(): number; complete(orderIndex: number): number };
   /** 弹性池并发上限。 */
   concurrency: number;
+  /** 管线观测（可选）：转移点埋点，缺省不埋；未触发的常规触发器评估不记（spec 噪音边界）。 */
+  tracer?: PipelineTracer;
 };
 
 export function createOcrJobExecutor(deps: OcrJobDependencies): JobExecutor {
@@ -42,6 +45,7 @@ export function createOcrJobExecutor(deps: OcrJobDependencies): JobExecutor {
     const book = deps.loadBook(job.bookId);
     if (!book) throw new Error("当前 PDF 书籍不可用。");
     const { completed } = deps.decodeCheckpoint(job.checkpoint);
+    deps.tracer?.emit(job.bookId, { kind: "ocr_start", data: { fromPage: completed } });
     const pages = linearPageOrder(book.pageCount);
     // 弹性池动态派页（T49）：至多 N 页在途；断点只推进连续前沿——前沿之前必然已落库，
     // 前沿之后的在途页崩溃后按缓存缺失自然重扫。线性页序（T57-02）下断点即「已扫到第几页」。
@@ -60,6 +64,16 @@ export function createOcrJobExecutor(deps: OcrJobDependencies): JobExecutor {
       const probe = outlineYieldProbe(windowEnd, (page) => deps.getPageBlocks(job.bookId, page));
       if (shouldYieldToOutline(probe, reached, book.pageCount)) {
         yieldedOcrJobs.add(job.id);
+        // 让位成立的触发现场（探针快照）：为什么这时交棒的唯一证据。
+        deps.tracer?.emit(job.bookId, {
+          kind: "ocr_yield",
+          data: {
+            trigger: allowPastWindow ? "startup-check" : reached >= windowEnd ? "window-covered" : "run-end",
+            windowEnd,
+            scannedCount: reached,
+            probe: probe.map((entry) => ({ page: entry.page, hasIndexBlock: entry.hasIndexBlock })),
+          },
+        });
         // 先调度后交棒：目录任务入队后 OCR 自暂停，串行泵让目录先行、空闲后自动恢复。
         deps.scheduleOutlineRerank(job.bookId);
         context.yieldOnce();
@@ -78,10 +92,32 @@ export function createOcrJobExecutor(deps: OcrJobDependencies): JobExecutor {
           if (!deps.isPageCompatible(job.bookId, page)) {
             const result = await deps.recognizePage({ bookId: job.bookId, page, priority: "bulk" }, context.signal);
             if (!result.ok) {
-              if (!context.signal.aborted) failure = result.message;
+              if (!context.signal.aborted) {
+                // 只记首个失败（并发下后续页失败属同一事故）；progress 为当时前沿。
+                if (failure === undefined) {
+                  deps.tracer?.emit(job.bookId, {
+                    kind: "ocr_fail",
+                    data: { message: result.message, progress: written, total: book.pageCount },
+                  });
+                }
+                failure = result.message;
+              }
               return;
             }
-            await deps.ingestPage(job.bookId, page, result.page.blocks);
+            try {
+              await deps.ingestPage(job.bookId, page, result.page.blocks);
+            } catch (error) {
+              // 落库/索引联动失败与识别失败同收一个转移点：记首个、按失败收尾。
+              if (!context.signal.aborted && failure === undefined) {
+                const message = error instanceof Error ? error.message : String(error);
+                failure = message;
+                deps.tracer?.emit(job.bookId, {
+                  kind: "ocr_fail",
+                  data: { message, progress: written, total: book.pageCount },
+                });
+              }
+              return;
+            }
           }
           const reached = frontier.complete(index);
           if (reached > written) {
@@ -100,6 +136,9 @@ export function createOcrJobExecutor(deps: OcrJobDependencies): JobExecutor {
     while (inFlight.size > 0) await Promise.all([...inFlight]);
     if (context.signal.aborted) throw new Error("OCR 任务已暂停或取消。");
     if (failure) throw new Error(failure);
-    if (!context.signal.aborted) deps.completeBook(job.bookId);
+    if (!context.signal.aborted) {
+      deps.tracer?.emit(job.bookId, { kind: "ocr_complete", data: { totalPages: book.pageCount } });
+      deps.completeBook(job.bookId);
+    }
   };
 }
