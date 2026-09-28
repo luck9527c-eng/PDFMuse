@@ -27,6 +27,7 @@ import type { MineruEngine } from "./mineru.js";
 const BOOK_ID = "a".repeat(64);
 const NAVIGATION_FIXTURE = path.resolve(import.meta.dirname, "fixtures/navigation.pdf");
 const NO_OUTLINE_FIXTURE = path.resolve(import.meta.dirname, "fixtures/three-page.pdf");
+const ANCHOR_FIXTURE = path.resolve(import.meta.dirname, "fixtures/outline-anchors.pdf");
 
 function documentSource(
   pages: OutlineTextLine[][],
@@ -344,6 +345,21 @@ describe("book outline", () => {
     expect(nodes?.map((node) => node.label)).toEqual(["Chapter One", "Chapter Two", "Chapter Three"]);
     expect(nodes?.every((node) => node.page !== undefined)).toBe(true);
     expect(nodes?.[0]?.children[0]).toMatchObject({ label: "Section One", page: 1 });
+    // Fit 型 dest 无页内坐标，不造锚点（跳页顶）。
+    expect(nodes?.every((node) => node.anchor === undefined && node.children.every((child) => child.anchor === undefined))).toBe(true);
+  });
+
+  it("preserves in-page anchors from XYZ bookmark destinations", async () => {
+    const outline = createBookOutlineModule(dataHome);
+    closeOutline = outline.close;
+    const bytes = new Uint8Array(await readFile(ANCHOR_FIXTURE));
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes }));
+    expect(result.status).toBe("embedded");
+    // 同页多条目（Chapter One 与 1.1 同在 p.1）靠 XYZ top 区分落点，坐标原样保留交查看器换算。
+    const nodes = outline.get(BOOK_ID) ?? [];
+    expect(nodes[0]).toMatchObject({ label: "Chapter One", page: 1, anchor: { top: 500 } });
+    expect(nodes[0]?.children[0]).toMatchObject({ label: "Section 1.1", page: 1, anchor: { top: 100 } });
+    expect(nodes[1]).toMatchObject({ label: "Chapter Two", page: 2, anchor: { top: 400 } });
   });
 
   it("falls through to ai generation when the embedded outline is per-page junk", async () => {

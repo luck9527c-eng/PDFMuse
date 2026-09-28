@@ -32,7 +32,7 @@ export type ViewerState = {
 };
 
 export interface PdfViewerHandle {
-  goToPage(page: number): void;
+  goToPage(page: number, anchorTop?: number): void;
   previousPage(): void;
   nextPage(): void;
   zoomIn(): void;
@@ -73,6 +73,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
   const viewerElementRef = useRef<HTMLDivElement>(null);
   const adapterRef = useRef<{
     eventBus: EventBus;
+    linkService: PDFLinkService;
     viewer: PDFViewer;
     fitMode: Exclude<ReadingZoomMode, "custom"> | null;
     currentPage: number;
@@ -90,13 +91,17 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
   }, [panMode]);
 
   useImperativeHandle(ref, () => ({
-    goToPage(page) {
+    goToPage(page, anchorTop) {
       const adapter = adapterRef.current;
-      if (adapter) {
-        const targetPage = Math.max(1, Math.min(adapter.viewer.pagesCount, page));
-        adapter.currentPage = targetPage;
-        adapter.viewer.currentPageNumber = targetPage;
+      if (!adapter) return;
+      const targetPage = Math.max(1, Math.min(adapter.viewer.pagesCount, page));
+      adapter.currentPage = targetPage;
+      // 页内锚点（内嵌档书签 dest 的用户空间 Y）：走原生 XYZ 滚动，缩放不动；x=0 即左缘。
+      if (anchorTop !== undefined && Number.isFinite(anchorTop)) {
+        adapter.linkService.goToXY(targetPage, 0, anchorTop);
+        return;
       }
+      adapter.viewer.currentPageNumber = targetPage;
     },
     previousPage() {
       const adapter = adapterRef.current;
@@ -194,6 +199,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
     const restoredZoomMode = book.readingState.zoomMode;
     const adapter: NonNullable<typeof adapterRef.current> = {
       eventBus,
+      linkService,
       viewer,
       fitMode: restoredZoomMode === "custom" ? null : restoredZoomMode,
       currentPage: book.currentPage,

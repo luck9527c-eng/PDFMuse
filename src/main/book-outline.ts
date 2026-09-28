@@ -14,7 +14,7 @@ import {
 import type { BookOutlineNode, BookOutlineStrategy, MineruBlock } from "../shared/contracts.js";
 
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
-const OUTLINE_VERSION = 5;
+const OUTLINE_VERSION = 6;
 const MAX_HEADINGS = 240;
 const MIN_OFFSET_VOTES = 2;
 const REPEATED_LABEL_PAGES = 3;
@@ -676,7 +676,8 @@ export function evaluateEmbeddedOutline(nodes: readonly BookOutlineNode[], pageC
   return { accepted, entryCount: entries.length, resolvableCount: resolvable.length, distinctPages };
 }
 
-/** PDF 大纲 → BookOutlineNode 树：主进程唯一解析点，一次遍历同时解析跳转目标；有效性由质量闸门从节点推导。 */
+/** PDF 大纲 → BookOutlineNode 树：主进程唯一解析点，一次遍历同时解析跳转目标与页内锚点；
+ *  有效性由质量闸门从节点推导。 */
 async function resolveEmbeddedNodes(
   document: PdfDocument,
   items: PdfOutlineItem[] | null,
@@ -686,9 +687,10 @@ async function resolveEmbeddedNodes(
   const nodes: BookOutlineNode[] = [];
   for (const [index, item] of items.entries()) {
     let page: number | undefined;
+    let destination: Awaited<ReturnType<PdfDocument["getDestination"]>> | undefined;
     if (item.dest) {
       try {
-        const destination = typeof item.dest === "string" ? await document.getDestination(item.dest) : item.dest;
+        destination = typeof item.dest === "string" ? await document.getDestination(item.dest) : item.dest;
         const target = destination?.[0];
         if (typeof target === "number") page = target + 1;
         else if (target) page = (await document.getPageIndex(target)) + 1;
@@ -696,10 +698,14 @@ async function resolveEmbeddedNodes(
         page = undefined;
       }
     }
+    // 页内锚点只认 XYZ 的 top（用户空间 Y，原样保留交查看器换算）：同页多条目（手册条款）
+    // 靠它区分落点；Fit/FitH 等类型无独立坐标或语义不同，不造锚点、跳页顶。
+    const anchorTop = destination?.[1]?.name === "XYZ" && typeof destination[3] === "number" ? destination[3] : undefined;
     nodes.push({
       id: `${lineage}-${index}`,
       label: item.title.trim() || `未命名章节 ${index + 1}`,
       ...(page === undefined ? {} : { page }),
+      ...(page !== undefined && anchorTop !== undefined ? { anchor: { top: anchorTop } } : {}),
       children: await resolveEmbeddedNodes(document, item.items, `${lineage}-${index}`),
     });
   }

@@ -131,4 +131,18 @@ describe("OutlinePanel", () => {
     expect(isExpanded("sec-2-1")).toBe(true);
     expect(isExpanded("ch-13")).toBe(true);
   });
+
+  it("passes the in-page anchor along when jumping to an entry", () => {
+    // 内嵌档同页多条目靠页内锚点区分落点：点击要把 anchor.top 一并交给查看器。
+    const jumps: Array<{ page: number; anchorTop?: number }> = [];
+    const nodes: BookOutlineNode[] = [
+      { id: "a", label: "第三章", page: 6, children: [] },
+      { id: "b", label: "3.1 行为准则", page: 6, anchor: { top: 263.75 }, children: [] },
+    ];
+    render({ ...baseProps(nodes, 1), onGoToPage: (page, anchorTop) => jumps.push({ page, anchorTop }) });
+    const items = container.querySelectorAll<HTMLButtonElement>(".outline-item");
+    act(() => items[0]!.click());
+    act(() => items[1]!.click());
+    expect(jumps).toEqual([{ page: 6, anchorTop: undefined }, { page: 6, anchorTop: 263.75 }]);
+  });
 });

@@ -707,7 +707,7 @@ export function App() {
               </div>
               <div className="sidebar-tabs"><button className={sidebarView === "outline" ? "active" : ""} onClick={() => setSidebarView("outline")}>目录</button><button className={sidebarView === "thumbnails" ? "active" : ""} onClick={() => setSidebarView("thumbnails")}>缩略图</button></div>
               {sidebarView === "outline" ? (
-                <OutlinePanel nodes={effectiveOutline} strategy={generatedOutline?.strategy ?? "empty"} page={viewerState.page} emptyMessage={outlineEmptyMessage} onGoToPage={(page) => viewerRef.current?.goToPage(page)} />
+                <OutlinePanel nodes={effectiveOutline} strategy={generatedOutline?.strategy ?? "empty"} page={viewerState.page} emptyMessage={outlineEmptyMessage} onGoToPage={(page, anchorTop) => viewerRef.current?.goToPage(page, anchorTop)} />
               ) : (
                 <div className="thumbnail-list">
                   {Array.from({ length: viewerState.pages }, (_, index) => index + 1).map((page) => (

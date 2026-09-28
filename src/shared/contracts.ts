@@ -296,6 +296,10 @@ export type BookOutlineNode = {
   id: string;
   label: string;
   page?: number;
+  /** 页内定位锚点（内嵌档原样保留自 PDF 书签 dest）：top 为 PDF 用户空间 Y 坐标（原点左下），
+   *  跳转落到页内精确位置——同页多条目（手册条款）靠它区分落点。AI/正文识别档的数据源
+   *  只有页码粒度，无此字段（跳页顶）。 */
+  anchor?: { top: number };
   children: BookOutlineNode[];
 };
 

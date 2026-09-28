@@ -35,7 +35,7 @@ function OutlineTree({
   activeId?: string;
   expanded: Set<string>;
   onToggle(id: string): void;
-  onGoToPage(page: number): void;
+  onGoToPage(page: number, anchorTop?: number): void;
 }) {
   if (nodes.length === 0) {
     return <p className="outline-empty">未检测到可用章节。</p>;
@@ -51,7 +51,7 @@ function OutlineTree({
                 {expanded.has(node.id) ? <ChevronDown /> : <ChevronRight />}
               </button>
             ) : <span className="outline-spacer" />}
-            <button className="outline-item" disabled={!node.page} onClick={() => node.page && onGoToPage(node.page)}>
+            <button className="outline-item" disabled={!node.page} onClick={() => node.page && onGoToPage(node.page, node.anchor?.top)}>
               <span>{node.label}</span>
               {node.page && <span className="outline-page">{node.page}</span>}
             </button>
@@ -65,7 +65,7 @@ function OutlineTree({
   );
 }
 
-export function OutlinePanel({ nodes, strategy, page, emptyMessage, onGoToPage }: { nodes: OutlineNode[]; strategy: BookOutlineStrategy; page: number; emptyMessage: string; onGoToPage(page: number): void }) {
+export function OutlinePanel({ nodes, strategy, page, emptyMessage, onGoToPage }: { nodes: OutlineNode[]; strategy: BookOutlineStrategy; page: number; emptyMessage: string; onGoToPage(page: number, anchorTop?: number): void }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const activeId = useMemo(() => {
