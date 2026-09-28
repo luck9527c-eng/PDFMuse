@@ -27,8 +27,11 @@ export function aiOutlineEntryKey(entry: { level: number; label: string }) {
   return `${entry.level}|${entry.label.toLocaleLowerCase()}`;
 }
 
+/** 页文本选源（定位器、AI 载荷与页候选落库共用同一联合）：native 原生行 / ocr 识别块 / empty 两无所获。 */
+export type PageTextSource = "native" | "ocr" | "empty";
+
 /** 一次视觉调用里随图附带的逐页识别文字；source 决定提示词里的真值语义。 */
-export type TocPageText = { page: number; lines: string[]; source: "native" | "ocr" | "none" };
+export type TocPageText = { page: number; lines: string[]; source: PageTextSource };
 
 export type AiOutlineCompleteInput = {
   pages: number[];
@@ -63,7 +66,7 @@ function userPrompt(pages: readonly number[], texts: readonly TocPageText[]) {
   const sections = pages.map((page, index) => {
     const text = texts.find((candidate) => candidate.page === page);
     const lines = text?.lines ?? [];
-    if (text === undefined || text.source === "none" || lines.length === 0) {
+    if (text === undefined || text.source === "empty" || lines.length === 0) {
       return `第 ${page} 页（第 ${index + 1} 张图）：`;
     }
     const sourceLabel = text.source === "native" ? "原生文本，逐字精确" : "OCR 识别，可能有识别错误";

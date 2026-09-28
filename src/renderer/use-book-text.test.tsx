@@ -162,16 +162,16 @@ describe("useBookText", () => {
     const env = installApi({ preflightWarnings: ["尚未安装 OCR 工作进程资源"] });
     renderProbe({ book: BOOK, page: 2, renderRevision: 0, viewer: { current: makeViewer(async () => true) } });
     await vi.waitFor(() => expect(env.scheduled).toHaveLength(2));
-    expect(env.scheduled.map((job) => [job.kind, job.priority])).toEqual([["index", 10], ["outline", 5]]);
+    expect(env.scheduled.map((job) => [job.kind, job.priority])).toEqual([["outline", 25], ["index", 10]]);
   });
 
-  it("OCR 可用且嵌入已配置时四类任务全排，OCR 以当前页为起点", async () => {
+  it("OCR 可用且嵌入已配置时四类任务全排（批量序线性，与开书页无关）", async () => {
     const env = installApi({ embedding: { baseUrl: "http://127.0.0.1:9", model: "e", hasApiKey: false } });
     renderProbe({ book: BOOK, page: 2, renderRevision: 0, viewer: { current: makeViewer(async () => true) } });
     await vi.waitFor(() => expect(env.scheduled).toHaveLength(4));
     expect(env.scheduled.map((job) => [job.kind, job.priority])).toEqual([
+      ["outline", 25],
       ["index", 10],
-      ["outline", 5],
       ["ocr", 20],
       ["embedding", 0],
     ]);

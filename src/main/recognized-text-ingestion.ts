@@ -19,9 +19,9 @@ export type RecognizedTextIngestionDependencies = {
   cancelJob(id: string): unknown;
   scheduleJob(input: ScheduleJobInput): unknown;
 };
-// 手动识别需要目录立即跟上当前页；后台整书流程只在收尾重排一次。
+// 手动识别需要目录立即跟上当前页；整书收尾重排先于全文索引（T58：目录时点=整书完成，不再让位插队）。
 const INTERACTIVE_OUTLINE_PRIORITY = 20;
-const BACKGROUND_OUTLINE_PRIORITY = 5;
+const BACKGROUND_OUTLINE_PRIORITY = 15;
 const EMBEDDING_PRIORITY = 5;
 const ACTIVE_JOB_STATUSES: BackgroundJobStatus[] = ["queued", "running", "paused"];
 
@@ -44,7 +44,7 @@ export function createRecognizedTextIngestion(dependencies: RecognizedTextIngest
         });
       }
     },
-    /** 整书识别收尾：OCR 全书完成后正文锚点才齐，重排目录任务（AI 结论与页候选已缓存，重建只重跑装配）。 */
+    /** 整书识别收尾：证据闸门此时已过（窗口全覆盖、锚点与页脚票全量），重排目录任务产出最终目录。 */
     completeBookOcr(bookId: string) {
       dependencies.scheduleJob({
         bookId,

@@ -8,12 +8,13 @@ import {
   generateAiOutline,
   type AiOutlineComplete,
   type AiOutlineEntry,
+  type PageTextSource,
   type TocPageText,
 } from "./agent/outline-ai.js";
 import type { BookOutlineNode, BookOutlineStrategy, MineruBlock } from "../shared/contracts.js";
 
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
-const OUTLINE_VERSION = 4;
+const OUTLINE_VERSION = 5;
 const MAX_HEADINGS = 240;
 const MIN_OFFSET_VOTES = 2;
 const REPEATED_LABEL_PAGES = 3;
@@ -236,11 +237,13 @@ function countLabelPages(headings: readonly OutlineHeading[]): Map<string, Set<n
 
 /**
  * 页眉抑制：章/节序号身份在全书（页序）内只保留首次出现——真标题必然先于它的页眉出现；
- * 非序号标题在 ≥3 页重复出现视为页眉/页脚。
+ * 非序数标签在 ≥3 页重复出现同样视为页眉/页脚签名，只保留首现页——特名章（如「参考文献」
+ * 兼作页眉）的真身就在首现页，后续重复才是页眉。
  */
 function suppressRunningHeaders(headings: readonly OutlineHeading[]): OutlineHeading[] {
   const labelPages = countLabelPages(headings);
   const seenScoped = new Set<string>();
+  const seenRepeated = new Set<string>();
   let chapterScope = 0;
   const kept: OutlineHeading[] = [];
   for (const heading of headings) {
@@ -253,7 +256,11 @@ function suppressRunningHeaders(headings: readonly OutlineHeading[]): OutlineHea
       kept.push(heading);
       continue;
     }
-    if ((labelPages.get(heading.label.toLocaleLowerCase())?.size ?? 0) >= REPEATED_LABEL_PAGES) continue;
+    const labelKey = heading.label.toLocaleLowerCase();
+    if ((labelPages.get(labelKey)?.size ?? 0) >= REPEATED_LABEL_PAGES) {
+      if (seenRepeated.has(labelKey)) continue;
+      seenRepeated.add(labelKey);
+    }
     kept.push(heading);
   }
   return kept;
@@ -289,21 +296,27 @@ function collectAnchors(bodyHeadings: readonly OutlineHeading[]): OutlineAnchors
 
 export type PrintedPageVote = { page: number; printed: number };
 
-/** 印刷页码 → PDF 页码偏移投票：印刷页码观测（每页一块的 page_number 块、原生孤立数字行）
- *  与正文锚点（真标题页减目录行印刷页码）汇入同一多数派——密集页脚票主导，锚点票补位，
- *  章节重启页码产生的杂音被「多数派 + 最少票数阈值」吸收；目录页自身的页码块也是合法票。
- *  锚点两路：序数身份（章/节 key）优先，剥前缀标题（「窃(qiè)读记」对「1 窃读记」）兜底；
- *  每行只投一票——序数票与标题票同源时不是独立观测。 */
+/** 印刷页码 → PDF 页码偏移解算（锚点一致性择峰，T58-02）。票分三类：
+ *  正文锚点票（真标题页 − 目录行印刷页码，地面真值——序数身份优先、剥前缀标题兜底、
+ *  每行只投一票）、正文页脚票（page_number 块 / 原生孤立数字行）、目录页自身页脚票
+ *  （独立编号序列，污染源）。裁定序：锚点多数簇（锚点与票簇冲突听锚点；锚点簇的
+ *  平票与阈值都不引目录票——污染源不得反客为主）→ 正文页脚多数簇 → 目录页脚兜底
+ *  （前两类全缺的老书场景，阈值计目录票）。多峰书（分部重启页码）与长前言序列由此吸收。 */
 function resolvePageOffset(
   tocRows: readonly TocRow[],
   anchors: OutlineAnchors,
   printedVotes: readonly PrintedPageVote[] = [],
+  tocPageSet: ReadonlySet<number> = new Set(),
 ): number | undefined {
-  const votes = new Map<number, number>();
-  const vote = (offset: number) => votes.set(offset, (votes.get(offset) ?? 0) + 1);
+  const support = new Map<number, { anchor: number; body: number; toc: number }>();
+  const tally = (offset: number, kind: "anchor" | "body" | "toc") => {
+    const entry = support.get(offset) ?? { anchor: 0, body: 0, toc: 0 };
+    entry[kind] += 1;
+    support.set(offset, entry);
+  };
   for (const observed of printedVotes) {
     if (Number.isSafeInteger(observed.printed) && observed.printed >= 0 && observed.page >= 1) {
-      vote(observed.page - observed.printed);
+      tally(observed.page - observed.printed, tocPageSet.has(observed.page) ? "toc" : "body");
     }
   }
   let chapterScope = 0;
@@ -315,14 +328,60 @@ function resolvePageOffset(
     const title = outlineTitleKey(row.label);
     const titleAnchor = title ? anchors.byTitle.get(title) : undefined;
     const anchorPage = ordinalAnchor ?? titleAnchor;
-    if (anchorPage !== undefined) vote(anchorPage - row.printedPage);
+    if (anchorPage !== undefined) tally(anchorPage - row.printedPage, "anchor");
   }
-  let bestOffset: number | undefined;
-  let bestVotes = 0;
-  for (const [offset, count] of votes) {
-    if (count > bestVotes) { bestVotes = count; bestOffset = offset; }
+  // 类内多数簇；平票以锚点票 + 正文票合计破平（锚点/正文裁定时），目录兜底时以目录票破平。
+  const pluralityOf = (kind: "anchor" | "body" | "toc"): number | undefined => {
+    let best: { offset: number; classVotes: number; total: number } | undefined;
+    for (const [offset, entry] of support) {
+      const classVotes = entry[kind];
+      if (classVotes <= 0) continue;
+      const total = kind === "toc" ? entry.toc : entry.anchor + entry.body;
+      if (!best || classVotes > best.classVotes || (classVotes === best.classVotes && total > best.total)) {
+        best = { offset, classVotes, total };
+      }
+    }
+    return best?.offset;
+  };
+  const confirmed = (offset: number | undefined, kind: "anchor" | "body" | "toc"): number | undefined => {
+    if (offset === undefined) return undefined;
+    const entry = support.get(offset)!;
+    const confirming = kind === "toc" ? entry.toc : entry.anchor + entry.body;
+    return confirming >= MIN_OFFSET_VOTES ? offset : undefined;
+  };
+  return confirmed(pluralityOf("anchor"), "anchor")
+    ?? confirmed(pluralityOf("body"), "body")
+    ?? confirmed(pluralityOf("toc"), "toc");
+}
+
+/** 栈式聚树（两档装配共用）：按 level 弹栈挂父；首个章之前的次级条目（目录排版上
+ *  组标/章标常落在其首批条目之后）待首个章落位后归入第一个章，无章时平铺保序。 */
+function assembleLevelTree(
+  entries: ReadonlyArray<{ label: string; page: number; level: number }>,
+  idPrefix: string,
+): BookOutlineNode[] {
+  const roots: BookOutlineNode[] = [];
+  const orphans: BookOutlineNode[] = [];
+  const stack: BookOutlineNode[] = [];
+  let sequence = 0;
+  for (const entry of entries) {
+    const node: BookOutlineNode = { id: `${idPrefix}-${++sequence}`, label: entry.label, page: entry.page, children: [] };
+    while (stack.length >= entry.level) stack.pop();
+    if (stack.length > 0) {
+      stack[stack.length - 1]!.children.push(node);
+      stack.push(node);
+    } else if (entry.level === 1) {
+      roots.push(node);
+      stack.push(node);
+    } else {
+      orphans.push(node);
+    }
   }
-  return bestVotes >= MIN_OFFSET_VOTES ? bestOffset : undefined;
+  if (orphans.length > 0 && roots.length > 0) {
+    roots[0]!.children = [...orphans, ...roots[0]!.children];
+    return roots;
+  }
+  return [...orphans, ...roots];
 }
 
 function buildTocNodes(
@@ -366,40 +425,22 @@ function buildTocNodes(
     }
     return entry;
   });
-  const roots: BookOutlineNode[] = [];
-  const orphans: BookOutlineNode[] = [];
-  const stack: BookOutlineNode[] = [];
-  let sequence = 0;
-  for (const entry of resolved) {
-    if (!inRange(entry.page)) continue;
-    const node: BookOutlineNode = { id: `toc-${++sequence}`, label: entry.label, page: entry.page, children: [] };
-    while (stack.length >= entry.level) stack.pop();
-    if (stack.length > 0) {
-      stack[stack.length - 1]!.children.push(node);
-      stack.push(node);
-    } else if (entry.level === 1) {
-      roots.push(node);
-      stack.push(node);
-    } else {
-      // 首个章之前的次级条目（目录排版上组标/章标常落在其首批条目之后）：待首个章落位后归入。
-      orphans.push(node);
-    }
-  }
-  // 首个章之前的次级条目（目录排版上组标/章标常落在其首批条目之后）归入第一个章。
-  if (orphans.length > 0 && roots.length > 0) {
-    const first = roots[0]!;
-    first.children = [...orphans, ...first.children];
-    return roots;
-  }
-  return [...orphans, ...roots];
+  return assembleLevelTree(
+    resolved.flatMap((entry) => (inRange(entry.page) ? [{ label: entry.label, page: entry.page!, level: entry.level }] : [])),
+    "toc",
+  );
 }
 
 /** 目录页定位输入：一页的文本行（原生文本行或识别块拆行）、是否含布局模型标记的 index 块、
  *  该页是否可判定（有原生文本或已有识别结果——空白页的空识别结果也算已判定）。 */
 export type TocLocatorPageInput = { page: number; lines: readonly string[]; hasIndexBlock: boolean; covered: boolean };
 
-export const TOC_PROBE_WINDOW_PAGES = 30;
-export const TOC_YIELD_GAP_PAGES = 2;
+const TOC_PROBE_WINDOW_PAGES = 30;
+
+/** 探测窗口末端（窗口常量与书页数的单一出口）：证据闸门与目录定位共用。 */
+function tocWindowEnd(pageCount: number) {
+  return Math.min(pageCount, TOC_PROBE_WINDOW_PAGES);
+}
 const TOC_TEXT_LINE_CAP = 80;
 const TOC_DENSITY_MIN_LINES = 4;
 const TOC_MIN_LEADER_LINES = 3;
@@ -450,36 +491,6 @@ export function locateTocPages(inputs: readonly TocLocatorPageInput[]): { hits: 
   };
 }
 
-export type OutlineYieldProbePage = { page: number; hasIndexBlock: boolean };
-
-/** 让位判定（纯函数，只看块库状态）：目录数据就绪即让位，扫描不必等全书——
- *  1. run-end：探测窗口内最后一个 index 页 M 之后的 g 页全部已扫且无 index 块 → 目录区已结束；
- *  2. 窗口覆盖：窗口内页面全部已扫（无 index 也放行——密度兜底与「零调用」路径都需要这次机会）。
- *  scannedCount 为线性页序已扫描页数；pages 必须覆盖整个探测窗口，窗口外页与本判定无关。
- *  碎片化目录（间隔超过 g 页）由模型续点回报兜住，早触发不损失完整性。 */
-export function shouldYieldToOutline(
-  pages: readonly OutlineYieldProbePage[],
-  scannedCount: number,
-  pageCount: number,
-): boolean {
-  const windowEnd = Math.min(pageCount, TOC_PROBE_WINDOW_PAGES);
-  if (windowEnd <= 0) return false;
-  if (scannedCount >= windowEnd) return true;
-  const indexByPage = new Map(pages.map((page) => [page.page, page.hasIndexBlock]));
-  let lastIndex = 0;
-  for (const page of pages) {
-    if (page.hasIndexBlock) lastIndex = Math.max(lastIndex, page.page);
-  }
-  if (lastIndex === 0) return false;
-  const end = Math.min(lastIndex + TOC_YIELD_GAP_PAGES, windowEnd);
-  for (let page = lastIndex + 1; page <= end; page += 1) {
-    if (!indexByPage.has(page)) return false;
-    if (page > scannedCount) return false;
-    if (indexByPage.get(page)) return false;
-  }
-  return true;
-}
-
 /** 单调性修复：目录条目页码沿阅读序应非递减，错锚/偏移漂移造成的倒挂按前值下限钳制。 */
 export function repairOutlineMonotonicity(nodes: readonly BookOutlineNode[]): BookOutlineNode[] {
   let last = 0;
@@ -522,25 +533,10 @@ const MIN_BODY_OUTLINE_ROOTS = 3;
  *  顶层序数章不足时宁缺毋滥输出空。 */
 export function assembleBodyHeadingOutline(headings: readonly OutlineHeading[]): AssembledOutline {
   const usable = suppressRunningHeaders(headings).filter((heading) => isAdmittedBodyHeading(heading.label));
-  const roots: BookOutlineNode[] = [];
-  const orphans: BookOutlineNode[] = [];
-  const stack: BookOutlineNode[] = [];
-  let sequence = 0;
-  for (const heading of usable) {
-    const level = explicitLevel(heading.label) ?? 1;
-    const node: BookOutlineNode = { id: `body-${++sequence}`, label: heading.label, page: heading.page, children: [] };
-    while (stack.length >= level) stack.pop();
-    if (stack.length > 0) {
-      stack[stack.length - 1]!.children.push(node);
-      stack.push(node);
-    } else if (level === 1) {
-      roots.push(node);
-      stack.push(node);
-    } else {
-      orphans.push(node);
-    }
-  }
-  if (orphans.length > 0 && roots.length > 0) roots[0]!.children = [...orphans, ...roots[0]!.children];
+  const roots = assembleLevelTree(
+    usable.map((heading) => ({ label: heading.label, page: heading.page, level: explicitLevel(heading.label) ?? 1 })),
+    "body",
+  );
   const spine = roots
     .map((root) => parseOutlineOrdinal(root.label))
     .filter((ordinal): ordinal is NonNullable<typeof ordinal> => ordinal !== undefined)
@@ -552,17 +548,19 @@ export function assembleBodyHeadingOutline(headings: readonly OutlineHeading[]):
   return { nodes: repairOutlineMonotonicity(roots), strategy: "body_headings" };
 }
 
-/** 全书装配：AI 目录行 + 正文锚点投票解算偏移；偏移不可信（锚点不足）时输出空目录等 OCR 补全后重算。 */
+/** 全书装配：AI 目录行 + 正文锚点投票解算偏移（tocPages 标出目录页——其页脚票降级）；
+ *  偏移不可信（锚点不足）时输出空目录等 OCR 补全后重算。 */
 export function assembleOutline(
   headings: readonly OutlineHeading[],
   tocRows: readonly TocRow[],
   pageCount: number,
   printedVotes: readonly PrintedPageVote[] = [],
+  tocPages: ReadonlySet<number> = new Set(),
 ): AssembledOutline {
   const bodyHeadings = suppressRunningHeaders(headings);
   if (tocRows.length === 0) return { nodes: [], strategy: "empty" };
   const anchors = collectAnchors(bodyHeadings);
-  const offset = resolvePageOffset(tocRows, anchors, printedVotes);
+  const offset = resolvePageOffset(tocRows, anchors, printedVotes, tocPages);
   if (offset === undefined) return { nodes: [], strategy: "empty" };
   return { nodes: repairOutlineMonotonicity(buildTocNodes(tocRows, offset, pageCount, anchors)), strategy: "ai_toc" };
 }
@@ -591,15 +589,15 @@ const PAGE_NUMBER_LINE_PATTERN = /^(?:第?\s*\d+\s*页|page\s+\d+(?:\s+of\s+\d+)
 
 /** 页文本行（定位与 AI 载荷共用）：OCR 页按块拆行，原生页用文本行。 */
 function pageTextLines(
-  source: "native" | "ocr" | "empty",
+  source: PageTextSource,
   lines: readonly OutlineTextLine[],
   blocks: ReadonlyArray<MineruBlock> | undefined,
 ): string[] {
   return source === "ocr" ? blockTextLines(blocks) : lines.map((line) => normalizeLabel(line.text));
 }
 
-/** index 块判定（布局模型的目录页签名）：定位器与 OCR 让位探针共用同一谓词。 */
-export function hasIndexBlock(blocks: ReadonlyArray<MineruBlock> | undefined): boolean {
+/** index 块判定（布局模型的目录页签名）：页文本快照的定位信号。 */
+function hasIndexBlock(blocks: ReadonlyArray<MineruBlock> | undefined): boolean {
   return (blocks ?? []).some((block) => block?.type === "index");
 }
 
@@ -607,12 +605,33 @@ export function hasIndexBlock(blocks: ReadonlyArray<MineruBlock> | undefined): b
 function selectPageText(
   native: OutlineTextLine[],
   blocks: ReadonlyArray<MineruBlock> | undefined,
-): { lines: OutlineTextLine[]; source: "native" | "ocr" | "empty" } {
+): { lines: OutlineTextLine[]; source: PageTextSource } {
   const nativeTextLength = native
     .filter((line) => !PAGE_NUMBER_LINE_PATTERN.test(normalizeLabel(line.text)))
     .reduce((total, line) => total + normalizeLabel(line.text).length, 0);
   const lines = nativeTextLength >= 16 || !blocks || blocks.length === 0 ? native : recognizedLines(blocks);
   return { lines, source: lines.length === 0 ? "empty" : lines === native ? "native" : "ocr" };
+}
+
+/** 印刷页码观测（T57-05）：OCR 页的 page_number 块与原生页的孤立数字行——偏移投票的密集信号。 */
+function printedObservations(
+  source: PageTextSource,
+  lines: readonly OutlineTextLine[],
+  blocks: ReadonlyArray<MineruBlock> | undefined,
+): number[] {
+  if (source === "ocr") {
+    const printed: number[] = [];
+    for (const block of blocks ?? []) {
+      if (block?.type !== "page_number") continue;
+      const parsed = Number(String(block.text ?? "").match(/\d{1,4}/)?.[0]);
+      if (Number.isSafeInteger(parsed)) printed.push(parsed);
+    }
+    return printed;
+  }
+  if (source === "native") {
+    return lines.flatMap((line) => (/^\d{1,4}$/.test(normalizeLabel(line.text)) ? [Number(line.text)] : []));
+  }
+  return [];
 }
 
 type PdfDocument = Awaited<ReturnType<typeof getDocument>["promise"]>;
@@ -809,6 +828,11 @@ export function createBookOutlineModule(
       entries_json TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS book_outline_gate (
+      book_id TEXT PRIMARY KEY,
+      version INTEGER NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
   // 既有库补列：目录来源（T57-05）。
   const outlineColumns = database.prepare("PRAGMA table_info(book_outlines)").all() as Array<{ name: string }>;
@@ -881,39 +905,85 @@ export function createBookOutlineModule(
     return value === "embedded" || value === "ai_toc" || value === "body_headings" ? value : "empty";
   }
 
+  /** 第一档已裁决标记（无内嵌或垃圾书签）：让开书快检不必每次重复解析书签开 PDF。
+   *  证据闸门拦下的重建也落此标记——扫描书在整书完成前不写候选，标记是「管线已看过
+   *  第一档」的唯一痕迹。版本不符视为未裁决。 */
+  function markTierOneAdjudicated(bookId: string) {
+    if (!BOOK_ID_PATTERN.test(bookId)) return;
+    database.prepare(`
+      INSERT INTO book_outline_gate (book_id, version, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(book_id) DO UPDATE SET version = excluded.version, updated_at = excluded.updated_at
+    `).run(bookId, OUTLINE_VERSION, new Date().toISOString());
+  }
+
+  function tierOneAdjudicated(bookId: string): boolean {
+    if (!BOOK_ID_PATTERN.test(bookId)) return false;
+    return database.prepare("SELECT 1 FROM book_outline_gate WHERE book_id = ? AND version = ?").get(bookId, OUTLINE_VERSION) !== undefined;
+  }
+
+  /** 目录失效：页级失效只清该页候选——已落库目录保留到下一次重建整体替换（早出的
+   *  目录不因后续页识别被清空，渐进改善而非清空重现）；整表失效才连目录与 AI 结论一起清。 */
   function invalidate(bookId: string, page?: number) {
     if (!BOOK_ID_PATTERN.test(bookId)) return;
-    database.prepare("DELETE FROM book_outlines WHERE book_id = ?").run(bookId);
-    if (page && Number.isSafeInteger(page) && page > 0) {
+    if (page !== undefined && Number.isSafeInteger(page) && page > 0) {
       database.prepare("DELETE FROM book_outline_pages WHERE book_id = ? AND page = ?").run(bookId, page);
-    } else {
-      database.prepare("DELETE FROM book_outline_pages WHERE book_id = ?").run(bookId);
-      database.prepare("DELETE FROM book_outline_ai WHERE book_id = ?").run(bookId);
+      return;
     }
+    database.prepare("DELETE FROM book_outlines WHERE book_id = ?").run(bookId);
+    database.prepare("DELETE FROM book_outline_pages WHERE book_id = ?").run(bookId);
+    database.prepare("DELETE FROM book_outline_ai WHERE book_id = ?").run(bookId);
     options.onOutlineChange?.(bookId);
   }
 
-  /** 探测窗口内的目录信号定位：index 块命中，无命中时密度兜底。AI 是否可调用由
-   *  「让位判定」裁定（run-end 或窗口覆盖齐，复用 shouldYieldToOutline）——让位提前
-   *  触发的目录任务在窗口未扫满时也能提取；候选页裁到已覆盖前缀内。 */
+  /** 页文本快照：一页的选源结果与派生信号（拆行文本、index 有无、印刷页码观测、可判定性）。
+   *  定位器、AI 载荷与页候选循环共用同一份取数，「原生 → 识别块 → 选源」只此一处。 */
+  async function readPageTextSnapshot(
+    bookId: string,
+    document: OutlineDocument,
+    page: number,
+  ): Promise<{
+    source: PageTextSource;
+    lines: OutlineTextLine[];
+    blocks: ReadonlyArray<MineruBlock> | undefined;
+    textLines: string[];
+    hasIndex: boolean;
+    printedPages: number[];
+    covered: boolean;
+  }> {
+    const native = await document.getNativeLines(page);
+    const blocks = options.readRecognizedBlocks?.(bookId, page);
+    const { lines, source } = selectPageText(native, blocks);
+    return {
+      source,
+      lines,
+      blocks,
+      textLines: pageTextLines(source, lines, blocks),
+      hasIndex: hasIndexBlock(blocks),
+      printedPages: printedObservations(source, lines, blocks),
+      // 空白页的空识别结果也算已判定（有原生文本或已有识别结果）。
+      covered: native.length > 0 || blocks !== undefined,
+    };
+  }
+
+  /** 探测窗口内的目录信号定位：index 块命中，无命中时密度兜底；候选页裁到已覆盖前缀内。
+   *  windowCovered 是证据闸门（T58）：窗口内每页都可判定（有原生文本或已有识别结果）——
+   *  未覆盖即证据不足，调用方不得下任何结论。原生书例外放宽：窗口过半页有原生文本时，
+   *  无文本页视为原生书的空白分页页（无信号可言），整窗即刻可判——否则没装 OCR 资源的
+   *  原生书会被一页空白卡死（spec 故事 18）。 */
   async function locateTocCandidates(
     bookId: string,
     document: OutlineDocument,
     signal?: AbortSignal,
-  ): Promise<{ hits: number[]; pages: number[]; adjudicated: boolean }> {
-    const windowEnd = Math.min(document.pageCount, TOC_PROBE_WINDOW_PAGES);
+  ): Promise<{ hits: number[]; pages: number[]; windowCovered: boolean }> {
+    const windowEnd = tocWindowEnd(document.pageCount);
     const inputs: TocLocatorPageInput[] = [];
+    let nativePages = 0;
     for (let page = 1; page <= windowEnd; page += 1) {
       if (signal?.aborted) break;
-      const native = await document.getNativeLines(page);
-      const blocks = options.readRecognizedBlocks?.(bookId, page);
-      const { lines, source } = selectPageText(native, blocks);
-      inputs.push({
-        page,
-        lines: pageTextLines(source, lines, blocks),
-        hasIndexBlock: hasIndexBlock(blocks),
-        covered: native.length > 0 || blocks !== undefined,
-      });
+      const snapshot = await readPageTextSnapshot(bookId, document, page);
+      if (snapshot.covered && snapshot.source === "native") nativePages += 1;
+      inputs.push({ page, lines: snapshot.textLines, hasIndexBlock: snapshot.hasIndex, covered: snapshot.covered });
     }
     const located = locateTocPages(inputs);
     let coveredPrefix = 0;
@@ -921,24 +991,20 @@ export function createBookOutlineModule(
       if (!input.covered) break;
       coveredPrefix += 1;
     }
+    const windowCovered = coveredPrefix >= windowEnd || nativePages >= Math.ceil(windowEnd / 2);
     return {
       hits: located.hits,
-      pages: located.pages.filter((page) => page <= coveredPrefix),
-      adjudicated: shouldYieldToOutline(
-        inputs.map(({ page, hasIndexBlock }) => ({ page, hasIndexBlock })),
-        coveredPrefix,
-        document.pageCount,
-      ),
+      // 窗口可判时候选页取全集（空白分页页之后的命中不再被前缀裁掉）；不可判时按前缀裁剪。
+      pages: windowCovered ? located.pages : located.pages.filter((page) => page <= coveredPrefix),
+      windowCovered,
     };
   }
 
   /** 目录候选页的逐页识别文字（随图附给模型）；行数上限防载荷失控。 */
   async function readTocPageText(bookId: string, document: OutlineDocument, page: number): Promise<TocPageText> {
-    const native = await document.getNativeLines(page);
-    const blocks = options.readRecognizedBlocks?.(bookId, page);
-    const { lines, source } = selectPageText(native, blocks);
-    const textLines = pageTextLines(source, lines, blocks).slice(0, TOC_TEXT_LINE_CAP);
-    return { page, lines: textLines, source: textLines.length === 0 || source === "empty" ? "none" : source };
+    const snapshot = await readPageTextSnapshot(bookId, document, page);
+    const textLines = snapshot.textLines.slice(0, TOC_TEXT_LINE_CAP);
+    return { page, lines: textLines, source: textLines.length === 0 || snapshot.source === "empty" ? "empty" : snapshot.source };
   }
 
   async function rebuild(
@@ -960,40 +1026,46 @@ export function createBookOutlineModule(
         return { status: "embedded" as const, nodes: embeddedNodes, processedPages: 0, totalPages: document.pageCount };
       }
       // 闸门拒收（无书签或垃圾书签）的书签树直接弃用不留兜底，降第二档。
+      // 证据闸门（T58）：探测窗口未覆盖（有页既无原生文本也无识别结果）时不下结论——
+      // 零 AI 调用、不写页候选、不落库，静默返回未完成，等整书识别后的收尾重排。原生书
+      // 窗口即刻覆盖（开书秒级结论）；扫描书开书空转一次即退，OCR 独占跑到完成。
+      const incomplete = () => (
+        { status: "partial" as const, nodes: get(bookId) ?? [], processedPages: 0, totalPages: document.pageCount }
+      );
+      const located = await locateTocCandidates(bookId, document, signal);
+      if (signal?.aborted || !located.windowCovered) {
+        markTierOneAdjudicated(bookId);
+        return incomplete();
+      }
       // AI 目录：成功结论（含「无目录」）入库缓存；失败（无模型/网络）不缓存，下次打开自动重试。
       let aiCache = readAiEntries(bookId);
-      let tocSignalPages: number[] = [];
-      if (!aiCache && options.aiOutline) {
-        const located = await locateTocCandidates(bookId, document, signal);
-        tocSignalPages = located.hits;
-        // 只在让位判定成立（run-end 或窗口覆盖齐）且有定位命中时调用模型。未裁定
-        // （OCR 在途/失败）不缓存、无定位信号不调模型——缓存里只存模型结论。
-        if (located.adjudicated && located.pages.length > 0) {
-          try {
-            const result = await generateAiOutline({
-              pageCount: document.pageCount,
-              candidatePages: located.pages,
-              readPageText: (page) => readTocPageText(bookId, document, page),
-              renderPage: (page, scale) => options.aiOutline!.renderPage(bookId, page, scale),
-              complete: options.aiOutline.complete,
-              signal,
-            });
-            // 中止的半成品不当结论缓存——否则「无目录」会被永久固化。
-            if (result.aborted) {
-              return { status: "partial" as const, nodes: get(bookId) ?? [], processedPages: 0, totalPages: document.pageCount };
-            }
-            aiCache = { entries: result.hasToc ? result.entries : [], tocPages: result.tocPages };
-            writeAiEntries(bookId, aiCache);
-          } catch (error) {
-            console.warn("AI 目录提取失败，本次降级为空目录。", error);
-            aiCache = { entries: [], tocPages: [] };
-          }
+      const tocSignalPages = located.hits;
+      if (!aiCache && options.aiOutline && located.pages.length > 0) {
+        try {
+          const result = await generateAiOutline({
+            pageCount: document.pageCount,
+            candidatePages: located.pages,
+            readPageText: (page) => readTocPageText(bookId, document, page),
+            renderPage: (page, scale) => options.aiOutline!.renderPage(bookId, page, scale),
+            complete: options.aiOutline.complete,
+            signal,
+          });
+          // 中止的半成品不当结论缓存——否则「无目录」会被永久固化。
+          if (result.aborted) return incomplete();
+          aiCache = { entries: result.hasToc ? result.entries : [], tocPages: result.tocPages };
+          writeAiEntries(bookId, aiCache);
+        } catch (error) {
+          // 失败≠判无：模型调不起来（无模型/网络/解析失败）不下任何结论——不缓存、
+          // 不降第三档，保留现有目录，下次重建自动重试（spec 故事 22）。
+          console.warn("AI 目录提取失败，保留现有目录，下次重建自动重试。", error);
+          return incomplete();
         }
       }
       const tocPageSet = new Set([...tocSignalPages, ...(aiCache?.tocPages ?? [])]);
-      if (signal?.aborted) {
-        return { status: "partial" as const, nodes: get(bookId) ?? [], processedPages: 0, totalPages: document.pageCount };
-      }
+      if (signal?.aborted) return incomplete();
+      // 投票分类集用候选页全集（含 ±1 边距）：边距页的页脚更可能是目录序列的延续，
+      // 按目录票降级；标题排除仍只信真实命中——边距页的正文标题不被吞（T57-03 语义）。
+      const voteTocPages = new Set([...located.pages, ...(aiCache?.tocPages ?? [])]);
       // 检测逻辑随版本演进：载荷版本不一致（含旧版中断残留）时整体作废重算。
       const newestPayload = database.prepare(
         "SELECT candidates_json FROM book_outline_pages WHERE book_id = ? ORDER BY page DESC LIMIT 1",
@@ -1018,31 +1090,15 @@ export function createBookOutlineModule(
       `);
       for (let page = processedPages + 1; page <= document.pageCount; page += 1) {
         if (signal?.aborted) break;
-        const native = await document.getNativeLines(page);
-        const blocks = options.readRecognizedBlocks?.(bookId, page);
-        const { lines, source } = selectPageText(native, blocks);
-        // 印刷页码观测（T57-05）：OCR 的 page_number 块与原生孤立数字行——偏移投票的密集信号。
-        const pagePrinted: number[] = [];
-        if (source === "ocr") {
-          for (const block of blocks ?? []) {
-            if (block?.type !== "page_number") continue;
-            const parsed = Number(String(block.text ?? "").match(/\d{1,4}/)?.[0]);
-            if (Number.isSafeInteger(parsed)) pagePrinted.push(parsed);
-          }
-        } else if (source === "native") {
-          for (const line of lines) {
-            const text = normalizeLabel(line.text);
-            if (/^\d{1,4}$/.test(text)) pagePrinted.push(Number(text));
-          }
-        }
+        const snapshot = await readPageTextSnapshot(bookId, document, page);
         // 目录页不参与正文标题锚点——否则章/节锚点会全落在目录页本身。
         // OCR 页标题候选走布局模型判定（T57-06），原生页维持字号检测。
         const headings = tocPageSet.has(page)
           ? []
-          : source === "ocr"
-            ? detectRecognizedHeadings(page, blocks)
-            : detectHeadingCandidates(page, lines);
-        upsert.run(bookId, page, JSON.stringify({ v: OUTLINE_VERSION, headings, printed: pagePrinted }), source, new Date().toISOString());
+          : snapshot.source === "ocr"
+            ? detectRecognizedHeadings(page, snapshot.blocks)
+            : detectHeadingCandidates(page, snapshot.lines);
+        upsert.run(bookId, page, JSON.stringify({ v: OUTLINE_VERSION, headings, printed: snapshot.printedPages }), snapshot.source, new Date().toISOString());
         processedPages = page;
         onProgress?.(processedPages, document.pageCount);
       }
@@ -1060,7 +1116,7 @@ export function createBookOutlineModule(
         headings.push(...payload.headings);
         for (const printed of payload.printed) printedVotes.push({ page: row.page, printed });
       }
-      const assembled = assembleOutline(headings, aiCache?.entries ?? [], document.pageCount, printedVotes);
+      const assembled = assembleOutline(headings, aiCache?.entries ?? [], document.pageCount, printedVotes, voteTocPages);
       let nodes = assembled.nodes;
       let strategy: BookOutlineStrategy = assembled.strategy;
       if (strategy === "empty") {
@@ -1081,8 +1137,8 @@ export function createBookOutlineModule(
   }
 
   /** 读路径快检（第一档开书即得）：缓存未命中时同步解析内嵌书签（不渲染页面），
-   *  过质量闸门即落库返回；无内嵌或垃圾书签返回 undefined。目录管线已越过第一档
-   *  （AI 缓存或页候选在库）时不再重复开书——内嵌有无已被裁决。 */
+   *  过质量闸门即落库返回；无内嵌或垃圾书签落「已裁决」标记后返回 undefined。
+   *  目录管线已越过第一档（AI 缓存、页候选或裁决标记在库）时不再重复开书。 */
   async function ensureEmbedded(
     bookId: string,
     loadBook: () => Promise<{ bytes: Uint8Array; password?: string }>,
@@ -1090,13 +1146,17 @@ export function createBookOutlineModule(
     if (!BOOK_ID_PATTERN.test(bookId)) return undefined;
     const cached = get(bookId);
     if (cached !== undefined) return cached;
-    const adjudicated = readAiEntries(bookId) !== undefined
+    const pipelinePastTierOne = readAiEntries(bookId) !== undefined
+      || tierOneAdjudicated(bookId)
       || ((database.prepare("SELECT COUNT(*) AS count FROM book_outline_pages WHERE book_id = ?").get(bookId) as { count: number }).count > 0);
-    if (adjudicated) return undefined;
+    if (pipelinePastTierOne) return undefined;
     const document = await openDocument(await loadBook());
     try {
       const nodes = await document.getEmbeddedNodes();
-      if (!evaluateEmbeddedOutline(nodes, document.pageCount).accepted) return undefined;
+      if (!evaluateEmbeddedOutline(nodes, document.pageCount).accepted) {
+        markTierOneAdjudicated(bookId);
+        return undefined;
+      }
       persistOutline(bookId, nodes, document.pageCount, "embedded");
       options.onOutlineChange?.(bookId);
       return nodes;
@@ -1112,11 +1172,12 @@ export function createBookOutlineModule(
     rebuild,
     ensureEmbedded,
 
-    /** 每书数据清理钩子：在调用方提供的连接上删除本书生成目录、页候选与 AI 目录缓存。 */
+    /** 每书数据清理钩子：在调用方提供的连接上删除本书生成目录、页候选、AI 目录缓存与裁决标记。 */
     deleteBookData(bookId: string, connection: DatabaseSync) {
       connection.prepare("DELETE FROM book_outlines WHERE book_id = ?").run(bookId);
       connection.prepare("DELETE FROM book_outline_pages WHERE book_id = ?").run(bookId);
       connection.prepare("DELETE FROM book_outline_ai WHERE book_id = ?").run(bookId);
+      connection.prepare("DELETE FROM book_outline_gate WHERE book_id = ?").run(bookId);
     },
 
     close() { database.close(); },

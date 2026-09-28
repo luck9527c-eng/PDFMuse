@@ -28,13 +28,8 @@ import {
   createBookOutlineModule,
   findOutlineChapterRange,
   findOutlineSectionPath,
-  hasIndexBlock,
-  shouldYieldToOutline,
-  TOC_PROBE_WINDOW_PAGES,
-  TOC_YIELD_GAP_PAGES,
-  type OutlineYieldProbePage,
 } from "./book-outline.js";
-import { linearPageOrder } from "./ocr-page-order.js";
+import { createOcrJobExecutor } from "./ocr-job.js";
 import { createReaderProfileModule } from "./reader-profile.js";
 import { createAppearanceSettingsModule } from "./appearance-settings.js";
 import type {
@@ -62,9 +57,6 @@ let closeBookIndex: (() => void) | undefined;
 let closeOcr: (() => void) | undefined;
 let closeBackgroundJobs: (() => void) | undefined;
 let closeBookOutline: (() => void) | undefined;
-// 让位一次性登记（按任务 id）：probe 判定只看块库状态，同任务续跑后条件仍成立，
-// 不登记会让「让位 → 续跑 → 再让位」成为循环。任务 id 每次调度唯一，集合不增长。
-const yieldedOcrJobs = new Set<string>();
 
 // 组装根唯一的窗口广播：agent 事件与后台状态推送共用同一遍历（ADR-0008 泛化 agent broadcast）。
 function broadcastToWindows(channel: string, payload: unknown) {
@@ -236,68 +228,19 @@ app.whenReady().then(async () => {
         const stats = bookIndex.stats(job.bookId);
         context.checkpoint(`page:${stats.indexedPages}`, stats.indexedPages, stats.totalPages);
       },
-      ocr: async (job, context) => {
-        const book = library.list().find((item) => item.id === job.bookId);
-        if (!book) throw new Error("当前 PDF 书籍不可用。");
-        const { completed } = ingestion.decodeOcrCheckpoint(job.checkpoint);
-        const pages = linearPageOrder(book.pageCount);
-        // 弹性池动态派页（T49）：至多 N 页在途；断点只推进连续前沿——前沿之前必然已落库，
-        // 前沿之后的在途页崩溃后按缓存缺失自然重扫。线性页序（T57-02）下断点即「已扫到第几页」。
-        const limit = mineruEngine.concurrency;
-        const frontier = ingestion.createOcrFrontier(completed);
-        let written = completed;
-        let nextIndex = completed;
-        let failure: string | undefined;
-        const inFlight = new Set<Promise<void>>();
-        // 目录数据就绪即让位（T57-04）：run-end（目录区结束）或探测窗口扫满，二者取先。
-        // 判定只在前沿推进后做一次性检查，越过窗口 + gap 后不可能再触发。
-        const windowEnd = Math.min(book.pageCount, TOC_PROBE_WINDOW_PAGES);
-        const maybeYieldToOutline = (reached: number) => {
-          if (yieldedOcrJobs.has(job.id)) return;
-          if (reached > windowEnd + TOC_YIELD_GAP_PAGES) return;
-          const probe: OutlineYieldProbePage[] = [];
-          for (let page = 1; page <= windowEnd; page += 1) {
-            probe.push({ page, hasIndexBlock: hasIndexBlock(ocr.getPage(job.bookId, page)?.blocks) });
-          }
-          if (shouldYieldToOutline(probe, reached, book.pageCount)) {
-            yieldedOcrJobs.add(job.id);
-            context.yieldOnce();
-          }
-        };
-        const pump = () => {
-          while (!failure && !context.signal.aborted && inFlight.size < limit && nextIndex < pages.length) {
-            const index = nextIndex;
-            nextIndex += 1;
-            const task = (async () => {
-              if (context.signal.aborted) return;
-              const page = pages[index]!;
-              if (!ocr.isPageCompatible(job.bookId, page, MINERU_ENGINE_VERSION, MINERU_MODEL, MINERU_INPUT_VERSION)) {
-                const result = await ocr.recognizePage({ bookId: job.bookId, page, priority: "bulk" }, context.signal);
-                if (!result.ok) {
-                  if (!context.signal.aborted) failure = result.message;
-                  return;
-                }
-                await ingestion.ingestRecognizedPage(job.bookId, page, result.page.blocks, "background");
-              }
-              const reached = frontier.complete(index);
-              if (reached > written) {
-                written = reached;
-                context.checkpoint(ingestion.encodeOcrCheckpoint(reached), reached, book.pageCount);
-                maybeYieldToOutline(reached);
-              }
-            })().finally(() => {
-              inFlight.delete(task);
-              pump();
-            });
-            inFlight.add(task);
-          }
-        };
-        pump();
-        while (inFlight.size > 0) await Promise.all([...inFlight]);
-        if (context.signal.aborted) throw new Error("OCR 任务已暂停或取消。");
-        if (failure) throw new Error(failure);
-        if (!context.signal.aborted) ingestion.completeBookOcr(job.bookId);
-      },
+      // OCR 整书执行器（T58）：线性扫描、弹性池派页、断点前沿——不让位不并行，
+      // 整书完成后经收尾重排产出目录；依赖全注入，模块级测试覆盖断点与续跑。
+      ocr: createOcrJobExecutor({
+        loadBook: (bookId) => library.list().find((item) => item.id === bookId),
+        isPageCompatible: (bookId, page) => ocr.isPageCompatible(bookId, page, MINERU_ENGINE_VERSION, MINERU_MODEL, MINERU_INPUT_VERSION),
+        recognizePage: (input, signal) => ocr.recognizePage(input, signal),
+        ingestPage: (bookId, page, blocks) => ingestion.ingestRecognizedPage(bookId, page, blocks, "background"),
+        completeBook: (bookId) => ingestion.completeBookOcr(bookId),
+        decodeCheckpoint: ingestion.decodeOcrCheckpoint,
+        encodeCheckpoint: ingestion.encodeOcrCheckpoint,
+        createFrontier: ingestion.createOcrFrontier,
+        concurrency: mineruEngine.concurrency,
+      }),
       outline: async (job, context) => {
         const result = await bookOutline.rebuild(
           job.bookId,

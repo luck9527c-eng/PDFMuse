@@ -36,6 +36,7 @@ import type {
   AgentImageAttachment,
   AppearanceSettings,
   BackgroundJob,
+  BackgroundJobStatus,
   BookOutline,
   ConversationMessage,
   LibraryBook,
@@ -291,6 +292,16 @@ export function App() {
     return () => unsubscribe?.();
   }, []);
 
+  // 目录空态文案（T58）：扫描书目录时点 = 整书识别完成——识别进行中/已暂停各有其提示。
+  const resolveOutlineEmptyMessage = (outlineStatus: BackgroundJobStatus | undefined, ocrStatuses: BackgroundJobStatus[]) => {
+    if (outlineStatus === "running" || outlineStatus === "queued") return "正在分析章节结构...";
+    if (outlineStatus === "paused") return "目录补全已暂停。";
+    if (outlineStatus === "failed") return "暂时无法补全目录，请稍后重试。";
+    if (ocrStatuses.some((status) => status === "running" || status === "queued")) return "整书文字识别中，完成后生成目录。";
+    if (ocrStatuses.some((status) => status === "paused")) return "文字识别已暂停，恢复后完成即可生成目录。";
+    return "未检测到可用章节，可使用缩略图浏览。";
+  };
+
   const visibleBackgroundJobs = useMemo(() => {
     const rank: Record<BackgroundJob["status"], number> = {
       running: 0,
@@ -321,15 +332,10 @@ export function App() {
   // 目录单一来源：主进程解析（内嵌书签过闸落库，或 AI/正文识别生成），经读取快检与推送送达。
   const effectiveOutline = generatedOutline?.nodes ?? [];
   const outlineJob = backgroundJobs.find((job) => job.kind === "outline");
-  const outlineEmptyMessage = outlineJob?.status === "running" || outlineJob?.status === "queued"
-    ? "正在分析章节结构..."
-    : outlineJob?.status === "paused"
-      ? "目录补全已暂停。"
-      : outlineJob?.status === "failed"
-        ? "暂时无法补全目录，请稍后重试。"
-        : backgroundJobs.some((job) => job.kind === "ocr" && (job.status === "running" || job.status === "queued"))
-          ? "文字识别进行中，目录将随之生成。"
-          : "未检测到可用章节，可使用缩略图浏览。";
+  const outlineEmptyMessage = resolveOutlineEmptyMessage(
+    outlineJob?.status,
+    backgroundJobs.filter((job) => job.kind === "ocr").map((job) => job.status),
+  );
 
   const handleOpenResult = useCallback((result: OpenPdfBookResult, attemptedBookId?: string) => {
     if (result.ok) {

@@ -14,7 +14,6 @@ import {
   findOutlineSectionPath,
   locateTocPages,
   repairOutlineMonotonicity,
-  shouldYieldToOutline,
   type BookOutlineAiDeps,
   type OpenOutlineDocument,
   type OutlineHeading,
@@ -259,7 +258,8 @@ describe("book outline", () => {
     });
     closeOutline = outline.close;
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
-    expect(result).toMatchObject({ status: "generated", nodes: [] });
+    // 失败≠判无：不缓存、不降第三档、保留现状，本次以未完成收场。
+    expect(result).toMatchObject({ status: "partial", nodes: [] });
     // 失败不落缓存：下一次重建会重新调用模型。
     await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(calls).toBe(2);
@@ -304,7 +304,8 @@ describe("book outline", () => {
     expect(partial).toMatchObject({ status: "partial", processedPages: 1 });
     const completed = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(completed).toMatchObject({ status: "generated", processedPages: 3 });
-    expect(visited).toEqual([1, 2, 3]);
+    // 证据闸门使每次重建先读一遍探测窗口（3 页），页候选循环再续扫未持久化的页。
+    expect(visited).toEqual([1, 2, 3, 1, 1, 2, 3, 2, 3]);
   });
 
   it("discards stale page candidates when the outline version changes", async () => {
@@ -327,7 +328,8 @@ describe("book outline", () => {
     closeOutline = outline.close;
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(result).toMatchObject({ status: "generated", processedPages: 2 });
-    expect(visited).toEqual([1, 2]);
+    // 窗口闸门预读 [1,2]，过期载荷作废后候选循环全书重算 [1,2]。
+    expect(visited).toEqual([1, 2, 1, 2]);
     expect(outline.get(BOOK_ID)).toEqual([]);
   });
 
@@ -398,9 +400,9 @@ describe("book outline", () => {
     const loadBook = async () => ({ bytes: new Uint8Array() });
     await outline.rebuild(BOOK_ID, loadBook);
     expect(opened).toBe(1);
-    // 页级失效只删 book_outlines 行与单页候选，其余页候选与 AI 缓存仍在——管线已裁决第一档，快检不再开书。
+    // 页级失效只删该页候选，已落库目录保留（渐进改善不闪空）——管线已裁决第一档，快检不再开书。
     outline.invalidate(BOOK_ID, 1);
-    expect(await outline.ensureEmbedded(BOOK_ID, loadBook)).toBeUndefined();
+    expect(await outline.ensureEmbedded(BOOK_ID, loadBook)).toEqual([]);
     expect(opened).toBe(1);
   });
 
@@ -441,6 +443,131 @@ describe("book outline", () => {
     ]);
   });
 
+  it("absorbs chapter-restart printed-page peaks by majority voting", () => {
+    const tocRows: TocRow[] = [
+      { label: "第一章 函数", level: 1, printedPage: 1 },
+      { label: "1.1 概念", level: 2, printedPage: 2 },
+    ];
+    const headings: OutlineHeading[] = [
+      { label: "第一章 函数", page: 18, level: 1, explicit: true },
+    ];
+    // 主峰 offset=17（20 票密集页脚）；章节重启页码造出 offset=217 的次峰（4 票）——
+    // 多数派 + 最少票数阈值吸收次峰，不误判整档偏移。
+    const printedVotes = [
+      ...Array.from({ length: 20 }, (_, index) => ({ page: 18 + index, printed: 1 + index })),
+      ...Array.from({ length: 4 }, (_, index) => ({ page: 218 + index, printed: 1 + index })),
+    ];
+    const result = assembleOutline(headings, tocRows, 400, printedVotes);
+    expect(result.strategy).toBe("ai_toc");
+    expect(result.nodes).toMatchObject([
+      { label: "第一章 函数", page: 18, children: [{ label: "1.1 概念", page: 19 }] },
+    ]);
+  });
+
+  it("resolves the offset against anchors when toc-page footers vote a different sequence", () => {
+    const tocRows: TocRow[] = [
+      { label: "第一章 起点", level: 1, printedPage: 1 },
+      { label: "第二章 收束", level: 1, printedPage: 30 },
+    ];
+    const headings: OutlineHeading[] = [
+      { label: "第一章 起点", page: 10, level: 1, explicit: true },
+    ];
+    // 目录页 1~3 自带的页脚编号是独立序列（offset=0 ×3 票）；一个锚点 + 一张正文票
+    // 共同指向 offset=9——锚点一致性择峰不听目录页脚的多数。
+    const printedVotes = [
+      { page: 1, printed: 1 },
+      { page: 2, printed: 2 },
+      { page: 3, printed: 3 },
+      { page: 11, printed: 2 },
+    ];
+    const result = assembleOutline(headings, tocRows, 100, printedVotes, new Set([1, 2, 3]));
+    expect(result.strategy).toBe("ai_toc");
+    expect(result.nodes).toMatchObject([
+      { label: "第一章 起点", page: 10 },
+      { label: "第二章 收束", page: 39 },
+    ]);
+  });
+
+  it("anchors part-restart chapters exactly while the global offset follows the anchor plurality", () => {
+    // 多峰书（分部重启页码）：上半本 offset=10、下半本 offset=110。锚点多数簇定全局偏移，
+    // 第四 章（下半本印刷页 5）靠自身锚点精确落位，不被偏移换算到上半本的 15。
+    const tocRows: TocRow[] = [
+      { label: "第一章", level: 1, printedPage: 5 },
+      { label: "第二章", level: 1, printedPage: 25 },
+      { label: "第三章", level: 1, printedPage: 45 },
+      { label: "第四章", level: 1, printedPage: 5 },
+    ];
+    const headings: OutlineHeading[] = [
+      { label: "第一章", page: 15, level: 1, explicit: true },
+      { label: "第二章", page: 35, level: 1, explicit: true },
+      { label: "第三章", page: 55, level: 1, explicit: true },
+      { label: "第四章", page: 115, level: 1, explicit: true },
+    ];
+    const printedVotes = [
+      ...Array.from({ length: 20 }, (_, index) => ({ page: 15 + index, printed: 5 + index })),
+      ...Array.from({ length: 8 }, (_, index) => ({ page: 115 + index, printed: 5 + index })),
+    ];
+    const result = assembleOutline(headings, tocRows, 300, printedVotes);
+    expect(result.strategy).toBe("ai_toc");
+    expect(result.nodes).toMatchObject([
+      { label: "第一章", page: 15 },
+      { label: "第二章", page: 35 },
+      { label: "第三章", page: 55 },
+      { label: "第四章", page: 115 },
+    ]);
+  });
+
+  it("falls back to toc-page footer votes only when anchors and body votes are absent", () => {
+    const tocRows: TocRow[] = [{ label: "第一章", level: 1, printedPage: 4 }];
+    const printedVotes = [
+      { page: 1, printed: 1 },
+      { page: 2, printed: 2 },
+      { page: 3, printed: 3 },
+    ];
+    const result = assembleOutline([], tocRows, 50, printedVotes, new Set([1, 2, 3]));
+    expect(result.strategy).toBe("ai_toc");
+    expect(result.nodes).toMatchObject([{ label: "第一章", page: 4 }]);
+  });
+
+  it("lets dense body votes win over a single unconfirmed anchor", () => {
+    const tocRows: TocRow[] = [
+      { label: "第一章", level: 1, printedPage: 1 },
+      { label: "第二章", level: 1, printedPage: 20 },
+    ];
+    // 孤立锚点（offset=8，无第二票佐证）不过阈值，不劫持正文页脚多数派（offset=10）。
+    const headings: OutlineHeading[] = [
+      { label: "第一章", page: 9, level: 1, explicit: true },
+    ];
+    const printedVotes = Array.from({ length: 5 }, (_, index) => ({ page: 11 + index, printed: 1 + index }));
+    const result = assembleOutline(headings, tocRows, 100, printedVotes);
+    expect(result.strategy).toBe("ai_toc");
+    expect(result.nodes).toMatchObject([
+      { label: "第一章", page: 9 },
+      { label: "第二章", page: 30 },
+    ]);
+  });
+
+  it("lets two agreeing anchors override a denser body cluster", () => {
+    const tocRows: TocRow[] = [
+      { label: "第一章", level: 1, printedPage: 1 },
+      { label: "第二章", level: 1, printedPage: 20 },
+      { label: "第三章", level: 1, printedPage: 40 },
+    ];
+    // 两个锚点同证 offset=8；更密的正文簇（offset=10 ×5）是另一序列——冲突听锚点。
+    const headings: OutlineHeading[] = [
+      { label: "第一章", page: 9, level: 1, explicit: true },
+      { label: "第二章", page: 28, level: 1, explicit: true },
+    ];
+    const printedVotes = Array.from({ length: 5 }, (_, index) => ({ page: 11 + index, printed: 1 + index }));
+    const result = assembleOutline(headings, tocRows, 100, printedVotes);
+    expect(result.strategy).toBe("ai_toc");
+    expect(result.nodes).toMatchObject([
+      { label: "第一章", page: 9 },
+      { label: "第二章", page: 28 },
+      { label: "第三章", page: 48 },
+    ]);
+  });
+
   it("clamps out-of-order pages along reading order", () => {
     const nodes: BookOutlineNode[] = [
       {
@@ -458,6 +585,19 @@ describe("book outline", () => {
         ],
       },
     ]);
+  });
+
+  it("keeps already-monotonic page sequences untouched", () => {
+    const nodes: BookOutlineNode[] = [
+      {
+        id: "1", label: "第一章", page: 10, children: [
+          { id: "2", label: "1.1 小节", page: 10, children: [] },
+          { id: "3", label: "1.2 小节", page: 15, children: [] },
+        ],
+      },
+      { id: "4", label: "第二章", page: 20, children: [] },
+    ];
+    expect(repairOutlineMonotonicity(nodes)).toEqual(nodes);
   });
 
   it("admits only ordinal or known-name paragraph titles as recognized headings", () => {
@@ -513,6 +653,42 @@ describe("book outline", () => {
       { label: "第一章 起点", page: 20, level: 1, explicit: true },
       { label: "第三章 收束", page: 30, level: 1, explicit: true },
     ]).strategy).toBe("empty");
+  });
+
+  it("keeps the first occurrence of a special-name chapter that doubles as a running header", () => {
+    // 「参考文献」兼作章内页眉（≥3 页重复）：真身先于页眉出现，保留首现页而非整删。
+    const headings: OutlineHeading[] = [
+      { label: "第一章 起点", page: 10, level: 1, explicit: true },
+      { label: "第二章 转折", page: 20, level: 1, explicit: true },
+      { label: "第三章 收束", page: 30, level: 1, explicit: true },
+      ...[31, 32, 33].map((page) => ({ label: "参考文献", page, level: 1 as const, explicit: true })),
+    ];
+    const result = assembleBodyHeadingOutline(headings);
+    expect(result.strategy).toBe("body_headings");
+    expect(result.nodes.at(-1)).toMatchObject({ label: "参考文献", page: 31 });
+  });
+
+  it("anchors a special-name toc row to the first body occurrence when it repeats as a header", () => {
+    const tocRows: TocRow[] = [
+      { label: "第一章 起点", level: 1, printedPage: 1 },
+      { label: "参考文献", level: 1, printedPage: 30 },
+    ];
+    const headings: OutlineHeading[] = [
+      { label: "第一章 起点", page: 5, level: 1, explicit: true },
+      ...[40, 41, 42].map((page) => ({ label: "参考文献", page, level: 1 as const, explicit: true })),
+    ];
+    // 页脚密集票定出 offset=4；「参考文献」行靠首现正文锚点落 p.40，而非偏移换算的 p.34。
+    const printedVotes = [
+      { page: 5, printed: 1 },
+      { page: 6, printed: 2 },
+      { page: 7, printed: 3 },
+    ];
+    const result = assembleOutline(headings, tocRows, 100, printedVotes);
+    expect(result.strategy).toBe("ai_toc");
+    expect(result.nodes).toMatchObject([
+      { label: "第一章 起点", page: 5 },
+      { label: "参考文献", page: 40 },
+    ]);
   });
 
   it("resolves the printed-to-pdf offset by voting and clips out-of-range entries", () => {
@@ -668,6 +844,99 @@ describe("book outline", () => {
     expect(notified).toEqual([BOOK_ID, BOOK_ID]);
   });
 
+  it("keeps the stored outline when a page-level invalidation arrives during background ocr", async () => {
+    // 早出的目录在后续页识别到达时不闪空：页级失效只清该页候选，
+    // 已落库目录保留到整书收尾的重建整体替换（spec 故事 8/11 的「继续改善」语义）。
+    const notified: string[] = [];
+    const tocPage = [
+      { text: "目录", size: 18, y: 740 },
+      { text: "第一章 早目录………………………………1", size: 12, y: 700 },
+      { text: "1.1 早小节……………………………………2", size: 12, y: 660 },
+      { text: "第二章 后章…………………………………9", size: 12, y: 620 },
+      { text: "附录 参考答案………………………………12", size: 12, y: 580 },
+    ];
+    const pages: OutlineTextLine[][] = [
+      tocPage,
+      [
+        { text: "第一章 早目录", size: 24, y: 700 },
+        { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 },
+        { text: "1", size: 12, y: 60 },
+      ],
+      ...Array.from({ length: 10 }, (_, index) => [
+        { text: `第${index + 3}页正文，内容长度足够参与统计。`, size: 12, y: 650 },
+        { text: String(index + 2), size: 12, y: 60 },
+      ]),
+    ];
+    const ai = aiOutlineDeps([{ label: "第一章 早目录", level: 1, printedPage: 1 }], [1]);
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource(pages),
+      aiOutline: ai.deps,
+      onOutlineChange: (bookId) => notified.push(bookId),
+    });
+    closeOutline = outline.close;
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(outline.strategy(BOOK_ID)).toBe("ai_toc");
+    const before = outline.get(BOOK_ID);
+    expect(before).toMatchObject([{ label: "第一章 早目录", page: 2 }]);
+
+    outline.invalidate(BOOK_ID, 2);
+    expect(outline.get(BOOK_ID)).toEqual(before);
+    expect(outline.strategy(BOOK_ID)).toBe("ai_toc");
+    // 目录未变不推送；只有该页候选被清，其余页候选保留。
+    expect(notified).toEqual([BOOK_ID]);
+    const { DatabaseSync } = await import("node:sqlite");
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    const rows = database.prepare("SELECT page FROM book_outline_pages WHERE book_id = ? ORDER BY page").all(BOOK_ID) as Array<{ page: number }>;
+    database.close();
+    expect(rows.map((row) => row.page)).toEqual([1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+    // 整表失效才连已落库目录一起清。
+    outline.invalidate(BOOK_ID);
+    expect(outline.get(BOOK_ID)).toBeUndefined();
+    expect(notified).toEqual([BOOK_ID, BOOK_ID]);
+  });
+
+  it("keeps the tier verdict open when the ai call fails even if body headings would pass the gate", async () => {
+    closeOcr?.();
+    const engine: MineruEngine = {
+      name: "测试 OCR",
+      model: "测试模型",
+      async recognizePage(input) {
+        if (input.page === 1) {
+          return {
+            blocks: [{ type: "index", text: "第一章 失败目录…………………………1\n第一节 失败内容…………………………2", bbox: [0.1, 0.1, 0.9, 0.5] }],
+            markdown: "",
+          };
+        }
+        const titles: Record<number, string> = { 2: "第一章 起点", 3: "第二章 转折", 4: "第三章 收束" };
+        const blocks = [{ type: "text", text: `第${input.page}页正文，长度足够参与统计。`, bbox: [0.1, 0.2, 0.9, 0.24] }];
+        if (titles[input.page]) blocks.unshift({ type: "paragraph_title", text: titles[input.page]!, bbox: [0.1, 0.05, 0.9, 0.12] });
+        return { blocks, markdown: "" };
+      },
+    };
+    const ocr = createOcrModule(dataHome, engine, {
+      resolvePdfPath: (bookId) => (bookId === BOOK_ID ? { path: "C:/book.pdf", encrypted: false } : undefined),
+    });
+    closeOcr = ocr.close;
+    for (const page of [1, 2, 3, 4]) {
+      await ocr.recognizePage({ bookId: BOOK_ID, page });
+    }
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource([[], [], [], []]),
+      aiOutline: {
+        renderPage: async () => ({ imageData: "aW1n" }),
+        complete: async () => { throw new Error("网络错误"); },
+      },
+      readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+    });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    // 失败≠判无：定位命中但模型调不起来——不缓存、不降第三档，保留现状等重试。
+    expect(result).toMatchObject({ status: "partial", nodes: [] });
+    expect(outline.get(BOOK_ID)).toBeUndefined();
+    expect(outline.strategy(BOOK_ID)).toBe("empty");
+  });
+
   it("nests three toc levels from ai entries", () => {
     const tocRows: TocRow[] = [
       { label: "第1章 绪论", level: 1, printedPage: 1 },
@@ -766,10 +1035,12 @@ describe("book outline", () => {
       readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
     });
     closeOutline = outline.close;
-    // 仅 p.2 已识别（含 index 块）：窗口未覆盖，不下结论也不调模型、不缓存。
+    // 仅 p.2 已识别（含 index 块）：窗口未覆盖——不下结论、不调模型、不写任何持久化状态。
     await ocr.recognizePage({ bookId: BOOK_ID, page: 2 });
-    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    const early = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(early).toMatchObject({ status: "partial", processedPages: 0 });
     expect(calls).toBe(0);
+    expect(outline.get(BOOK_ID)).toBeUndefined();
     // 窗口覆盖齐全后：定位命中 → 调用一次模型并缓存结论。
     for (const page of [1, 3, 4, 5]) {
       await ocr.recognizePage({ bookId: BOOK_ID, page });
@@ -780,10 +1051,10 @@ describe("book outline", () => {
     expect(calls).toBe(1);
   });
 
-  it("calls the ai on run-end without waiting for full window coverage", async () => {
+  it("holds the conclusion until the window is covered even when the toc region ended early", async () => {
     closeOcr?.();
-    // 扫描书 10 页：目录区在第 2 页（index 块），OCR 只推进到第 6 页——
-    // run-end（M=2 之后的 gap 页 3、4 已扫且无 index）成立即让位并提取，不等窗口扫满。
+    // 扫描书 10 页：目录区在第 2 页（index 块），OCR 只推进到第 6 页——目录区虽已结束，
+    // 但窗口未覆盖（证据闸门），不出结论不调模型；扫满窗口后才提取。
     const engine: MineruEngine = {
       name: "测试 OCR",
       model: "测试模型",
@@ -820,10 +1091,76 @@ describe("book outline", () => {
       readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
     });
     closeOutline = outline.close;
+    const early = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(early).toMatchObject({ status: "partial", processedPages: 0 });
+    expect(requested).toEqual([]);
+    expect(outline.get(BOOK_ID)).toBeUndefined();
+    // 窗口（全书 10 页 ≤ 30）扫满：定位命中 → 提取，候选页 = 命中页 ±1 边距。
+    for (const page of [7, 8, 9, 10]) {
+      await ocr.recognizePage({ bookId: BOOK_ID, page });
+    }
     const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(result.status).toBe("generated");
-    // 让位判定成立即调模型；候选页裁到已扫前缀（1~6）内。
     expect(requested).toEqual([[1, 2, 3]]);
+  });
+
+  it("writes nothing and marks tier one adjudicated when the probe window is uncovered", async () => {
+    // 扫描书开书（零识别、无原生文本）：目录任务空转退出——不写页候选、不落库、零 AI 调用，
+    // 只落「第一档已裁决」标记，开书快检不再重复开书解析书签。
+    const notified: string[] = [];
+    let opened = 0;
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource(Array.from({ length: 40 }, () => []), { onOpen: () => { opened += 1; } }),
+      aiOutline: {
+        renderPage: async () => ({ imageData: "aW1n" }),
+        complete: async () => { throw new Error("不应调用模型。"); },
+      },
+      onOutlineChange: (bookId) => notified.push(bookId),
+    });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(result).toMatchObject({ status: "partial", processedPages: 0 });
+    expect(outline.get(BOOK_ID)).toBeUndefined();
+    expect(notified).toEqual([]);
+    const { DatabaseSync } = await import("node:sqlite");
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    const candidateRows = database.prepare("SELECT COUNT(*) AS count FROM book_outline_pages WHERE book_id = ?").get(BOOK_ID) as { count: number };
+    const gateRows = database.prepare("SELECT COUNT(*) AS count FROM book_outline_gate WHERE book_id = ?").get(BOOK_ID) as { count: number };
+    database.close();
+    expect(candidateRows.count).toBe(0);
+    expect(gateRows.count).toBe(1);
+    // 标记在库：快检不再开书（rebuild 已开过一次）。
+    expect(await outline.ensureEmbedded(BOOK_ID, async () => ({ bytes: new Uint8Array() }))).toBeUndefined();
+    expect(opened).toBe(1);
+  });
+
+  it("marks tier one adjudicated on the read path so the quick check stops reopening", async () => {
+    let opened = 0;
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: documentSource([[{ text: "第一章 无书签", size: 24, y: 700 }]], { onOpen: () => { opened += 1; } }),
+    });
+    closeOutline = outline.close;
+    const loadBook = async () => ({ bytes: new Uint8Array() });
+    expect(await outline.ensureEmbedded(BOOK_ID, loadBook)).toBeUndefined();
+    expect(await outline.ensureEmbedded(BOOK_ID, loadBook)).toBeUndefined();
+    expect(opened).toBe(1);
+  });
+
+  it("treats a majority-native window with blank divider pages as covered", async () => {
+    // 原生书含空白分页页（章节扉页无文字层）：窗口过半页有原生文本即整窗可判，
+    // 不被一页空白卡死（spec 故事 18——没装 OCR 资源时原生书照常产出结论）。
+    const bodyPage = [
+      { text: "第一章 起点", size: 24, y: 700 },
+      { text: "普通正文内容，长度足够参与统计。", size: 12, y: 650 },
+    ];
+    const pages: OutlineTextLine[][] = Array.from({ length: 10 }, (_, index) => (
+      index === 3 || index === 7 || index === 9 ? [] : bodyPage
+    ));
+    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages) });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(result).toMatchObject({ status: "generated", processedPages: 10 });
+    expect(outline.get(BOOK_ID)).toEqual([]);
   });
 
   it("feeds page_number blocks into the offset vote for scanned books", async () => {
@@ -1022,40 +1359,6 @@ describe("toc page locator", () => {
     expect(result.covered).toBe(false);
     expect(result.hits).toEqual([1]);
     expect(result.pages).toEqual([1, 2]);
-  });
-});
-
-describe("outline yield probe", () => {
-  function probe(specs: Array<[page: number, index: boolean]>) {
-    return specs.map(([page, hasIndexBlock]) => ({ page, hasIndexBlock }));
-  }
-
-  it("yields when the probe window is fully scanned even without index pages", () => {
-    expect(shouldYieldToOutline([], 30, 100)).toBe(true);
-    expect(shouldYieldToOutline(probe([[1, false], [2, false]]), 2, 100)).toBe(false);
-    expect(shouldYieldToOutline(probe([[1, false], [2, false]]), 30, 100)).toBe(true);
-  });
-
-  it("yields on run-end once the gap pages after the last index page are scanned and index-free", () => {
-    const pages = probe([[1, false], [2, true], [3, false], [4, false]]);
-    // 最后一个 index 页 M=2：gap 页 3 已扫但 4 未扫，不能下结论。
-    expect(shouldYieldToOutline(pages, 3, 100)).toBe(false);
-    // 3、4 已扫且无 index → 目录区已结束。
-    expect(shouldYieldToOutline(pages, 4, 100)).toBe(true);
-  });
-
-  it("does not yield while index pages keep appearing within the gap", () => {
-    const pages = probe([[1, false], [2, true], [3, false], [4, true], [5, false], [6, false]]);
-    expect(shouldYieldToOutline(pages, 4, 100)).toBe(false);
-    expect(shouldYieldToOutline(pages, 5, 100)).toBe(false);
-    expect(shouldYieldToOutline(pages, 6, 100)).toBe(true);
-  });
-
-  it("never yields before the window is adjudicable", () => {
-    expect(shouldYieldToOutline([], 0, 10)).toBe(false);
-    expect(shouldYieldToOutline(probe([[1, true]]), 0, 10)).toBe(false);
-    // 单页书：窗口即全书，扫完即覆盖。
-    expect(shouldYieldToOutline([], 1, 1)).toBe(true);
   });
 });
 

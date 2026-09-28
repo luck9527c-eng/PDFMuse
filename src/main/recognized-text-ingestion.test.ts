@@ -63,7 +63,7 @@ describe("recognized text ingestion", () => {
   it("requeues the outline once at background priority when a whole book finishes OCR", () => {
     const { ingestion, calls } = createHarness();
     ingestion.completeBookOcr(BOOK);
-    expect(calls).toEqual(["schedule:outline:5:120"]);
+    expect(calls).toEqual(["schedule:outline:15:120"]);
   });
 
   it("encodes and decodes linear OCR checkpoints and treats legacy formats as stale", () => {

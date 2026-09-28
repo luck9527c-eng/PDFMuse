@@ -49,8 +49,11 @@ export function useBookText(options: {
     if (!book || !window.pdfMuse) return;
     const api = window.pdfMuse;
     void (async () => {
+      // 目录任务先于一切排入（T58 证据闸门）：串行泵按入队时优先级起跑——outline 先跑，
+      // 快进快出：原生书窗口即刻覆盖、秒级出目录；扫描书窗口无证据、秒级空转退出，
+      // OCR 独占跑到整书完成后由收尾重排产出目录。调度顺序与优先级缺一不可。
+      await api.scheduleBackgroundJob({ bookId: book.id, kind: "outline", priority: 25, total: book.pageCount });
       await api.scheduleBackgroundJob({ bookId: book.id, kind: "index", priority: 10, total: book.pageCount });
-      await api.scheduleBackgroundJob({ bookId: book.id, kind: "outline", priority: 5, total: book.pageCount });
       const preflight = await loadStartupPreflight();
       if (preflight?.ok && !ocrResourcesMissing(preflight)) {
         await api.scheduleBackgroundJob({ bookId: book.id, kind: "ocr", priority: 20, total: book.pageCount, maxAttempts: 3, inputVersion: MINERU_INPUT_VERSION });
