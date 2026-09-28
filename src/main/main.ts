@@ -228,13 +228,15 @@ app.whenReady().then(async () => {
         const stats = bookIndex.stats(job.bookId);
         context.checkpoint(`page:${stats.indexedPages}`, stats.indexedPages, stats.totalPages);
       },
-      // OCR 整书执行器（T58）：线性扫描、弹性池派页、断点前沿——不让位不并行，
-      // 整书完成后经收尾重排产出目录；依赖全注入，模块级测试覆盖断点与续跑。
+      // OCR 整书执行器（T58-03 统一目录流）：线性扫描、弹性池派页、断点前沿与数据触发器
+      // （目录数据就绪即交棒重排）；依赖全注入，模块级测试覆盖触发/断点/续跑。
       ocr: createOcrJobExecutor({
         loadBook: (bookId) => library.list().find((item) => item.id === bookId),
+        getPageBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
         isPageCompatible: (bookId, page) => ocr.isPageCompatible(bookId, page, MINERU_ENGINE_VERSION, MINERU_MODEL, MINERU_INPUT_VERSION),
         recognizePage: (input, signal) => ocr.recognizePage(input, signal),
         ingestPage: (bookId, page, blocks) => ingestion.ingestRecognizedPage(bookId, page, blocks, "background"),
+        scheduleOutlineRerank: ingestion.scheduleOutlineRerank,
         completeBook: (bookId) => ingestion.completeBookOcr(bookId),
         decodeCheckpoint: ingestion.decodeOcrCheckpoint,
         encodeCheckpoint: ingestion.encodeOcrCheckpoint,

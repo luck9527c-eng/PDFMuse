@@ -44,14 +44,18 @@ export function createRecognizedTextIngestion(dependencies: RecognizedTextIngest
         });
       }
     },
-    /** 整书识别收尾：证据闸门此时已过（窗口全覆盖、锚点与页脚票全量），重排目录任务产出最终目录。 */
-    completeBookOcr(bookId: string) {
+    /** 目录重排调度：数据触发器与整书收尾共用（后台优先级，先于全文索引）。 */
+    scheduleOutlineRerank(bookId: string) {
       dependencies.scheduleJob({
         bookId,
         kind: "outline",
         priority: BACKGROUND_OUTLINE_PRIORITY,
         total: dependencies.loadPageCount(bookId),
       });
+    },
+    /** 整书识别收尾：证据齐备（全书锚点与页脚票），重排目录任务产出转正目录。 */
+    completeBookOcr(bookId: string) {
+      this.scheduleOutlineRerank(bookId);
     },
     /** 线性页序的断点：completed = 已连续扫完的页数（页 1..completed）。 */
     encodeOcrCheckpoint(completed: number) {

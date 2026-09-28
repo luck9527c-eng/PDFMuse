@@ -454,9 +454,52 @@ export type TocLocatorPageInput = { page: number; lines: readonly string[]; hasI
 
 const TOC_PROBE_WINDOW_PAGES = 30;
 
-/** 探测窗口末端（窗口常量与书页数的单一出口）：证据闸门与目录定位共用。 */
-function tocWindowEnd(pageCount: number) {
+/** 探测窗口末端（窗口常量与书页数的单一出口）：数据触发器与目录定位共用。 */
+export function tocWindowEnd(pageCount: number) {
   return Math.min(pageCount, TOC_PROBE_WINDOW_PAGES);
+}
+
+export const TOC_YIELD_GAP_PAGES = 2;
+
+/** 数据触发器探针页（块库直读，未识别页按无 index 计）。 */
+export type OutlineYieldProbePage = { page: number; hasIndexBlock: boolean };
+
+/** 触发探针拼装：窗口内逐页的 index 块有无。判定函数只吃数据，拼装收在目录模块。 */
+export function outlineYieldProbe(
+  windowEnd: number,
+  readBlocks: (page: number) => ReadonlyArray<MineruBlock> | undefined,
+): OutlineYieldProbePage[] {
+  const probe: OutlineYieldProbePage[] = [];
+  for (let page = 1; page <= windowEnd; page += 1) {
+    probe.push({ page, hasIndexBlock: hasIndexBlock(readBlocks(page)) });
+  }
+  return probe;
+}
+
+/** 目录数据就绪判定（纯函数，只看块库状态）——统一目录流的数据触发器（T58-03）：
+ *  1. run-end：探测窗口内最后一个 index 页 M 之后的 g 页全部已扫且无 index 块 → 目录区已结束；
+ *  2. 窗口覆盖：窗口内页面全部已扫（无目录书与「零调用」路径的出口）。
+ *  scannedCount 为线性页序已扫描页数；gap 页必须在探针观察面内且已被扫过，「无 index」
+ *  才是结论而非未知——M 落在窗口末页时 gap 页越出观察面，只能等窗口覆盖兜底。 */
+export function shouldYieldToOutline(
+  pages: readonly OutlineYieldProbePage[],
+  scannedCount: number,
+  pageCount: number,
+): boolean {
+  const windowEnd = tocWindowEnd(pageCount);
+  if (windowEnd <= 0) return false;
+  if (scannedCount >= windowEnd) return true;
+  const indexByPage = new Map(pages.map((page) => [page.page, page.hasIndexBlock]));
+  let lastIndex = 0;
+  for (const page of pages) {
+    if (page.hasIndexBlock) lastIndex = Math.max(lastIndex, page.page);
+  }
+  if (lastIndex === 0) return false;
+  for (let page = lastIndex + 1; page <= lastIndex + TOC_YIELD_GAP_PAGES; page += 1) {
+    const observed = indexByPage.get(page);
+    if (observed === undefined || page > scannedCount || observed) return false;
+  }
+  return true;
 }
 const TOC_TEXT_LINE_CAP = 80;
 const TOC_DENSITY_MIN_LINES = 4;

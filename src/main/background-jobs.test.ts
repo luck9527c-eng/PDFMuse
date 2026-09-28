@@ -234,8 +234,79 @@ describe("background jobs", () => {
     expect(module.list(BOOK_B)).toHaveLength(1);
   });
 
-  it("keeps a reader-paused job paused instead of auto-resuming it", async () => {
+  it("lets a running job hand over to queued jobs and auto-resumes when the queue idles", async () => {
+    // T58-03 数据触发器：任务自暂停交棒，串行泵让排队任务先行，队列空闲自动恢复。
     const events: string[] = [];
+    let yielded = false;
+    module = createBackgroundJobModule(dataHome, {
+      ocr: async (_job, context) => {
+        events.push("ocr:start");
+        const aborted = new Promise<void>((resolve) => {
+          context.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        if (!yielded) {
+          yielded = true;
+          context.yieldOnce();
+        }
+        if (context.signal.aborted) {
+          await aborted;
+          throw new Error("OCR 任务已暂停或取消。");
+        }
+        events.push("ocr:done");
+      },
+      outline: async () => {
+        events.push("outline:done");
+      },
+    });
+    // 真实时序：OCR 先跑、触发后调度 outline 并交棒，目录任务先行。
+    module.schedule({ bookId: BOOK_A, kind: "ocr", priority: 20 });
+    await waitFor(() => module?.list(BOOK_A)[0]?.status === "running");
+    module.schedule({ bookId: BOOK_A, kind: "outline", priority: 15 });
+    await waitFor(() => module?.list(BOOK_A).every((job) => job.status === "completed") ?? false);
+    expect(events).toEqual(["ocr:start", "outline:done", "ocr:start", "ocr:done"]);
+  });
+
+  it("does not auto-resume a handed-over job the reader cancelled while it waited", async () => {
+    const events: string[] = [];
+    let yielded = false;
+    let releaseOutline: (() => void) | undefined;
+    module = createBackgroundJobModule(dataHome, {
+      ocr: async (_job, context) => {
+        events.push("ocr:start");
+        const aborted = new Promise<void>((resolve) => {
+          context.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        if (!yielded) {
+          yielded = true;
+          context.yieldOnce();
+        }
+        if (context.signal.aborted) {
+          await aborted;
+          throw new Error("OCR 任务已暂停或取消。");
+        }
+        events.push("ocr:done");
+      },
+      outline: async () => {
+        events.push("outline:start");
+        await new Promise<void>((resolve) => { releaseOutline = resolve; });
+        events.push("outline:done");
+      },
+    });
+    module.schedule({ bookId: BOOK_A, kind: "ocr", priority: 20 });
+    await waitFor(() => module?.list(BOOK_A)[0]?.status === "running");
+    module.schedule({ bookId: BOOK_A, kind: "outline", priority: 15 });
+    // OCR 交棒自暂停，outline 已在运行：Reader 在交棒等待期取消 OCR。
+    await waitFor(() => module?.list(BOOK_A).find((job) => job.kind === "outline")?.status === "running" ?? false);
+    const ocrJob = module.list(BOOK_A).find((job) => job.kind === "ocr");
+    if (ocrJob) await module.cancel(ocrJob.id);
+    releaseOutline?.();
+    await waitFor(() => module?.list(BOOK_A).every((job) => job.status === "completed" || job.status === "cancelled") ?? false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(events).toEqual(["ocr:start", "outline:start", "outline:done"]);
+    expect(module.list(BOOK_A).find((job) => job.kind === "ocr")?.status).toBe("cancelled");
+  });
+
+  it("keeps a reader-paused job paused instead of auto-resuming it", async () => {    const events: string[] = [];
     module = createBackgroundJobModule(dataHome, {
       ocr: async (_job, context) => {
         events.push("ocr:start");
