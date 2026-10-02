@@ -246,29 +246,31 @@ const JOB_STATUS_LABELS: Record<BackgroundJob["status"], string> = {
 function JobsTab({ jobs }: { jobs: BackgroundJob[] }) {
   if (jobs.length === 0) return <p className="observer-empty">本书没有后台任务记录。</p>;
   return (
-    <table className="observer-jobs">
-      <thead>
-        <tr><th>类型</th><th>优先级</th><th>状态</th><th>进度</th><th>断点</th><th>尝试</th><th>错误</th><th>更新时间</th></tr>
-      </thead>
-      <tbody>
-        {jobs.map((job) => (
-          <tr key={job.id} data-status={job.status}>
-            <td>{JOB_KIND_LABELS[job.kind]}</td>
-            <td>{job.priority}</td>
-            <td>{JOB_STATUS_LABELS[job.status]}</td>
-            <td>{job.total > 0 ? `${job.progress}/${job.total}` : job.progress}</td>
-            <td className="observer-mono">{job.checkpoint ?? "—"}</td>
-            <td>{job.attempts}/{job.maxAttempts}</td>
-            <td>
-              {job.errorMessage
-                ? <details><summary>{job.errorMessage.length > 24 ? `${job.errorMessage.slice(0, 24)}…` : job.errorMessage}</summary><pre className="observer-json">{job.errorMessage}</pre></details>
-                : "—"}
-            </td>
-            <td className="observer-mono">{job.updatedAt.slice(11, 19)}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <div className="observer-jobs-scroll">
+      <table className="observer-jobs">
+        <thead>
+          <tr><th>类型</th><th>优先级</th><th>状态</th><th>进度</th><th>断点</th><th>尝试</th><th>错误</th><th>更新时间</th></tr>
+        </thead>
+        <tbody>
+          {jobs.map((job) => (
+            <tr key={job.id} data-status={job.status}>
+              <td>{JOB_KIND_LABELS[job.kind]}</td>
+              <td>{job.priority}</td>
+              <td>{JOB_STATUS_LABELS[job.status]}</td>
+              <td>{job.total > 0 ? `${job.progress}/${job.total}` : job.progress}</td>
+              <td className="observer-mono">{job.checkpoint ?? "—"}</td>
+              <td>{job.attempts}/{job.maxAttempts}</td>
+              <td>
+                {job.errorMessage
+                  ? <details><summary>{job.errorMessage.length > 24 ? `${job.errorMessage.slice(0, 24)}…` : job.errorMessage}</summary><pre className="observer-json">{job.errorMessage}</pre></details>
+                  : "—"}
+              </td>
+              <td className="observer-mono">{job.updatedAt.slice(11, 19)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

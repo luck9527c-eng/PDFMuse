@@ -373,6 +373,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .observer-json { margin: 6px 0 0; padding: 8px; max-height: 300px; overflow: auto; border: 1px solid var(--line); border-radius: 4px; background: #f4f2ea; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 10px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
 .observer-error { margin: 5px 0 0; color: #8d3f37; font-size: 10px; }
 
+.observer-timeline { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .observer-snapshot { flex: none; margin-bottom: 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 5px; background: #fdfcf8; font-size: 10px; line-height: 1.6; color: var(--ink); }
 .observer-pages { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 6px; }
 .observer-page { display: grid; place-items: center; min-width: 22px; height: 16px; padding: 0 2px; border-radius: 3px; font-size: 9px; font-variant-numeric: tabular-nums; background: #eeece6; color: var(--muted); }
@@ -393,7 +394,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .observer-event > summary .observer-kind.ocr_fail, .observer-event > summary .observer-kind.ai_call { color: #8d3f37; }
 .observer-event > summary em { color: var(--ink); font-style: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.observer-payload { overflow: auto; }
+.observer-payload { flex: 1; min-height: 0; overflow: auto; }
 .observer-ai { margin-bottom: 10px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 5px; background: #fdfcf8; }
 .observer-ai.cache { opacity: .62; }
 .observer-ai > header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; font-size: 11px; }
@@ -405,6 +406,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .observer-exchange > details { margin-top: 4px; }
 .observer-exchange summary { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; cursor: pointer; font-size: 10px; color: var(--muted); font-weight: 650; }
 
+.observer-jobs-scroll { flex: 1; min-height: 0; overflow: auto; }
 .observer-jobs { width: 100%; border-collapse: collapse; font-size: 10px; }
 .observer-jobs th { padding: 4px 6px; border-bottom: 1px solid var(--line); text-align: left; color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
 .observer-jobs td { padding: 5px 6px; border-bottom: 1px dotted var(--line); vertical-align: top; }
