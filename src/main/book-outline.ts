@@ -1299,13 +1299,15 @@ export function createBookOutlineModule(
       if (newestPayload && isStalePagePayload(newestPayload.candidates_json)) {
         database.prepare("DELETE FROM book_outline_pages WHERE book_id = ?").run(bookId);
       }
-      const coverage = database.prepare(`
-        SELECT COUNT(*) AS count, MAX(page) AS max_page
-        FROM book_outline_pages WHERE book_id = ?
-      `).get(bookId) as { count: number; max_page: number | null };
-      const contiguous = coverage.count === (coverage.max_page ?? 0);
-      let processedPages = contiguous ? coverage.count : 0;
-      if (!contiguous) database.prepare("DELETE FROM book_outline_pages WHERE book_id = ?").run(bookId);
+      // 页级增量填充：候选行存在即复用，只补缺失页——页级失效（交互识别当前页、
+      // 整书扫描逐页入库）只缺口一页时不再因「前缀断裂」推倒全书快照重扫。
+      // 载荷版本不一致的整表作废仍在其上方先行；越界行（异常残留）顺手清掉。
+      database.prepare("DELETE FROM book_outline_pages WHERE book_id = ? AND page > ?")
+        .run(bookId, document.pageCount);
+      const existingPages = new Set(
+        (database.prepare("SELECT page FROM book_outline_pages WHERE book_id = ?").all(bookId) as Array<{ page: number }>)
+          .map((row) => row.page),
+      );
       const upsert = database.prepare(`
         INSERT INTO book_outline_pages (book_id, page, candidates_json, source, updated_at)
         VALUES (?, ?, ?, ?, ?)
@@ -1314,8 +1316,11 @@ export function createBookOutlineModule(
         source = excluded.source,
         updated_at = excluded.updated_at
       `);
-      for (let page = processedPages + 1; page <= document.pageCount; page += 1) {
+      let processedPages = existingPages.size;
+      onProgress?.(processedPages, document.pageCount);
+      for (let page = 1; page <= document.pageCount; page += 1) {
         if (signal?.aborted) break;
+        if (existingPages.has(page)) continue;
         const snapshot = await readPageTextSnapshot(bookId, document, page);
         // 目录页不参与正文标题锚点——否则章/节锚点会全落在目录页本身。
         // OCR 页标题候选走布局模型判定（T57-06），原生页维持字号检测；
@@ -1330,7 +1335,7 @@ export function createBookOutlineModule(
           }
         }
         upsert.run(bookId, page, JSON.stringify({ v: OUTLINE_VERSION, headings, printed: snapshot.printedPages }), snapshot.source, new Date().toISOString());
-        processedPages = page;
+        processedPages += 1;
         onProgress?.(processedPages, document.pageCount);
       }
       if (processedPages < document.pageCount) {

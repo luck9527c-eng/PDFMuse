@@ -323,6 +323,25 @@ describe("book outline", () => {
     expect(visited).toEqual([1, 2, 3, 1, 1, 2, 3, 2, 3]);
   });
 
+  it("re-snapshots only the invalidated page instead of the whole book", async () => {
+    const visited: number[] = [];
+    const pages = [1, 2, 3, 4, 5].map((page) => [
+      { text: `第${page}页正文，内容长度足够参与统计。`, size: 12, y: 650 },
+    ]);
+    const outline = createBookOutlineModule(dataHome, { openDocument: documentSource(pages, { visited }) });
+    closeOutline = outline.close;
+    await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(visited).toEqual([1, 2, 3, 4, 5, 1, 2, 3, 4, 5]);
+    // 开书时 Reader 交互识别当前页 → 页级失效只删该页候选行：重建只补扫该页，
+    // 不再因「前缀断裂」推倒全书快照重扫（重复 rebuild 全书重扫的根因）。
+    outline.invalidate(BOOK_ID, 3);
+    visited.length = 0;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(result).toMatchObject({ status: "generated", processedPages: 5 });
+    // 定位证据闸门照读一遍探测窗口（5 页），页候选循环只补第 3 页。
+    expect(visited).toEqual([1, 2, 3, 4, 5, 3]);
+  });
+
   it("discards stale page candidates when the outline version changes", async () => {
     const visited: number[] = [];
     const pages = [1, 2].map((page) => [
