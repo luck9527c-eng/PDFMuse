@@ -5,6 +5,8 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { applyDocvortexScriptConflictPatch } from "./lib/docvortex-patch.mjs";
+
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const resourcesRoot = path.join(projectRoot, "resources");
 const tmpRoot = path.join(projectRoot, "tmp");
@@ -164,6 +166,15 @@ run("uv", [
   "-r", lockfile,
 ], { env: { ...process.env, ...proxyEnv } });
 
+// 构建期打 docvortex 上下标冲突补丁（T65）：必须在导入验证之前——校验随 import 固化。
+// 补丁后的 schema.py 参与清单哈希，manifest 记录补丁状态；worker 启动只读校验。
+console.log("正在修补 docvortex 上下标冲突校验（构建期）...");
+const docvortexPatch = await applyDocvortexScriptConflictPatch(sitePackages);
+if (docvortexPatch.state === "unrecognized") {
+  console.warn("警告：docvortex schema.py 与已知模式均不匹配，补丁未应用——数学页（双上下标公式）可能整页解析失败，请人工核对上游变更后更新补丁模式。");
+}
+console.log(`docvortex 补丁状态：${docvortexPatch.state}`);
+
 console.log("正在验证 MinerU 导入...");
 runPython("from mineru.parser.mineru_parser import MinerUParser; import mineru; print('mineru', mineru.version.__version__)");
 
@@ -202,6 +213,7 @@ const manifest = {
   engineVersion: "4.0.2",
   runtime: "Python 3.11.9 + ONNX Runtime (MinerU basic)",
   model: "basic",
+  patches: { docvortexScriptConflict: docvortexPatch.state },
   files: await Promise.all(["mineru-runtime", "mineru-worker/mineru_worker.py"].map(async (resourcePath) => ({
     path: resourcePath,
     sha256: await digestResource(path.join(resourcesRoot, resourcePath)),

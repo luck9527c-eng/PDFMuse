@@ -17,8 +17,10 @@ def write_response(value):
 # docvortex 0.4.12 的 TextSpan 校验对同一 span 同时声明上下标直接抛 ValueError——
 # 原生 PDF 的数学页（x_i^2 型公式行）样式区间物化时会合出这种组合，整页解析报废。
 # 按 mineru 自家 legacy 适配器（legacy_schema_adapter._normalize_styles）的消解方式
-# 丢弃 subscript；块协议只取 type/text/bbox，样式无损。幂等：原文在才打，
-# 已打过或上游已改都跳过；补丁失败只记 stderr，不影响其余页解析。
+# 丢弃 subscript；块协议只取 type/text/bbox，样式无损。
+# 补丁主路径在构建期（prepare-mineru-runtime.mjs 经 scripts/lib/docvortex-patch.mjs 打好并
+# 进清单哈希）；本函数是旧版 runtime 的回退：启动时只读校验，发现原文未打才补（写侧固定
+# LF），补丁失败只记 stderr，不影响其余页解析。
 DOCVORTEX_SCRIPT_CONFLICT_ORIGINAL = (
     '        unique = set(value)\n'
     '        if "superscript" in unique and "subscript" in unique:\n'
@@ -34,7 +36,7 @@ DOCVORTEX_SCRIPT_CONFLICT_PATCHED = (
 
 
 def patch_docvortex_script_conflict(package_dir=None):
-    """修补钉版 runtime 里 docvortex 的上下标冲突校验；package_dir 仅供测试注入。"""
+    """回退补丁：构建期已打过则零写入跳过；原文未打（旧版 runtime）才改写。package_dir 仅供测试注入。"""
     try:
         if package_dir is None:
             import importlib.util
@@ -46,14 +48,19 @@ def patch_docvortex_script_conflict(package_dir=None):
         schema_path = os.path.join(str(package_dir), "schema.py")
         with open(schema_path, encoding="utf-8") as handle:
             source = handle.read()
+        if DOCVORTEX_SCRIPT_CONFLICT_PATCHED in source:
+            return
         if DOCVORTEX_SCRIPT_CONFLICT_ORIGINAL not in source:
-            state = "已就绪" if DOCVORTEX_SCRIPT_CONFLICT_PATCHED in source else "与已知模式均不匹配（上游可能已改）"
-            print(f"[PDFMuse] docvortex 上下标冲突补丁{state}，跳过。", file=sys.stderr)
+            print("[PDFMuse] docvortex 上下标冲突补丁与已知模式均不匹配（上游可能已改），跳过。", file=sys.stderr)
             return
         # 读侧通用换行归一（CRLF/LF 都能命中 LF 模式）；写侧固定 LF，避免文本模式把全文翻成 CRLF。
         with open(schema_path, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(source.replace(DOCVORTEX_SCRIPT_CONFLICT_ORIGINAL, DOCVORTEX_SCRIPT_CONFLICT_PATCHED))
-        print("[PDFMuse] 已修补 docvortex 上下标冲突校验（丢弃 subscript）。", file=sys.stderr)
+        print(
+            "[PDFMuse] 检测到旧版运行时未打 docvortex 补丁，已回退就地修补（丢弃 subscript）；"
+            "建议重跑 npm run prepare:mineru 让补丁进入清单哈希。",
+            file=sys.stderr,
+        )
     except Exception as exc:
         print(f"[PDFMuse] docvortex 补丁未应用（不影响其余页解析）：{exc}", file=sys.stderr)
 

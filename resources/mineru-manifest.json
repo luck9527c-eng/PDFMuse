@@ -7,11 +7,14 @@
   "files": [
     {
       "path": "mineru-runtime",
-      "sha256": "8fa0b4aa3d4cac276cf2f5e46b87c3d6713235df7397ca691ade29b7800a9348"
+      "sha256": "d62fe365cd8b371f5c5c40f755b82d57c590e57782c8fd187566a15e87787dcb"
     },
     {
       "path": "mineru-worker/mineru_worker.py",
-      "sha256": "9e82047373aef6c4c5f148f55505103a0480c1af480a335edec850fdf7c78ca3"
+      "sha256": "47883912ab5da0a56e3893324e611c92dda0dfc178f43ed9d8c36ee6aefabd4f"
     }
-  ]
+  ],
+  "patches": {
+    "docvortexScriptConflict": "already-patched"
+  }
 }
