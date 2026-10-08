@@ -1,6 +1,7 @@
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 
 import { regionPixelRect, type RegionBbox } from "../shared/region.js";
+import type { PdfDocumentBroker } from "./pdf-document-broker.js";
 
 /** 页面渲染产物：PNG base64 与像素尺寸。 */
 export type RenderedPageImage = { imageData: string; width: number; height: number };
@@ -10,12 +11,27 @@ export type PageBookSource = (bookId: string) => Promise<{ bytes: Uint8Array; pa
 
 /**
  * 页面渲染（架构深化 T34）：canvas 依赖只在本模块出现，检索模块不再牵连渲染改动。
- * 无状态、不加缓存；每页独立打开与销毁文档，渲染内部保持既有实现。
+ * T60 起可注入文档句柄中介：同书渲染共享一次解析（字节读取与 pdfjs 解析每页一次的
+ * 现状由中介消除）；未注入（测试/独立使用）保持每页独立打开与销毁的既有实现。
  */
-export function createPageRenderer(loadBook: PageBookSource) {
-  /** 渲染整页到独立 canvas；调用方负责 cleanup（销毁 pdfjs 文档）。 */
+export function createPageRenderer(loadBook: PageBookSource, broker?: PdfDocumentBroker) {
+  /** 渲染整页到独立 canvas；调用方负责 cleanup（中介路径归还句柄引用）。 */
   async function openPageCanvas(bookId: string, pageNumber: number, scale: number) {
     const { createCanvas } = await import("@napi-rs/canvas");
+    if (broker) {
+      const handle = await broker.acquire(bookId);
+      try {
+        const page = await handle.document.getPage(pageNumber);
+        const viewport = page.getViewport({ scale });
+        const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+        const context = canvas.getContext("2d");
+        await page.render({ canvas: canvas as never, canvasContext: context as never, viewport }).promise;
+        return { canvas, cleanup: () => handle.release() };
+      } catch (error) {
+        handle.release();
+        throw error;
+      }
+    }
     const source = await loadBook(bookId);
     const loadingTask = getDocument({
       data: source.bytes.slice(),

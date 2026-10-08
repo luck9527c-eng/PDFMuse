@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createBookIndex, keepStrongHits, pageTextSemanticFactor, splitSearchTerms, tokenizeForIndex, type EmbeddingProvider } from "./book-index.js";
 import { createLibraryModule } from "../library.js";
+import { createPdfDocumentBroker } from "../pdf-document-broker.js";
 
 const FIXTURE = path.resolve(import.meta.dirname, "../fixtures/navigation.pdf");
 
@@ -548,6 +549,32 @@ describe("book index", () => {
     expect(search.status).toBe("ok");
     if (search.status !== "ok") return;
     expect(search.hits[0]).toMatchObject({ source: "pdf", page: 2 });
+  });
+
+  it("注入共享句柄后整书抽取只取一次句柄，覆盖完整的快路径不再取（T60）", async () => {
+    index.close();
+    let acquires = 0;
+    const broker = createPdfDocumentBroker({
+      loadBook: async () => ({ bytes: fixtureBytes }),
+      idleTimeoutMs: 0,
+    });
+    index = createBookIndex(dataHome, {
+      getBookSource: (id) => library.getBookSource(id),
+      acquireDocument: async (id) => {
+        acquires += 1;
+        return broker.acquire(id);
+      },
+    });
+
+    const outcome = await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+    expect(outcome.indexedPages).toBe(3);
+    expect(acquires).toBe(1);
+
+    // 覆盖完整快路径：无需文档，也不取句柄。
+    const again = await index.ensureIndexed(bookId, async () => { throw new Error("不应再加载书源"); });
+    expect(again.indexedPages).toBe(3);
+    expect(acquires).toBe(1);
+    broker.dispose();
   });
 
   it("boosts in-chapter pages when a chapter range is provided", async () => {

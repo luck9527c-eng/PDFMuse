@@ -22,6 +22,7 @@ import { createToolMedia } from "./tool-media.js";
 import { createOcrModule } from "./ocr.js";
 import { createWorkerMineruEngine } from "./mineru.js";
 import { createPageRenderer } from "./page-render.js";
+import { createPdfDocumentBroker } from "./pdf-document-broker.js";
 import { createBackgroundJobModule } from "./background-jobs.js";
 import { createRecognizedTextIngestion } from "./recognized-text-ingestion.js";
 import {
@@ -59,6 +60,7 @@ let closeBookIndex: (() => void) | undefined;
 let closeOcr: (() => void) | undefined;
 let closeBackgroundJobs: (() => void) | undefined;
 let closeBookOutline: (() => void) | undefined;
+let disposePdfBroker: (() => void) | undefined;
 
 // 组装根唯一的窗口广播：agent 事件与后台状态推送共用同一遍历（ADR-0008 泛化 agent broadcast）。
 function broadcastToWindows(channel: string, payload: unknown) {
@@ -154,6 +156,12 @@ app.whenReady().then(async () => {
       },
     });
     closeOcr = ocr.close;
+    // PDF 文档句柄中介（T60）：渲染、整书抽取共享 per-book 文档句柄（一次解析），
+    // LRU 容量 2、空闲 5 分钟回收；书源经检索模块的既有读接口加载（原文件只读）。
+    const pdfBroker = createPdfDocumentBroker({
+      loadBook: (bookId) => bookIndex.loadBookByBookId(bookId),
+    });
+    disposePdfBroker = pdfBroker.dispose;
     const bookIndex = createBookIndex(startupPreflight.dataHome, {
       onEmbeddingError: (error) => {
         const diagnostic = error instanceof Error
@@ -180,10 +188,11 @@ app.whenReady().then(async () => {
       },
       getBookSource: (bookId) => library.getBookSource(bookId),
       readRecognizedBlocks: (bookId, page) => ocr.getPage(bookId, page)?.blocks,
+      acquireDocument: (bookId) => pdfBroker.acquire(bookId),
     });
     closeBookIndex = bookIndex.close;
     // 页面渲染独立模块（T34）：OCR 链路、视觉工具与目录 AI 共用，检索模块不再依赖 canvas。
-    const pageRenderer = createPageRenderer((bookId) => bookIndex.loadBookByBookId(bookId));
+    const pageRenderer = createPageRenderer((bookId) => bookIndex.loadBookByBookId(bookId), pdfBroker);
     const sessionStore = createSessionStore(startupPreflight.dataHome, {
       deleteConversationEmbeddings: bookIndex.deleteConversationEmbeddings,
     });
@@ -549,6 +558,8 @@ app.whenReady().then(async () => {
 });
 
 app.once("before-quit", () => {
+  disposePdfBroker?.();
+  disposePdfBroker = undefined;
   closeBackgroundJobs?.();
   closeBackgroundJobs = undefined;
   closeBookOutline?.();

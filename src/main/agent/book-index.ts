@@ -9,6 +9,7 @@ import type { BookSource } from "../library.js";
 import { openPdfMuseDatabase } from "../database.js";
 import { assembleBlockText, figureBlocks, stripFigurePlaceholderLines, type RecognizedBlockLike } from "./figure-placeholder.js";
 import { chunkPageText } from "./semantic-chunker.js";
+import type { PdfDocumentHandle } from "../pdf-document-broker.js";
 
 /**
  * 整本书的页级全文索引（FTS5）。
@@ -115,6 +116,11 @@ export type BookIndexOptions = {
   getBookSource?(bookId: string): BookSource | undefined;
   /** Recognized Text 行最小读接口（recognized_pages 表属 OCR）：原生文本不足时兜底取识别行。 */
   readRecognizedBlocks?(bookId: string, page: number): ReadonlyArray<MineruBlock> | undefined;
+  /**
+   * 共享文档句柄（T60）：注入后整书抽取复用进程级 per-book 文档（一次解析），
+   * 与 view_page 渲染共享同一句柄；缺省时按原路径独立打开与销毁。
+   */
+  acquireDocument?(bookId: string): Promise<PdfDocumentHandle>;
 };
 
 type EmbeddingRow = {
@@ -522,14 +528,18 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       return { indexedPages: existing.count, totalPages: row.pageCount };
     }
     const source = await loadBook();
-    const loadingTask = getDocument({
-      data: source.bytes.slice(),
-      ...(source.password ? { password: source.password } : {}),
-    });
+    // T60：优先经共享句柄中介打开（同书渲染/抽取共用一次解析）；未注入走独立打开。
+    const owned = options.acquireDocument ? await options.acquireDocument(bookId) : undefined;
+    const loadingTask = owned
+      ? undefined
+      : getDocument({
+        data: source.bytes.slice(),
+        ...(source.password ? { password: source.password } : {}),
+      });
     const contiguous = existing.count === (existing.max_page ?? 0);
     let indexed = contiguous ? existing.count : 0;
     try {
-      const document = await loadingTask.promise;
+      const document = owned ? owned.document : await loadingTask!.promise;
       if (!contiguous) {
         database.exec("BEGIN");
         try {
@@ -563,7 +573,8 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
         onProgress?.(indexed, document.numPages);
       }
     } finally {
-      await loadingTask.destroy();
+      if (owned) owned.release();
+      else await loadingTask!.destroy();
     }
     const provider = await embeddingProvider();
     if (provider && needsEmbeddingBuild(bookId, provider)) await startEmbeddingBuild(bookId, signal);
