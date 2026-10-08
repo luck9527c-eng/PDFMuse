@@ -13,7 +13,6 @@ import type {
   StartAgentRunResult,
 } from "../../shared/contracts.js";
 import { CONVERSATION_EVIDENCE_MAX, DEFAULT_MODEL_CONTEXT_WINDOW, MAX_AGENT_IMAGE_ATTACHMENTS, MAX_AGENT_IMAGE_BYTES, MAX_AGENT_IMAGE_TOTAL_BYTES } from "../../shared/contracts.js";
-import { argsKeyOf, type ToolPayload } from "./loop-detector.js";
 import {
   createRunGuards,
   FINAL_EXHAUSTED_MESSAGE,
@@ -36,7 +35,8 @@ import {
   type ReplayImageLoader,
 } from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, parseContextWindowError, toLlmModel, type ContextWindowError, type ResolvedModelConnection } from "./model-runtime.js";
-import { MAX_SEARCH_WEB_CALLS, type PageImageBudget, type ToolExecutionOutcome } from "./tool-registry.js";
+import { MAX_SEARCH_WEB_CALLS, type PageImageBudget } from "./tool-registry.js";
+import { createToolCallPipeline } from "./tool-middleware.js";
 import {
   Agent,
   compact,
@@ -62,10 +62,9 @@ import {
   createDiagnosticsStore,
   createRunCollector,
   toDiagnosticsUsage,
-  truncateToolResult,
   wrapStreamFnWithDiagnostics,
 } from "./diagnostics.js";
-import type { RunDiagnostics, RunDiagnosticsToolCall } from "../../shared/contracts.js";
+import type { RunDiagnostics } from "../../shared/contracts.js";
 
 export type AgentHostOptions = {
   dataHome: string;
@@ -121,12 +120,6 @@ const COMPACTION_DOMAIN_INSTRUCTIONS = [
   "省略寒暄与重复；不得引入会话中不存在的信息。",
 ].join("\n");
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-
-/** 工具结果 details 里的媒体引用 → media_path JSON（`[{"page":N,"path":...}]`；无媒体时 undefined）。 */
-function toolMediaPathJson(details: unknown): string | undefined {
-  const media = (details as { media?: Array<{ page: number; path: string }> } | undefined)?.media;
-  return media && media.length > 0 ? JSON.stringify(media) : undefined;
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -635,8 +628,9 @@ export function createAgentHost(options: AgentHostOptions) {
       pageBudget: { pagesDelivered: 0, deliveredMedia: new Map() },
     }) ?? [];
 
-    // 工具包装（T50）：捕获参数、结果与耗时进运行诊断；软收尾短拒、联网子额度、
-    // 单飞收敛、指纹窗口判定（Result Stub / 警告 / 循环锤）与注解合成都在这一层。
+    // 工具调用管线（T50 语义、T62 分层重构）：飞行记账 → 守卫闸门（软收尾短拒）→
+    // 联网子额度 → 落库与交付形态（single-flight、指纹窗口的 Result Stub/警告/循环锤、
+    // 注解合成）。层实现与独立单测在 tool-middleware；宿主只提供落库/诊断出口与配额计数。
     let webSearchCalls = 0;
     // 并行批同（工具, 参数）single-flight：收敛一次执行，兄弟按到达次序占链位（e=1 全文、e=2 stub）。
     const singleFlight = new Map<string, Promise<AgentToolResult<unknown>>>();
@@ -649,135 +643,32 @@ export function createAgentHost(options: AgentHostOptions) {
       const row = toolCalls.find((item) => item.callId === callId);
       if (row) row.resultText = row.resultText ? `${row.resultText}\n\n${appended}` : appended;
     };
+    const toolPipeline = createToolCallPipeline({
+      sink: {
+        appendRow: recordToolCall,
+        observeToolStart: (frame) => collector.pushTimeline("tool-start", frame.tool.name),
+        observeToolCall: (toolCall, timeline) => {
+          collector.recordTool(toolCall);
+          collector.pushTimeline(timeline.phase, timeline.detail);
+          options.emit({ stream: "diagnostics", kind: "tool", runId, sessionId, toolCall });
+        },
+        snapshotDiagnostics: () => diagnosticsStore.record(bookId, collector.run),
+      },
+      guards,
+      webQuota: {
+        matches: (name) => name === "search_web",
+        limit: MAX_SEARCH_WEB_CALLS,
+        used: () => webSearchCalls,
+        onAttempt: () => {
+          webSearchCalls += 1;
+        },
+      },
+      singleFlight,
+    });
     const diagnosticsTools = tools.map((tool): AgentTool => ({
       ...tool,
       async execute(toolCallId, params, signal, onUpdate) {
-        collector.pushTimeline("tool-start", tool.name);
-        guards.noteToolFlightStart();
-        const startedAt = Date.now();
-        // 短拒构造：被拒行（rejected + is_error）+ 诊断 blocked 标记 + 面向模型的单文本块结果。
-        const rejectWith = (text: string): AgentToolResult<unknown> => {
-          recordToolCall({
-            callId: toolCallId,
-            toolName: tool.name,
-            title: tool.label ?? tool.name,
-            argumentsJson: JSON.stringify(params),
-            resultText: text,
-            status: "rejected",
-            isError: true,
-          });
-          const toolCall: RunDiagnosticsToolCall = {
-            callId: toolCallId,
-            name: tool.name,
-            parameters: params,
-            resultText: truncateToolResult(text),
-            durationMs: Date.now() - startedAt,
-            blocked: true,
-          };
-          collector.recordTool(toolCall);
-          collector.pushTimeline("tool-end", `${tool.name} · 已达上限，拒绝执行`);
-          options.emit({ stream: "diagnostics", kind: "tool", runId, sessionId, toolCall });
-          return { content: [{ type: "text", text }], details: undefined };
-        };
-        try {
-          // 软收尾期间工具全关：一律短拒「已达上限」。
-          const gate = guards.checkToolCall();
-          if (gate.reject) return rejectWith(gate.reject);
-          // 联网搜索子额度：执行即扣（模块缓存命中也扣——预算层不窥探工具内部，额度兼任反打转压力）。
-          if (tool.name === "search_web") {
-            webSearchCalls += 1;
-            if (webSearchCalls > MAX_SEARCH_WEB_CALLS) {
-              return rejectWith(`联网额度已用完（${MAX_SEARCH_WEB_CALLS} 次），不要再调用 search_web，用已有材料和书内工具继续。`);
-            }
-          }
-          const flightKey = `${tool.name}:${argsKeyOf(params)}`;
-          const existingFlight = singleFlight.get(flightKey);
-          const execution = existingFlight ?? tool.execute(toolCallId, params, signal, onUpdate);
-          if (!existingFlight) singleFlight.set(flightKey, execution);
-          const cleanupFlight = () => {
-            if (singleFlight.get(flightKey) === execution) singleFlight.delete(flightKey);
-          };
-          let result: AgentToolResult<unknown>;
-          try {
-            result = await execution;
-          } catch (error) {
-            // 执行出错：落 error 行后原样上抛，由 agent 循环合成错误工具结果（单飞兄弟各自落行）。
-            cleanupFlight();
-            recordToolCall({
-              callId: toolCallId,
-              toolName: tool.name,
-              title: tool.label ?? tool.name,
-              argumentsJson: JSON.stringify(params),
-              resultText: error instanceof Error ? error.message : String(error),
-              status: "error",
-              isError: true,
-            });
-            throw error;
-          }
-          cleanupFlight();
-
-          const outcome = (result.details ?? {}) as Partial<ToolExecutionOutcome>;
-          const firstTextBlock = result.content.find((block): block is Extract<typeof block, { type: "text" }> => block.type === "text");
-          const firstText = firstTextBlock?.text ?? "";
-          const imageBlocks = result.content.filter((block): block is Extract<typeof block, { type: "image" }> => block.type === "image");
-          const mediaPath = toolMediaPathJson(result.details);
-          const recordExecuted = (text: string, isError: boolean) => {
-            recordToolCall({
-              callId: toolCallId,
-              toolName: tool.name,
-              title: tool.label ?? tool.name,
-              argumentsJson: JSON.stringify(params),
-              // 模型所见即所存：落库 = 最终合成文本（全文/stub + 注解）。
-              resultText: text,
-              status: "executed",
-              isError,
-              ...(mediaPath ? { mediaPath } : {}),
-            });
-            const toolCall: RunDiagnosticsToolCall = {
-              callId: toolCallId,
-              name: tool.name,
-              parameters: params,
-              resultText: truncateToolResult(text),
-              evidence: outcome.evidence,
-              durationMs: Date.now() - startedAt,
-            };
-            collector.recordTool(toolCall);
-            collector.pushTimeline("tool-end", `${tool.name} · ${toolCall.durationMs}ms`);
-            options.emit({ stream: "diagnostics", kind: "tool", runId, sessionId, toolCall });
-            diagnosticsStore.record(bookId, collector.run);
-          };
-          // 420 秒软超时：软错误结果原样送达（error/超时不进指纹窗口、永不替换）。
-          if (outcome.timeout) {
-            recordExecuted(firstText, true);
-            return result;
-          }
-          // 执行即重跑：结果到手后撞指纹窗口决定交付形态——「byte-identical」是校验过的事实。
-          const payload: ToolPayload = { text: firstText, images: imageBlocks.map((block) => block.data) };
-          const verdict = guards.recordExecution({ callId: toolCallId, toolName: tool.name, params, payload });
-          if (verdict.finalizeText) {
-            // 循环检测锤：只锤再次落入检出链；收尾文案作被拒调用的结果送达。
-            return rejectWith(verdict.finalizeText);
-          }
-          const annotations = outcome.annotations ?? [];
-          const deliveredText = verdict.delivery === "stub"
-            ? `${verdict.stubText ?? ""}${verdict.warningText ? `\n\n${verdict.warningText}` : ""}`
-            : `${firstText}${verdict.warningText ? `\n\n${verdict.warningText}` : ""}`;
-          // 注解（额度回显）头部合成：注解层不进指纹哈希，但模型所见与落库逐字一致。
-          const composed = annotations.length > 0 ? `${annotations.join("\n")}\n${deliveredText}` : deliveredText;
-          if (verdict.delivery === "stub") {
-            // Result Stub 换掉全部内容块（含图片）；evidence 与媒体引用按真实执行保留在 details。
-            recordExecuted(composed, false);
-            return { content: [{ type: "text", text: composed }], details: result.details };
-          }
-          recordExecuted(composed, false);
-          if (composed !== firstText && firstTextBlock) {
-            const content = result.content.map((block) => (block === firstTextBlock ? { ...block, text: composed } : block));
-            return { ...result, content };
-          }
-          return result;
-        } finally {
-          guards.noteToolFlightEnd();
-        }
+        return toolPipeline.execute(tool, toolCallId, params, signal, onUpdate);
       },
     }));
 
