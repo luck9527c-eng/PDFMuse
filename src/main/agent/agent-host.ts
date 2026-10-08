@@ -80,6 +80,8 @@ export type AgentHostOptions = {
   resolveReadingSection?(bookId: string, page: number): string | undefined | Promise<string | undefined>;
   /** 已索引页文本读接口（T64 引用落地校验）：undefined = 该页未建立索引；缺省不校验。 */
   readIndexedPageText?(bookId: string, page: number): string | undefined;
+  /** 全书已索引页数（T64）：零索引的书整体跳过校验（页码腿会是「索引未建」误报）。 */
+  countIndexedPages?(bookId: string): number;
   /** 当前页所在顶层章节页码范围由 Main 侧解析，只用于检索加权，不进模型可见文字。 */
   resolveChapterRange?(bookId: string, page: number): { from: number; to: number } | undefined | Promise<{ from: number; to: number } | undefined>;
   /** Book 所有权验证：伪造的 bookId 不允许建立会话。 */
@@ -930,6 +932,7 @@ export function createAgentHost(options: AgentHostOptions) {
           answerBody: assistantBody,
           evidencePages: collectEvidence().map((item) => item.page),
           pageText: (page) => options.readIndexedPageText!(bookId, page),
+          indexedPagesCount: options.countIndexedPages?.(bookId) ?? 1,
         });
         if (verdict.findings.length > 0) {
           const detail = verdict.findings

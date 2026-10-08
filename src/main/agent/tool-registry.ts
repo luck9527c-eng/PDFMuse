@@ -587,7 +587,11 @@ async function executeFigureView(
   const cached = ctx.loadRenderedImage
     ? await ctx.loadRenderedImage(ctx.bookId, page, figure, FIGURE_RENDER_SCALE)
     : null;
-  if (cached) return figureOutcome(page, figure, cached.data, cached.relativePath);
+  if (cached) {
+    // 回填同问复用表（双轴审查修复）：本问再请求同幅插图走内存路径，不重复读盘。
+    budget.deliveredMedia.set(key, cached.relativePath);
+    return figureOutcome(page, figure, cached.data, cached.relativePath);
+  }
   if (budget.pagesDelivered >= MAX_PAGE_IMAGE_PAGES) return quotaExhaustedOutcome();
   const bbox = ctx.bookIndex.recognizedFigureBbox(ctx.bookId, page, figure);
   if (!bbox) {

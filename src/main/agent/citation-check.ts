@@ -12,8 +12,8 @@ export type CitationFinding =
 
 /** 「第 N 页」声明（容忍第3页/第 3 页/第3 页等空白变体；上限 4 位防误吞长数字）。 */
 const PAGE_CLAIM_PATTERN = /第\s*(\d{1,4})\s*页/g;
-/** 引文片段：中文直角/弯引号与英文双引号；过短片段（<6 字符）不承载可判语义，跳过。 */
-const QUOTE_SPAN_PATTERN = /[「“]([^「」“”]{6,160})[」”]|"([^"\n]{6,160})"/g;
+/** 引文片段：中文直角/弯引号、英文双引号、书名号；过短片段（<6 字符）不承载可判语义，跳过。 */
+const QUOTE_SPAN_PATTERN = /[「“]([^「」“”]{6,160})[」”]|"([^"\n]{6,160})"|《([^《》]{6,160})》/g;
 
 /** 比对归一化：去空白与全部标点/符号、小写——OCR 与正文间的标点空白差异不再干扰子串匹配。 */
 function normalizeForMatch(text: string): string {
@@ -25,9 +25,11 @@ export function checkCitations(input: {
   evidencePages: readonly number[];
   /** 已索引页文本；undefined = 该页未建立索引。 */
   pageText(page: number): string | undefined;
+  /** 全书已索引页数（双轴审查修复）：整书零索引时页码腿全是「索引未建」而非「引用未落地」的误报，整体跳过。 */
+  indexedPagesCount: number;
 }): { pageClaims: number; quotes: number; findings: CitationFinding[] } {
   const body = input.answerBody;
-  if (!body.trim()) return { pageClaims: 0, quotes: 0, findings: [] };
+  if (!body.trim() || input.indexedPagesCount <= 0) return { pageClaims: 0, quotes: 0, findings: [] };
 
   const evidence = new Set(input.evidencePages);
   const claimedPages = new Set<number>();
@@ -45,7 +47,7 @@ export function checkCitations(input: {
 
   const quotes: string[] = [];
   for (const match of body.matchAll(QUOTE_SPAN_PATTERN)) {
-    const span = (match[1] ?? match[2] ?? "").trim();
+    const span = (match[1] ?? match[2] ?? match[3] ?? "").trim();
     if (span.length >= 6) quotes.push(span);
   }
   // 语料 = 声明页 ∪ 证据页的已索引文本；全部未索引时引文腿无从比对，跳过（页码腿已兜住）。

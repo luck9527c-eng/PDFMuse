@@ -327,6 +327,7 @@ app.whenReady().then(async () => {
       isKnownBook: isOwnedBook,
       // T64 引用落地校验的语料读接口：声明页/证据页的已索引文本（未索引页 undefined）。
       readIndexedPageText: (bookId, page) => bookIndex.readPages(bookId, page, page)[0]?.text,
+      countIndexedPages: (bookId) => bookIndex.stats(bookId).indexedPages,
       buildTools: (context) => toolRegistry.buildAgentTools(() => ({
         bookId: context.bookId,
         focus: context.focus,

@@ -527,15 +527,17 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       if (provider && needsEmbeddingBuild(bookId, provider)) await startEmbeddingBuild(bookId, signal);
       return { indexedPages: existing.count, totalPages: row.pageCount };
     }
-    const source = await loadBook();
-    // T60：优先经共享句柄中介打开（同书渲染/抽取共用一次解析）；未注入走独立打开。
+    // T60：优先经共享句柄中介打开（同书渲染/抽取共用一次解析）；未注入才读书源独立打开
+    // （双轴审查修复：中介路径不再预读字节——broker 自己会读，预读即整文件多余一次）。
     const owned = options.acquireDocument ? await options.acquireDocument(bookId) : undefined;
-    const loadingTask = owned
-      ? undefined
-      : getDocument({
+    let loadingTask: ReturnType<typeof getDocument> | undefined;
+    if (!owned) {
+      const source = await loadBook();
+      loadingTask = getDocument({
         data: source.bytes.slice(),
         ...(source.password ? { password: source.password } : {}),
       });
+    }
     const contiguous = existing.count === (existing.max_page ?? 0);
     let indexed = contiguous ? existing.count : 0;
     try {
