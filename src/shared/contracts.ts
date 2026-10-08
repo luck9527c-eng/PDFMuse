@@ -631,7 +631,7 @@ export type RunDiagnostics = {
 
 export type RunDiagnosticsTimelineEntry = {
   at: string;
-  kind: "run-start" | "request" | "request-complete" | "tool-start" | "tool-end" | "guard" | "run-end";
+  kind: "run-start" | "request" | "request-complete" | "tool-start" | "tool-end" | "guard" | "citation" | "run-end";
   detail: string;
 };
 

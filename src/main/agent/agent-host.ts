@@ -35,6 +35,7 @@ import {
   type ReplayImageLoader,
 } from "./context-assembly.js";
 import { createModelStreamFn, normalizeModelError, parseContextWindowError, toLlmModel, type ContextWindowError, type ResolvedModelConnection } from "./model-runtime.js";
+import { checkCitations } from "./citation-check.js";
 import { MAX_SEARCH_WEB_CALLS, type PageImageBudget } from "./tool-registry.js";
 import { createToolCallPipeline } from "./tool-middleware.js";
 import {
@@ -77,6 +78,8 @@ export type AgentHostOptions = {
   loadBookTitle?(bookId: string): string | undefined | Promise<string | undefined>;
   /** 当前页所在章节由 Main 侧 Book Outline 解析，注入 Reading Focus 帮模型定位相对引用。 */
   resolveReadingSection?(bookId: string, page: number): string | undefined | Promise<string | undefined>;
+  /** 已索引页文本读接口（T64 引用落地校验）：undefined = 该页未建立索引；缺省不校验。 */
+  readIndexedPageText?(bookId: string, page: number): string | undefined;
   /** 当前页所在顶层章节页码范围由 Main 侧解析，只用于检索加权，不进模型可见文字。 */
   resolveChapterRange?(bookId: string, page: number): { from: number; to: number } | undefined | Promise<{ from: number; to: number } | undefined>;
   /** Book 所有权验证：伪造的 bookId 不允许建立会话。 */
@@ -917,6 +920,31 @@ export function createAgentHost(options: AgentHostOptions) {
         status: assistantFailure?.status ?? "complete",
         errorMessage: assistantFailure?.message,
       });
+    }
+
+    // T64 引用落地校验（旁路，只进诊断时间线）：complete 且有正文的回答才检查；
+    // 确定性比对零模型调用，校验自身异常被吞——永不影响收尾事务与时序。
+    if (!assistantFailure && assistantBody.trim() && options.readIndexedPageText) {
+      try {
+        const verdict = checkCitations({
+          answerBody: assistantBody,
+          evidencePages: collectEvidence().map((item) => item.page),
+          pageText: (page) => options.readIndexedPageText!(bookId, page),
+        });
+        if (verdict.findings.length > 0) {
+          const detail = verdict.findings
+            .map((finding) => finding.kind === "page_claim_unindexed"
+              ? `第 ${finding.page} 页未落地（无证据且未索引）`
+              : `引文未找到：「${finding.excerpt}」`)
+            .join("；");
+          collector.pushTimeline(
+            "citation",
+            `引用落地校验（${verdict.pageClaims} 处页码声明、${verdict.quotes} 段引文）：${detail}`.slice(0, 400),
+          );
+        }
+      } catch {
+        // 旁路诊断：校验异常不影响运行收尾。
+      }
     }
 
     collector.finish(

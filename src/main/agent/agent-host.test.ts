@@ -1259,6 +1259,67 @@ describe("agent host", () => {
     library.close();
   });
 
+  it("records ungrounded citations as a diagnostics timeline entry without touching the answer (T64)", async () => {
+    const library = createLibraryModule(dataHome);
+    const bookIndex = createBookIndex(dataHome, { getBookSource: (bookId) => library.getBookSource(bookId) });
+    const opened = await library.openPath(FIXTURE);
+    expect(opened.ok).toBe(true);
+    const fixtureBookId = opened.ok ? opened.book.id : "";
+    const registry = createToolRegistry();
+    const requests: CapturedRequest[] = [];
+    const streamFn = async (model: Model, context: Context, options?: SimpleStreamOptions) => {
+      const request: CapturedRequest = { model, context, options };
+      requests.push(request);
+      const stream = new AssistantMessageEventStream();
+      void Promise.resolve().then(() => {
+        if (requests.length === 1) {
+          const toolCallMessage = assistantMessage("", "toolUse");
+          toolCallMessage.content = [{ type: "toolCall", id: "call-cite-1", name: "search_book", arguments: { query: "Chapter One" } }];
+          stream.push({ type: "start", partial: toolCallMessage });
+          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-cite-1", name: "search_book", arguments: { query: "Chapter One" } }, partial: toolCallMessage });
+          stream.push({ type: "done", reason: "toolUse", message: toolCallMessage });
+          return;
+        }
+        // 正文：一段未落地引文 + 一处未索引页码声明（第 99 页）。
+        stream.push({ type: "start", partial: assistantMessage("") });
+        stream.push({ type: "done", reason: "stop", message: assistantMessage("书中断言「完全编造的引文片段」，另见第 99 页。") });
+      });
+      return stream;
+    };
+
+    buildHost({
+      createStreamFn: () => streamFn,
+      buildTools: (context) => registry.buildAgentTools(() => ({
+        bookId: context.bookId,
+        reportEvidence: context.reportEvidence,
+        pageBudget: context.pageBudget,
+        bookIndex,
+        getOutline: () => undefined,
+        renderPageImage: async () => { throw new Error("不应渲染"); },
+        renderRegionImage: async () => { throw new Error("不应渲染"); },
+        savePageImage: async (id: string, page: number) => ({ relativePath: `${id}/p${page}-test.png` }),
+      })),
+      readIndexedPageText: (bookId, page) => bookIndex.readPages(bookId, page, page)[0]?.text,
+    });
+
+    const result = await host.start({ bookId: fixtureBookId, question: "引用问题" });
+    expect(result.ok).toBe(true);
+    await waitFor(() => lifecyclePhase(events).includes("end"), 8_000);
+
+    // 回答原样落库（校验零改写）；未落地项进诊断时间线。
+    const conversation = host.getConversation(fixtureBookId);
+    const answer = conversation.find((message) => message.role === "assistant");
+    expect(answer?.body).toBe("书中断言「完全编造的引文片段」，另见第 99 页。");
+    const run = host.listDiagnostics(fixtureBookId)[0]!;
+    const citationEntry = run.timeline.find((entry) => entry.kind === "citation");
+    expect(citationEntry?.detail).toContain("引文未找到");
+    expect(citationEntry?.detail).toContain("完全编造的引文片段");
+    expect(citationEntry?.detail).toContain("第 99 页未落地");
+
+    bookIndex.close();
+    library.close();
+  });
+
   it("keeps search_book uncapped across a run and lets the budget govern (T50)", async () => {
     const library = createLibraryModule(dataHome);
     const bookIndex = createBookIndex(dataHome);
