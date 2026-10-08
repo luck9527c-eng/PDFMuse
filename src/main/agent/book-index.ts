@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { MineruBlock, ReadingFocus } from "../../shared/contracts.js";
 import type { RegionBbox } from "../../shared/region.js";
 import type { BookSource } from "../library.js";
+import { openPdfMuseDatabase } from "../database.js";
 import { assembleBlockText, figureBlocks, stripFigurePlaceholderLines, type RecognizedBlockLike } from "./figure-placeholder.js";
 import { chunkPageText } from "./semantic-chunker.js";
 
@@ -105,6 +105,12 @@ export type BookIndexOptions = {
   getEmbeddingProvider?: () => EmbeddingProvider | undefined | Promise<EmbeddingProvider | undefined>;
   embeddingBatchSize?: number;
   onEmbeddingError?: (error: unknown) => void;
+  /**
+   * 语义向量待构建时的转交通道（生产装配传入）：检索/索引路径发现向量缺失或过期时
+   * 改排后台任务并立即返回（首问不再阻塞整书补建）；缺省时同步补建，保持独立使用语义。
+   * 任务去重由后台任务模块按（书, kind）负责。
+   */
+  scheduleEmbeddingBuild?(bookId: string): void;
   /** 书目元数据最小读接口（library_books 表属 Library）：索引、检索与原文件加载经此取源。 */
   getBookSource?(bookId: string): BookSource | undefined;
   /** Recognized Text 行最小读接口（recognized_pages 表属 OCR）：原生文本不足时兜底取识别行。 */
@@ -117,6 +123,7 @@ type EmbeddingRow = {
   page: number | null;
   text: string;
   vector_json: string;
+  vector_blob?: Uint8Array | null;
   model: string;
   dimensions: number;
   content_hash: string;
@@ -166,7 +173,30 @@ function parseVector(value: string) {
   }
 }
 
-function cosineSimilarity(left: readonly number[], right: readonly number[]) {
+/** Float32 BLOB → 向量视图；长度非 4 的倍数、含非有限值都按损坏处理（回退 JSON）。 */
+function parseVectorBlob(blob: unknown): Float32Array | undefined {
+  if (!(blob instanceof Uint8Array) || blob.byteLength === 0 || blob.byteLength % 4 !== 0) return undefined;
+  // SQLite 返回的缓冲区不保证 4 字节对齐；未对齐时先拷贝到对齐缓冲。
+  const aligned = blob.byteOffset % 4 === 0
+    ? blob
+    : new Uint8Array(blob); // 拷贝构造必然从自身缓冲区 0 偏移开始
+  const view = new Float32Array(aligned.buffer, aligned.byteOffset, blob.byteLength / 4);
+  return view.every((value) => Number.isFinite(value)) ? view : undefined;
+}
+
+/** 行向量解析：blob 优先（Float32 视图）、JSON 兜底（历史行与测试直插行，普通数组）。 */
+function rowVector(row: Pick<EmbeddingRow, "vector_json" | "vector_blob">): Float32Array | number[] | undefined {
+  return parseVectorBlob(row.vector_blob) ?? parseVector(row.vector_json);
+}
+
+/** 向量 → Float32 BLOB 字节（写侧与读侧共用同一编码）。 */
+function vectorBlobBytes(vector: readonly number[]): Uint8Array {
+  const view = new Float32Array(vector.length);
+  for (let index = 0; index < vector.length; index += 1) view[index] = vector[index]!;
+  return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+}
+
+function cosineSimilarity(left: ArrayLike<number>, right: ArrayLike<number>) {
   if (left.length !== right.length || left.length === 0) return 0;
   let dot = 0;
   let leftNorm = 0;
@@ -199,7 +229,7 @@ async function extractPageText(document: Awaited<ReturnType<typeof getDocument>[
 }
 
 export function createBookIndex(dataHome: string, options: BookIndexOptions = {}) {
-  const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+  const database = openPdfMuseDatabase(dataHome);
   database.exec(`
     CREATE TABLE IF NOT EXISTS book_pages (
       book_id TEXT NOT NULL,
@@ -238,12 +268,85 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
   }
   // indexable_text 投影列（T53）：占位行只留在 text（read_pages 交付），FTS/LIKE/语义全部吃投影列。
   if (!pageColumns.some((column) => column.name === "indexable_text")) {
-    database.exec("ALTER TABLE book_pages ADD COLUMN indexable_text TEXT NOT NULL DEFAULT ''");
+    database.exec("ALTER TABLE book_pages ADD COLUMN indexable_text TEXT NOT NULL DEFAULT ''")
+  }
+  // 向量 BLOB 列：写侧双写（JSON 保兼容与可读），读侧 blob 优先——JSON.parse 千维浮点远慢于直接视图。
+  const embeddingColumns = database.prepare("PRAGMA table_info(semantic_embeddings)").all() as Array<{ name: string }>;
+  if (!embeddingColumns.some((column) => column.name === "vector_blob")) {
+    database.exec("ALTER TABLE semantic_embeddings ADD COLUMN vector_blob BLOB");
   }
 
   const embeddingBatchSize = Math.max(1, options.embeddingBatchSize ?? DEFAULT_EMBEDDING_BATCH_SIZE);
   const indexing = new Map<string, Promise<{ indexedPages: number; totalPages: number; note?: string }>>();
   const embeddingRuns = new Map<string, Promise<boolean>>();
+
+  // ---- 语义向量读缓存（按书）：COUNT + MAX(updated_at) 签名做廉价失效，避免每次检索
+  // 全表拉行并 JSON.parse 千维浮点；容量按 LRU 收敛（典型单书会话，两本足够交替）。
+  type CachedEmbedding = {
+    source: "pdf" | "conversation";
+    sourceId: string;
+    page: number | null;
+    text: string;
+    model: string;
+    dimensions: number;
+    contentHash: string;
+    vector: Float32Array | number[];
+  };
+  const EMBEDDING_CACHE_BOOKS = 2;
+  const embeddingCache = new Map<string, { signature: string; entries: CachedEmbedding[] }>();
+  const embeddingSignatureStatement = database.prepare(
+    "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS latest FROM semantic_embeddings WHERE book_id = ?",
+  );
+  const embeddingDirtyBooks = new Set<string>();
+
+  function embeddingRowsCached(bookId: string): CachedEmbedding[] {
+    const signatureRow = embeddingSignatureStatement.get(bookId) as { count: number; latest: string };
+    const signature = `${signatureRow.count}:${signatureRow.latest}`;
+    const cached = embeddingCache.get(bookId);
+    if (cached && cached.signature === signature) {
+      // LRU 触碰：删后重插保持新鲜序。
+      embeddingCache.delete(bookId);
+      embeddingCache.set(bookId, cached);
+      return cached.entries;
+    }
+    const entries = (embeddingRowsStatement.all(bookId) as EmbeddingRow[]).flatMap((row) => {
+      const vector = rowVector(row);
+      return vector
+        ? [{
+          source: row.source,
+          sourceId: row.source_id,
+          page: row.page,
+          text: row.text,
+          model: row.model,
+          dimensions: row.dimensions,
+          contentHash: row.content_hash,
+          vector,
+        }]
+        : [];
+    });
+    embeddingCache.set(bookId, { signature, entries });
+    while (embeddingCache.size > EMBEDDING_CACHE_BOOKS) {
+      const oldest = embeddingCache.keys().next().value;
+      if (oldest === undefined) break;
+      embeddingCache.delete(oldest);
+    }
+    return entries;
+  }
+
+  /** 语义向量是否需要构建：页文本写入后置脏，或当前 provider 模型下没有任何书内向量（首建/换模型）。 */
+  function needsEmbeddingBuild(bookId: string, provider: EmbeddingProvider): boolean {
+    return embeddingDirtyBooks.has(bookId)
+      || !embeddingRowsCached(bookId).some((entry) => entry.source === "pdf" && entry.model === provider.model);
+  }
+
+  /** 构建启动方式：接线了转交通道就改排后台任务（调用方立即继续）；缺省同步补建。 */
+  async function startEmbeddingBuild(bookId: string, signal?: AbortSignal) {
+    if (options.scheduleEmbeddingBuild) {
+      options.scheduleEmbeddingBuild(bookId);
+      return;
+    }
+    await ensureEmbeddings(bookId, signal);
+  }
 
   const indexedPagesStatement = database.prepare(
     "SELECT COUNT(*) AS count FROM book_pages WHERE book_id = ? AND extraction_version = ?",
@@ -282,17 +385,18 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     "SELECT page, text FROM book_pages WHERE book_id = ? AND extraction_version = ? AND page >= ? AND page <= ? ORDER BY page ASC",
   );
   const embeddingRowsStatement = database.prepare(`
-    SELECT source, source_id, page, text, vector_json, model, dimensions, content_hash
+    SELECT source, source_id, page, text, vector_json, vector_blob, model, dimensions, content_hash
     FROM semantic_embeddings WHERE book_id = ?
   `);
   const embeddingUpsertStatement = database.prepare(`
     INSERT INTO semantic_embeddings
-      (book_id, source, source_id, page, text, vector_json, model, dimensions, content_hash, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (book_id, source, source_id, page, text, vector_json, vector_blob, model, dimensions, content_hash, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(book_id, source, source_id) DO UPDATE SET
       page = excluded.page,
       text = excluded.text,
       vector_json = excluded.vector_json,
+      vector_blob = excluded.vector_blob,
       model = excluded.model,
       dimensions = excluded.dimensions,
       content_hash = excluded.content_hash,
@@ -315,10 +419,6 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
     return blocks ? figureBlocks(blocks)[figure - 1]?.bbox : undefined;
   }
 
-  function embeddingRows(bookId: string) {
-    return embeddingRowsStatement.all(bookId) as EmbeddingRow[];
-  }
-
   async function ensurePdfEmbeddings(
     bookId: string,
     provider: EmbeddingProvider,
@@ -331,13 +431,13 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       sourceId: `${page.page}:${chunk.id}`,
     })));
     const existing = new Map(
-      embeddingRows(bookId)
+      embeddingRowsCached(bookId)
         .filter((row) => row.source === "pdf")
-        .map((row) => [row.source_id, row]),
+        .map((row) => [row.sourceId, row]),
     );
     const missing = chunks.filter((chunk) => {
       const row = existing.get(chunk.sourceId);
-      return !row || row.model !== provider.model || row.content_hash !== contentHash(chunk.text);
+      return !row || row.model !== provider.model || row.contentHash !== contentHash(chunk.text);
     });
     try {
       for (let start = 0; start < missing.length; start += embeddingBatchSize) {
@@ -361,6 +461,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
               chunk.page,
               chunk.text,
               JSON.stringify(vector),
+              vectorBlobBytes(vector),
               provider.model,
               vector.length,
               contentHash(chunk.text),
@@ -376,12 +477,13 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       }
       const activeIds = new Set(chunks.map((chunk) => chunk.sourceId));
       for (const row of existing.values()) {
-        if (!activeIds.has(row.source_id)) {
+        if (!activeIds.has(row.sourceId)) {
           database.prepare(
             "DELETE FROM semantic_embeddings WHERE book_id = ? AND source = 'pdf' AND source_id = ?",
-          ).run(bookId, row.source_id);
+          ).run(bookId, row.sourceId);
         }
       }
+      embeddingDirtyBooks.delete(bookId);
       return true;
     } catch (error) {
       options.onEmbeddingError?.(error);
@@ -410,10 +512,13 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
         database.exec("ROLLBACK");
         throw error;
       }
+      // 版本作废把语义向量一并清了：全书重建索引，向量也待重建。
+      embeddingDirtyBooks.add(bookId);
     }
     if (existing.count >= row.pageCount && existing.max_page === row.pageCount) {
       const provider = await embeddingProvider();
-      if (provider) await ensureEmbeddings(bookId, signal);
+      // 向量缺失/过期才启动构建；接线了转交通道即排后台任务，覆盖完整的快路径立即返回。
+      if (provider && needsEmbeddingBuild(bookId, provider)) await startEmbeddingBuild(bookId, signal);
       return { indexedPages: existing.count, totalPages: row.pageCount };
     }
     const source = await loadBook();
@@ -453,6 +558,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
           database.exec("ROLLBACK");
           throw error;
         }
+        embeddingDirtyBooks.add(bookId);
         indexed = page;
         onProgress?.(indexed, document.numPages);
       }
@@ -460,7 +566,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       await loadingTask.destroy();
     }
     const provider = await embeddingProvider();
-    if (provider) await ensureEmbeddings(bookId, signal);
+    if (provider && needsEmbeddingBuild(bookId, provider)) await startEmbeddingBuild(bookId, signal);
     const partial = indexed < row.pageCount
       ? { note: `索引尚未完成（已索引 ${indexed}/${row.pageCount} 页），当前只在已索引范围内检索。` }
       : {};
@@ -478,6 +584,7 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       if (indexableText) insertFtsStatement.run(bookId, page, tokenizeForIndex(indexableText));
       database.prepare("DELETE FROM semantic_embeddings WHERE book_id = ? AND source = 'pdf' AND page = ?").run(bookId, page);
       database.exec("COMMIT");
+      embeddingDirtyBooks.add(bookId);
       return true;
     } catch {
       try { database.exec("ROLLBACK"); } catch { /* noop */ }
@@ -623,7 +730,8 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       const provider = await embeddingProvider();
       let queryVector: readonly number[] | undefined;
       if (provider) {
-        await ensurePdfEmbeddings(bookId, provider, signal);
+        // 语义腿只读不建：向量缺失/过期时经转交通道排后台构建（缺省同步补建），本次仍按现有向量打分。
+        if (needsEmbeddingBuild(bookId, provider)) await startEmbeddingBuild(bookId, signal);
         try {
           const vectors = await provider.embed([trimmed], signal);
           const vector = vectors[0];
@@ -636,23 +744,21 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       }
 
       if (queryVector) {
-        const rows = embeddingRows(bookId);
-        for (const row of rows) {
+        for (const row of embeddingRowsCached(bookId)) {
           // 对话召回腿已退役（T54）：存量 conversation 向量行是死数据，不参与检索。
           if (row.source === "conversation") continue;
-          const vector = parseVector(row.vector_json);
-          if (!vector || row.model !== provider?.model || row.dimensions !== queryVector.length) continue;
+          if (row.vector.length === 0 || row.model !== provider?.model || row.dimensions !== queryVector.length) continue;
           // 短页/目录页（点导引行堆出来的低信息密度页）向量不可靠，按有效文本长度折减。
           const factor = pageTextSemanticFactor(row.text);
-          const key = `${row.source}:${row.source === "pdf" ? row.page : row.source_id}`;
+          const key = `${row.source}:${row.source === "pdf" ? row.page : row.sourceId}`;
           const existing = candidates.get(key);
-          const semantic = cosineSimilarity(queryVector, vector) * factor;
+          const semantic = cosineSimilarity(queryVector, row.vector) * factor;
           if (existing) {
             existing.semantic = Math.max(existing.semantic, semantic);
           } else {
             candidates.set(key, {
               source: row.source,
-              sourceId: row.source_id,
+              sourceId: row.sourceId,
               ...(row.page === null ? {} : { page: row.page }),
               text: row.text,
               lexical: 0,
@@ -752,6 +858,8 @@ export function createBookIndex(dataHome: string, options: BookIndexOptions = {}
       connection.prepare("DELETE FROM book_pages WHERE book_id = ?").run(bookId);
       connection.prepare("DELETE FROM book_pages_fts WHERE book_id = ?").run(bookId);
       connection.prepare("DELETE FROM semantic_embeddings WHERE book_id = ?").run(bookId);
+      embeddingCache.delete(bookId);
+      embeddingDirtyBooks.delete(bookId);
     },
 
     /** 清空会话时的向量清理钩子：在调用方事务内只删本书会话来源的向量。 */

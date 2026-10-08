@@ -1,7 +1,8 @@
-import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+
+import { openPdfMuseDatabase } from "./database.js";
 
 import {
   aiOutlineEntryKey,
@@ -926,7 +927,7 @@ export function createBookOutlineModule(
     tracer?: PipelineTracer;
   } = {},
 ) {
-  const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+  const database = openPdfMuseDatabase(dataHome);
   database.exec(`
     CREATE TABLE IF NOT EXISTS book_outline_pages (
       book_id TEXT NOT NULL,

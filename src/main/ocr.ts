@@ -1,8 +1,8 @@
-import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 
 import type { OcrPageRequest, OcrPageResult, RecognizedPageText } from "../shared/contracts.js";
+import { openPdfMuseDatabase } from "./database.js";
 import type { MineruEngine } from "./mineru.js";
 
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
@@ -19,7 +19,7 @@ export function createOcrModule(
   engine: MineruEngine,
   dependencies: OcrModuleDependencies,
 ) {
-  const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+  const database = openPdfMuseDatabase(dataHome);
   const activeRecognitions = new Map<string, Promise<OcrPageResult>>();
   database.exec(`
     CREATE TABLE IF NOT EXISTS recognized_pages (

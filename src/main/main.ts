@@ -161,6 +161,15 @@ app.whenReady().then(async () => {
           : { name: "UnknownError", message: String(error) };
         console.error("语义索引底层请求失败：", diagnostic);
       },
+      // 语义向量构建转交通道：检索/索引路径发现向量缺失时排后台任务立即返回（首问不再阻塞整书补建）；
+      // 任务按（书, embedding kind）去重，优先级与 Recognized Text Ingestion 的语义调度一致。
+      scheduleEmbeddingBuild: (bookId) => {
+        void scheduleOptionalEmbedding({
+          bookId,
+          priority: 5,
+          total: library.getBookSource(bookId)?.pageCount ?? 0,
+        });
+      },
       getEmbeddingProvider: async () => {
         const config = await readAppConfig(configPath);
         if (!config.embedding) return undefined;

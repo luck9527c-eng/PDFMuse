@@ -218,6 +218,96 @@ describe("book index", () => {
     expect(search.hits[0]).toMatchObject({ source: "pdf", page: 1 });
   });
 
+  it("接线构建转交通道后：向量缺失时检索改排后台构建、本次 fts-only，补建完成升 hybrid 且不重复排", async () => {
+    // 先无 provider 建好全文索引（模拟「先索引、后配置嵌入连接」），再换带 provider 与转交通道的实例。
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+    index.close();
+    const scheduled: string[] = [];
+    const provider: EmbeddingProvider = {
+      model: "defer-embedding-v1",
+      embed: async (inputs) => inputs.map((input) => (input.includes("Chapter One") ? [1, 0] : [0, 1])),
+    };
+    index = createBookIndex(dataHome, {
+      getEmbeddingProvider: () => provider,
+      scheduleEmbeddingBuild: (id) => scheduled.push(id),
+      getBookSource: (id) => library.getBookSource(id),
+    });
+
+    const first = await index.search(bookId, "第一章", 3);
+    expect(first.status).toBe("ok");
+    if (first.status !== "ok") return;
+    expect(first.retrievalMode).toBe("fts-only");
+    expect(scheduled).toEqual([bookId]);
+
+    // 后台任务执行器语义（main.ts embedding executor）：调 ensureEmbeddings 完成补建并清脏。
+    await index.ensureEmbeddings(bookId);
+    const second = await index.search(bookId, "第一章", 3);
+    expect(second.status).toBe("ok");
+    if (second.status !== "ok") return;
+    expect(second.retrievalMode).toBe("hybrid");
+    expect(scheduled).toEqual([bookId]);
+  });
+
+  it("向量读缓存按 COUNT+MAX(updated_at) 签名失效：外部写入的新向量立即参与检索", async () => {
+    index.close();
+    const provider: EmbeddingProvider = {
+      model: "cache-embedding-v1",
+      embed: async (inputs) => inputs.map((input) => (input.includes("Chapter One") ? [1, 0] : [0, 1])),
+    };
+    index = createBookIndex(dataHome, { getEmbeddingProvider: () => provider, getBookSource: (id) => library.getBookSource(id) });
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+
+    const warm = await index.search(bookId, "Chapter One");
+    expect(warm.status).toBe("ok");
+    if (warm.status !== "ok") return;
+    expect(warm.hits.every((hit) => hit.page !== 3)).toBe(true);
+
+    // 外部直插一条第 3 页、与查询完全同向的向量：签名变化必须让缓存让位。
+    // 文本取足有效长度（≥120 字符），避免短文本语义折减把它压出相对阈值。
+    const probeText = "Chapter One cache probe. ".repeat(8);
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    const timestamp = new Date().toISOString();
+    database.prepare(`
+      INSERT INTO semantic_embeddings
+        (book_id, source, source_id, page, text, vector_json, model, dimensions, content_hash, created_at, updated_at)
+      VALUES (?, 'pdf', '3:cache-probe', 3, ?, '[1,0]', 'cache-embedding-v1', 2, 'probe-hash', ?, ?)
+    `).run(bookId, probeText, timestamp, timestamp);
+    database.close();
+
+    const refreshed = await index.search(bookId, "Chapter One");
+    expect(refreshed.status).toBe("ok");
+    if (refreshed.status !== "ok") return;
+    expect(refreshed.hits.some((hit) => hit.page === 3)).toBe(true);
+  });
+
+  it("向量读侧 blob 优先：写侧双写 blob，JSON 损坏时检索照常 hybrid", async () => {
+    index.close();
+    const provider: EmbeddingProvider = {
+      model: "blob-embedding-v1",
+      embed: async (inputs) => inputs.map((input) => (input.includes("Chapter One") ? [1, 0] : [0, 1])),
+    };
+    index = createBookIndex(dataHome, { getEmbeddingProvider: () => provider, getBookSource: (id) => library.getBookSource(id) });
+    await index.ensureIndexed(bookId, async () => ({ bytes: fixtureBytes }));
+    await index.ensureEmbeddings(bookId);
+
+    const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+    const blobs = database.prepare(
+      "SELECT COUNT(*) AS count FROM semantic_embeddings WHERE book_id = ? AND source = 'pdf' AND vector_blob IS NOT NULL",
+    ).get(bookId) as { count: number };
+    const rows = database.prepare(
+      "SELECT COUNT(*) AS count FROM semantic_embeddings WHERE book_id = ? AND source = 'pdf'",
+    ).get(bookId) as { count: number };
+    database.exec("UPDATE semantic_embeddings SET vector_json = '[]' WHERE book_id = ? AND source = 'pdf'");
+    database.close();
+    expect(rows.count).toBeGreaterThan(0);
+    expect(blobs.count).toBe(rows.count);
+
+    const search = await index.search(bookId, "Chapter One");
+    expect(search.status).toBe("ok");
+    if (search.status !== "ok") return;
+    expect(search.retrievalMode).toBe("hybrid");
+  });
+
   it("falls back to smaller embedding batches when a provider rejects a large batch", async () => {
     index.close();
     const provider: EmbeddingProvider = {

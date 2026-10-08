@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { openPdfMuseDatabase } from "../database.js";
 import type {
   AgentMessageStatus,
   ConversationEvidence,
@@ -113,10 +113,8 @@ export type PersistedToolCall = {
 };
 
 export function createSessionStore(dataHome: string, options: SessionStoreOptions = {}) {
-  const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+  const database = openPdfMuseDatabase(dataHome);
   database.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS agent_sessions (
       id TEXT PRIMARY KEY,
       book_id TEXT NOT NULL UNIQUE,

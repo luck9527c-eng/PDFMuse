@@ -9,6 +9,8 @@ import {
   PasswordResponses,
 } from "pdfjs-dist/legacy/build/pdf.mjs";
 
+import { openPdfMuseDatabase } from "./database.js";
+
 import type {
   LibraryBook,
   LibraryMutationResult,
@@ -139,10 +141,8 @@ async function inspectPdf(bytes: Uint8Array, fallbackTitle: string, password?: s
 }
 
 export function createLibraryModule(dataHome: string) {
-  const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+  const database = openPdfMuseDatabase(dataHome);
   database.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS library_books (
       id TEXT PRIMARY KEY,
       fingerprint TEXT NOT NULL UNIQUE,

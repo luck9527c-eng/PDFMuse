@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
+import { openPdfMuseDatabase } from "./database.js";
 import type {
   BackgroundJob,
   BackgroundJobKind,
@@ -81,7 +81,7 @@ export function createBackgroundJobModule(
   executors: Partial<Record<BackgroundJobKind, JobExecutor>> = {},
   onJobsChange?: (bookId: string) => void,
 ) {
-  const database = new DatabaseSync(path.join(dataHome, "pdfmuse.db"));
+  const database = openPdfMuseDatabase(dataHome);
   const createTable = `
     CREATE TABLE IF NOT EXISTS background_jobs (
       id TEXT PRIMARY KEY,
