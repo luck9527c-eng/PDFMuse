@@ -4,6 +4,7 @@ import type { BookOutlineNode, ReadingFocus } from "../../shared/contracts.js";
 import type { RegionBbox } from "../../shared/region.js";
 import type { RenderedPageImage } from "../page-render.js";
 import type { BookIndex } from "./book-index.js";
+import { resolveSectionRange } from "./outline-section.js";
 import type { AgentTool, AgentToolResult } from "./openclaw-core.js";
 import type { WebSearchModule } from "./web-search.js";
 
@@ -142,13 +143,13 @@ function createSearchBookTool(): RegisteredTool {
 
 const readOutlineSchema = Type.Object({});
 
-/** read_outline：读取本书目录（章节树 + PDF 页序号），结构类问题与按章定位的入口。 */
+/** read_outline：读取本书目录（章节树 + 节点 id + PDF 页序号），结构类问题与按章定位的入口。 */
 function createReadOutlineTool(): RegisteredTool {
   return {
     name: "read_outline",
     title: "读取目录",
     description:
-      "读取本书目录：返回带层级的章节结构与各节的 PDF 页序号（从 1 开始，与书内印刷页码不同）。"
+      "读取本书目录：返回带层级的章节结构与各节的 PDF 页序号（从 1 开始，与书内印刷页码不同），每个章节前的 [id] 是该章节的标识符，供 read_section 按 id 读取整章原文。"
       + "回答章节结构、全书组织类问题，或需要按章定位页码范围时使用；目录未补全时结果会如实标注。",
     parameters: readOutlineSchema,
     async execute(_input, ctx) {
@@ -163,7 +164,7 @@ function createReadOutlineTool(): RegisteredTool {
       const lines: string[] = [];
       const walk = (items: BookOutlineNode[], depth: number) => {
         for (const node of items) {
-          lines.push(`${"  ".repeat(depth)}${node.label}${node.page !== undefined ? ` …… 第 ${node.page} 页` : ""}`);
+          lines.push(`${"  ".repeat(depth)}[${node.id}] ${node.label}${node.page !== undefined ? ` …… 第 ${node.page} 页` : ""}`);
           walk(node.children, depth + 1);
         }
       };
@@ -188,6 +189,45 @@ const readPagesSchema = Type.Object({
   })),
 });
 
+/**
+ * 整页文本的拼接、截断与续读提示（read_pages / read_section 共用同一语义）：
+ * 逐页【第 N 页】标记、超长截断附续读 offset（字符偏移）、缺页注记、可信证据。
+ * resumeSubject 只影响续读提示里的措辞（页码 / 章节 id）。
+ */
+function composePagedReading(
+  pages: readonly number[],
+  textByPage: ReadonlyMap<number, string>,
+  start: number,
+  resumeSubject: string,
+): { body: string; evidence: PdfEvidence[] } {
+  const found = pages.filter((page) => textByPage.has(page));
+  const fullText = found.map((page) => `【第 ${page} 页】\n${textByPage.get(page)}`).join("\n\n");
+  let body = start > 0 ? fullText.slice(start) : fullText;
+  if (body.length > READ_PAGES_MAX_CHARS) {
+    const nextOffset = start + READ_PAGES_MAX_CHARS;
+    const readThrough = start > 0
+      ? `本次从 offset ${start} 读到 ${nextOffset}，尚有 ${fullText.length - nextOffset} 字符未读；如需继续，用相同${resumeSubject}并以 offset=${nextOffset} 续读。`
+      : `本次读取第 0–${nextOffset} 字符，尚有 ${fullText.length - nextOffset} 字符未读；如需继续，用相同${resumeSubject}并以 offset=${nextOffset} 续读。`;
+    body = `${body.slice(0, READ_PAGES_MAX_CHARS)}\n…（内容过长已截断。${readThrough}）`;
+  } else if (start >= fullText.length) {
+    body = `（offset ${start} 已达到或超过本批页码全文长度（${fullText.length} 字符），没有更多内容。）`;
+  } else if (start > 0) {
+    body = `${body}\n（本批页码全文已读完整，共 ${fullText.length} 字符。）`;
+  }
+  const missing = pages.filter((page) => !textByPage.has(page));
+  if (missing.length > 0) {
+    body += `\n\n（注意：第 ${missing.join("、")} 页不在索引中，未读取到文本。）`;
+  }
+  const evidence: PdfEvidence[] = found.map((page) => ({
+    source: "pdf",
+    page,
+    snippet: (textByPage.get(page) ?? "").slice(0, 120).replace(/\s+/g, " "),
+    trust: "trusted",
+    score: 1,
+  }));
+  return { body, evidence };
+}
+
 /** read_pages：按页码列表整页读取已索引全文（含 OCR），小节讲解/总结/复习类问题的首选。 */
 function createReadPagesTool(): RegisteredTool {
   return {
@@ -195,7 +235,7 @@ function createReadPagesTool(): RegisteredTool {
     title: "读取页面",
     description:
       "按 PDF 页码列表整页读取文字（页码为页序号，从 1 开始，与书内印刷页码不同；扫描页读取 OCR 识别文本），支持不连续页码；一次请求多页的目的是减少往返，不是提前备料。"
-      + "讲解、总结、复习某小节或某几页时用它读原文，讲解概念可读整个相关小节；不知道页码时先用 read_outline 查章节结构，或用 search_book 检索定位。"
+      + "讲解、总结、复习某小节或某几页时用它读原文，讲解概念可读整个相关小节；读整个章节的连续原文用 read_section；不知道页码时先用 read_outline 查章节结构，或用 search_book 检索定位。"
       + "按最小充分页集取页：只读回答真正依赖的页；页码已从选区、上文或检索得知时直接取该页；要确认小节或习题区的起止范围，查 read_outline 的页码。"
       + `单次只返回本次请求各页拼接全文的前 ${READ_PAGES_MAX_CHARS.toLocaleString("en-US")} 字符，末尾附续读 offset——offset 是该拼接全文中的字符偏移（不是页码偏移），用相同页码带上它继续读取省略的部分。`,
     parameters: readPagesSchema,
@@ -208,41 +248,85 @@ function createReadPagesTool(): RegisteredTool {
 
       const rows = ctx.bookIndex.readPages(ctx.bookId, requested[0]!, requested[requested.length - 1]!);
       const textByPage = new Map(rows.map((row) => [row.page, row.text]));
-      const found = requested.filter((page) => textByPage.has(page));
-      if (found.length === 0) {
+      if (!requested.some((page) => textByPage.has(page))) {
         return {
           displaySummary: `第 ${requested[0]} 页附近没有可读文本`,
           contentText: "该页码范围尚未建立文字索引（可能仍在后台处理），请改用 search_book 检索。",
         };
       }
-      const missing = requested.filter((page) => !textByPage.has(page));
-      const fullText = found.map((page) => `【第 ${page} 页】\n${textByPage.get(page)}`).join("\n\n");
-      let body = start > 0 ? fullText.slice(start) : fullText;
-      if (body.length > READ_PAGES_MAX_CHARS) {
-        const nextOffset = start + READ_PAGES_MAX_CHARS;
-        const readThrough = start > 0
-          ? `本次从 offset ${start} 读到 ${nextOffset}，尚有 ${fullText.length - nextOffset} 字符未读；如需继续，用相同页码并以 offset=${nextOffset} 续读。`
-          : `本次读取第 0–${nextOffset} 字符，尚有 ${fullText.length - nextOffset} 字符未读；如需继续，用相同页码并以 offset=${nextOffset} 续读。`;
-        body = `${body.slice(0, READ_PAGES_MAX_CHARS)}\n…（内容过长已截断。${readThrough}）`;
-      } else if (start >= fullText.length) {
-        body = `（offset ${start} 已达到或超过本批页码全文长度（${fullText.length} 字符），没有更多内容。）`;
-      } else if (start > 0) {
-        body = `${body}\n（本批页码全文已读完整，共 ${fullText.length} 字符。）`;
-      }
-      if (missing.length > 0) {
-        body += `\n\n（注意：第 ${missing.join("、")} 页不在索引中，未读取到文本。）`;
-      }
-      const evidence: PdfEvidence[] = found.map((page) => ({
-        source: "pdf",
-        page,
-        snippet: (textByPage.get(page) ?? "").slice(0, 120).replace(/\s+/g, " "),
-        trust: "trusted",
-        score: 1,
-      }));
+      const { body, evidence } = composePagedReading(requested, textByPage, start, "页码");
+      const found = requested.filter((page) => textByPage.has(page));
       const label = found.length === 1 ? `第 ${found[0]} 页` : `第 ${found.join("、")} 页`;
       // 插图不可见信号由页文本内的自描述占位行承载（T53）：升级方式落在图所在的位置，不再整批附注记。
       return {
         displaySummary: `已读取${label}全文`,
+        contentText: body,
+        evidence,
+      };
+    },
+  };
+}
+
+const readSectionSchema = Type.Object({
+  section: Type.String({ minLength: 1, maxLength: 64, description: "read_outline 输出中章节前的 [id] 标识符" }),
+  offset: Type.Optional(Type.Integer({
+    minimum: 0,
+    description: "续读起始字符偏移：上次结果被截断时，按其末尾提示的 offset 与相同 section 继续读取被省略的部分",
+  })),
+});
+
+/** read_section：按目录节点 id 整章（含小节）读取连续页原文，章节讲解/复习的直达路径（T63）。 */
+function createReadSectionTool(): RegisteredTool {
+  return {
+    name: "read_section",
+    title: "读取章节",
+    description:
+      "按章节 id 一次读取整个章节（含全部小节）覆盖的连续页码整页文字，页码范围由目录节点解析（页码为页序号，从 1 开始，与书内印刷页码不同；扫描页读取 OCR 识别文本）。"
+      + "讲解、总结、复习整个章节或某小节时用它读取原文；section 取 read_outline 输出中章节前的 [id] 标识符。"
+      + `单次只返回该章节拼接全文的前 ${READ_PAGES_MAX_CHARS.toLocaleString("en-US")} 字符，末尾附续读 offset——offset 是该拼接全文中的字符偏移（不是页码偏移），用相同 section 带上它继续读取省略的部分。`,
+    parameters: readSectionSchema,
+    async execute(input, ctx) {
+      const { section, offset } = input as Static<typeof readSectionSchema>;
+      const nodes = ctx.getOutline(ctx.bookId);
+      if (!nodes || nodes.length === 0) {
+        return {
+          displaySummary: "目录尚未建立",
+          contentText: "本书还没有可用目录（无内置目录且自动补全未完成）；可改用 search_book 按关键词定位相关页码。",
+        };
+      }
+      const totalPages = ctx.bookIndex.stats(ctx.bookId).totalPages;
+      const resolved = resolveSectionRange(nodes, section, totalPages);
+      if (!resolved) {
+        return {
+          displaySummary: "未找到该章节",
+          contentText: `目录中没有 id 为 ${section} 的章节；请以 read_outline 输出中方括号内的 id 为准。`,
+        };
+      }
+      if (resolved.from === undefined || resolved.to === undefined) {
+        return {
+          displaySummary: "该章节没有可用页码",
+          contentText: `章节「${resolved.label}」在目录中没有可定位的页码；可改用 read_pages 直接按页码读取，或用 search_book 检索。`,
+        };
+      }
+
+      await ctx.bookIndex.ensureIndexed(ctx.bookId, () => ctx.bookIndex.loadBookByBookId(ctx.bookId), ctx.signal);
+
+      const rows = ctx.bookIndex.readPages(ctx.bookId, resolved.from, resolved.to);
+      const textByPage = new Map(rows.map((row) => [row.page, row.text]));
+      const pages: number[] = [];
+      for (let page = resolved.from; page <= resolved.to; page += 1) {
+        if (textByPage.has(page)) pages.push(page);
+      }
+      if (pages.length === 0) {
+        return {
+          displaySummary: `章节「${resolved.label}」暂无可读文本`,
+          contentText: "该页码范围尚未建立文字索引（可能仍在后台处理），请改用 search_book 检索。",
+        };
+      }
+      const { body, evidence } = composePagedReading(pages, textByPage, Math.max(0, offset ?? 0), "章节 id");
+      const rangeLabel = resolved.from === resolved.to ? `第 ${resolved.from} 页` : `第 ${resolved.from}–${resolved.to} 页`;
+      return {
+        displaySummary: `已读取「${resolved.label}」（${rangeLabel}）`,
         contentText: body,
         evidence,
       };
@@ -543,7 +627,14 @@ function figureOutcome(
 
 export function createToolRegistry(options: { toolTimeoutMs?: number } = {}) {
   const toolTimeoutMs = options.toolTimeoutMs ?? TOOL_EXECUTION_TIMEOUT_MS;
-  const tools: RegisteredTool[] = [createSearchBookTool(), createReadOutlineTool(), createReadPagesTool(), createViewPageTool(), createSearchWebTool()];
+  const tools: RegisteredTool[] = [
+    createSearchBookTool(),
+    createReadOutlineTool(),
+    createReadSectionTool(),
+    createReadPagesTool(),
+    createViewPageTool(),
+    createSearchWebTool(),
+  ];
 
   /**
    * 单次工具 420 秒软超时（T50）：到点不抛错，返回软错误结果让模型换路继续；

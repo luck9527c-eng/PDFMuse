@@ -62,12 +62,12 @@ describe("tool registry", () => {
     };
   }
 
-  it("exposes the five reading and search tools", () => {
+  it("exposes the six reading and search tools in pairing order", () => {
     const registry = createToolRegistry();
-    expect(registry.toolNames()).toEqual(["search_book", "read_outline", "read_pages", "view_page", "search_web"]);
+    expect(registry.toolNames()).toEqual(["search_book", "read_outline", "read_section", "read_pages", "view_page", "search_web"]);
   });
 
-  it("renders the hierarchical outline tree with PDF page numbers via read_outline (T55)", async () => {
+  it("renders the hierarchical outline tree with node ids and PDF page numbers via read_outline (T55/T63)", async () => {
     outlineNodes = [
       {
         id: "n1",
@@ -84,7 +84,7 @@ describe("tool registry", () => {
     const tool = registry.buildAgentTools(context).find((item) => item.name === "read_outline")!;
     const result = await tool.execute("call-outline-1", {});
     const text = (result.content[0] as { text: string }).text;
-    expect(text).toBe("第1章 数据的机器层次表示 …… 第 35 页\n  1.1 概述 …… 第 35 页\n  1.2 机器数表示 …… 第 36 页\n附录");
+    expect(text).toBe("[n1] 第1章 数据的机器层次表示 …… 第 35 页\n  [n1-1] 1.1 概述 …… 第 35 页\n  [n1-2] 1.2 机器数表示 …… 第 36 页\n[n2] 附录");
     expect((result.details as { displaySummary?: string }).displaySummary).toContain("4 个条目");
   });
 
@@ -96,6 +96,48 @@ describe("tool registry", () => {
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain("还没有可用目录");
     expect(text).toContain("search_book");
+  });
+
+  it("reads a whole section's page range by outline node id with shared pagination semantics (T63)", async () => {
+    outlineNodes = [
+      { id: "s1", label: "第一部分", page: 1, children: [{ id: "s1-1", label: "Chapter One", page: 1, children: [] }] },
+      { id: "s2", label: "第二部分", page: 3, children: [] },
+    ];
+    const registry = createToolRegistry();
+    const tool = registry.buildAgentTools(context).find((item) => item.name === "read_section")!;
+
+    const result = await tool.execute("call-section-1", { section: "s1" });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("【第 1 页】");
+    expect(text).toContain("【第 2 页】");
+    expect(text).not.toContain("【第 3 页】");
+    const details = result.details as { displaySummary?: string; evidence?: Array<{ page: number }> };
+    expect(details.displaySummary).toContain("第一部分");
+    expect(details.displaySummary).toContain("第 1–2 页");
+    expect(details.evidence?.map((item) => item.page)).toEqual([1, 2]);
+
+    // 子节边界：其后无同级节点，边界落到下一章起始页前。
+    const child = await tool.execute("call-section-2", { section: "s1-1" });
+    expect((child.content[0] as { text: string }).text).toContain("【第 2 页】");
+  });
+
+  it("answers honestly for unknown ids, empty outlines and page-less sections (T63)", async () => {
+    const registry = createToolRegistry();
+    const tool = registry.buildAgentTools(context).find((item) => item.name === "read_section")!;
+
+    outlineNodes = [{ id: "s1", label: "第一章", page: 1, children: [] }];
+    const unknown = await tool.execute("call-section-x", { section: "nope" });
+    const unknownText = (unknown.content[0] as { text: string }).text;
+    expect(unknownText).toContain("没有 id 为 nope 的章节");
+    expect(unknownText).toContain("read_outline");
+
+    outlineNodes = [{ id: "noidx", label: "无页码章", children: [] }];
+    const noPage = await tool.execute("call-section-y", { section: "noidx" });
+    expect((noPage.content[0] as { text: string }).text).toContain("没有可定位的页码");
+
+    outlineNodes = undefined;
+    const empty = await tool.execute("call-section-z", { section: "s1" });
+    expect((empty.content[0] as { text: string }).text).toContain("还没有可用目录");
   });
 
   it("delivers figure placeholders inline and retires the batch modality note (T53)", async () => {
@@ -205,8 +247,18 @@ describe("tool registry", () => {
     expect(readOutline).toContain("带层级的章节结构与各节的 PDF 页序号（从 1 开始");
     expect(readOutline).toContain("回答章节结构、全书组织类问题，或需要按章定位页码范围时使用");
     expect(readOutline).toContain("如实标注");
+    expect(readOutline).toContain("[id]");
+    expect(readOutline).toContain("read_section");
     expect(readOutline).not.toContain("额度");
     expect(readOutline).not.toContain("没有次数限制");
+
+    const readSection = descriptions.get("read_section")!;
+    expect(readSection).toContain("按章节 id 一次读取整个章节（含全部小节）");
+    expect(readSection).toContain("页码范围由目录节点解析");
+    expect(readSection).toContain("section 取 read_outline 输出中章节前的 [id] 标识符");
+    expect(readSection).toContain("字符偏移（不是页码偏移）");
+    expect(readSection).not.toContain("额度");
+    expect(readSection).not.toContain("先用");
 
     const readPages = descriptions.get("read_pages")!;
     expect(readPages).toContain("页序号，从 1 开始");
@@ -214,6 +266,7 @@ describe("tool registry", () => {
     expect(readPages).toContain("字符偏移（不是页码偏移）");
     expect(readPages).toContain("OCR 识别文本");
     expect(readPages).toContain("先用 read_outline 查章节结构");
+    expect(readPages).toContain("读整个章节的连续原文用 read_section");
     expect(readPages).toContain("减少往返，不是提前备料");
     expect(readPages).toContain("按最小充分页集取页");
     expect(readPages).toContain("查 read_outline 的页码");
