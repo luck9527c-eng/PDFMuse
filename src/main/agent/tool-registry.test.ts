@@ -285,6 +285,73 @@ describe("tool registry", () => {
     expect(secondDetails.media?.[0]?.path).toBe((first.details as { media?: Array<{ page: number; path: string }> }).media?.[0]?.path);
   });
 
+  it("reuses the cross-run render cache: 追问重看同页不重渲、不扣额度、media 引用同源（T61）", async () => {
+    const toolMedia = createToolMedia(dataHome);
+    const registry = createToolRegistry();
+    let renders = 0;
+    const makeTool = (budget: PageImageBudget) => registry.buildAgentTools(() => ({
+      ...context(undefined, budget),
+      savePageImage: toolMedia.savePageImage,
+      loadPageImage: toolMedia.loadPageImage,
+      loadRenderedImage: toolMedia.loadRenderedImage,
+      saveRenderedImage: toolMedia.saveRenderedImage,
+      renderPageImage: async (id: string, page: number, scale: number) => {
+        renders += 1;
+        return pageRenderer.renderPage(id, page, scale);
+      },
+    })).find((item) => item.name === "view_page")!;
+
+    // 第一问：渲染一次，未降采样 → 内容寻址缓存文件（确定性路径兼作 media 引用）。
+    const firstBudget = { pagesDelivered: 0, deliveredMedia: new Map<string, string>() };
+    const first = await makeTool(firstBudget).execute("call-xrun-1", { pages: [1] });
+    expect(renders).toBe(1);
+    expect(firstBudget.pagesDelivered).toBe(1);
+    const firstMedia = (first.details as { media?: Array<{ page: number; path: string }> }).media;
+    expect(firstMedia?.[0]?.path).toBe(`${bookId}/r-p1@2.png`);
+    const firstBytes = (first.content.find((block) => block.type === "image") as { data: string }).data;
+
+    // 第二问（新预算模拟追问）：磁盘缓存命中——零渲染、字节恒同、media 引用同一文件、不扣额度。
+    const secondBudget = { pagesDelivered: 0, deliveredMedia: new Map<string, string>() };
+    const second = await makeTool(secondBudget).execute("call-xrun-2", { pages: [1] });
+    expect(renders).toBe(1);
+    expect(secondBudget.pagesDelivered).toBe(0);
+    const secondBytes = (second.content.find((block) => block.type === "image") as { data: string }).data;
+    expect(secondBytes).toBe(firstBytes);
+    expect((second.details as { media?: Array<{ page: number; path: string }> }).media?.[0]?.path)
+      .toBe(firstMedia?.[0]?.path);
+  });
+
+  it("超限降采样的渲染不进跨 run 缓存，回退 UUID 媒体文件（T61 登记偏差）", async () => {
+    const registry = createToolRegistry();
+    const cacheWrites: string[] = [];
+    let savePageCalls = 0;
+    let renderCalls = 0;
+    const ctx = () => ({
+      ...context(),
+      // 首次渲染超边（9000px > 8000 上限）触发降采样重试；重试倍率 < 初始 2 → 不缓存。
+      renderPageImage: async () => {
+        renderCalls += 1;
+        if (renderCalls === 1) return { imageData: Buffer.from("huge").toString("base64"), width: 9000, height: 100 };
+        return { imageData: Buffer.from("small").toString("base64"), width: 100, height: 100 };
+      },
+      saveRenderedImage: async (_id: string, page: number, figure: number | undefined, scale: number) => {
+        cacheWrites.push(`p${page}-f${figure}@${scale}`);
+        return { relativePath: "should-not-be-used" };
+      },
+      savePageImage: async (id: string, page: number, _bytes: string, figure?: number) => {
+        savePageCalls += 1;
+        return { relativePath: `${id}/p${page}${figure ? `-f${figure}` : ""}-fallback.png` };
+      },
+    });
+    const tool = registry.buildAgentTools(ctx).find((item) => item.name === "view_page")!;
+    const result = await tool.execute("call-downscale-1", { pages: [1] });
+    expect(renderCalls).toBe(2);
+    expect(cacheWrites).toHaveLength(0);
+    expect(savePageCalls).toBe(1);
+    const media = (result.details as { media?: Array<{ page: number; path: string }> }).media;
+    expect(media?.[0]?.path).toContain("fallback.png");
+  });
+
   it("views a single figure crop via the figure parameter with reuse and quota accounting (T53)", async () => {
     const registry = createToolRegistry();
     const toolMedia = createToolMedia(dataHome);

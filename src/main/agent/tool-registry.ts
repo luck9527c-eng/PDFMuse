@@ -42,6 +42,10 @@ export type ToolExecutionContext = {
   savePageImage(bookId: string, page: number, pngBase64: string, figure?: number): Promise<{ relativePath: string }>;
   /** 同问复用时按相对路径读回媒体文件字节；缺失返回 null（回退重新渲染）。 */
   loadPageImage?(relativePath: string): Promise<string | null>;
+  /** 跨 run 渲染缓存读（T61 内容寻址）：bookId 即内容指纹，同键恒等字节；缺失返回 null。 */
+  loadRenderedImage?(bookId: string, page: number, figure: number | undefined, scale: number): Promise<{ data: string; relativePath: string } | null>;
+  /** 跨 run 渲染缓存写（T61）：确定性文件名；写失败由调用方回退 UUID 媒体文件。 */
+  saveRenderedImage?(bookId: string, page: number, figure: number | undefined, scale: number, pngBase64: string): Promise<{ relativePath: string }>;
   webSearch?: WebSearchModule;
 };
 
@@ -300,6 +304,8 @@ export const MAX_PAGE_IMAGE_PAGES = 20;
 
 /** 插图裁剪渲染倍率（T53）：高于整页默认倍率，小图不被 provider 降采样、有效 DPI 更高。 */
 const FIGURE_RENDER_SCALE = 4;
+/** 整页渲染倍率（T53 以来既有值；T61 起兼作跨 run 缓存键的组成部分）。 */
+const WHOLE_PAGE_RENDER_SCALE = 2;
 
 /** provider 图片硬限制（T44）：仅超限时降采样重渲，常规尺寸不重编码（公式清晰度优先）。 */
 const IMAGE_HARD_LIMIT_EDGE_PX = 8_000;
@@ -334,25 +340,48 @@ async function reuseDeliveredMedia(
   return { data, path: existing };
 }
 
-/** 渲染整页或其归一化 bbox 裁剪，并在超出 provider 硬限制时按比例降采样重渲。 */
+/**
+ * 渲染整页或其归一化 bbox 裁剪，并在超出 provider 硬限制时按比例降采样重渲。
+ * 返回最终倍率（T61）：只有未降采样的渲染（finalScale === 初始倍率）才进跨 run 缓存——
+ * 降采样链的倍率取决于逐次尝试的尺寸，键不可预先确定，缓存互串风险大于收益（登记偏差：不缓存）。
+ */
 async function renderWithinHardLimits(
   ctx: ToolExecutionContext,
   page: number,
   region?: RegionBbox,
-): Promise<RenderedPageImage> {
-  let scale = region === undefined ? 2 : FIGURE_RENDER_SCALE;
+): Promise<{ rendered: RenderedPageImage; finalScale: number }> {
+  let scale = region === undefined ? WHOLE_PAGE_RENDER_SCALE : FIGURE_RENDER_SCALE;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const rendered = region === undefined
       ? await ctx.renderPageImage(ctx.bookId, page, scale)
       : await ctx.renderRegionImage(ctx.bookId, page, region, scale);
     const bytes = Math.floor(rendered.imageData.length * 3 / 4);
     const maxEdge = Math.max(rendered.width, rendered.height);
-    if (maxEdge <= IMAGE_HARD_LIMIT_EDGE_PX && bytes <= IMAGE_HARD_LIMIT_BYTES) return rendered;
+    if (maxEdge <= IMAGE_HARD_LIMIT_EDGE_PX && bytes <= IMAGE_HARD_LIMIT_BYTES) return { rendered, finalScale: scale };
     const edgeFactor = maxEdge > IMAGE_HARD_LIMIT_EDGE_PX ? IMAGE_HARD_LIMIT_EDGE_PX / maxEdge : 1;
     const byteFactor = bytes > IMAGE_HARD_LIMIT_BYTES ? Math.sqrt(IMAGE_HARD_LIMIT_BYTES / bytes) : 1;
     scale = Math.max(0.5, scale * Math.min(edgeFactor, byteFactor) * 0.99);
   }
   throw new Error("页面原图超出尺寸硬限制，降采样后仍超限。");
+}
+
+/** 新渲染的媒体落盘（T61）：未降采样走内容寻址缓存（确定性路径，兼作 media 引用），否则回退 UUID 媒体文件。 */
+async function persistRenderedImage(
+  ctx: ToolExecutionContext,
+  page: number,
+  figure: number | undefined,
+  finalScale: number,
+  initialScale: number,
+  pngBase64: string,
+): Promise<string> {
+  if (finalScale === initialScale && ctx.saveRenderedImage) {
+    try {
+      return (await ctx.saveRenderedImage(ctx.bookId, page, figure, finalScale, pngBase64)).relativePath;
+    } catch {
+      // 缓存写失败只损失复用，不影响交付：回退 UUID 媒体文件。
+    }
+  }
+  return (await ctx.savePageImage(ctx.bookId, page, pngBase64, figure)).relativePath;
 }
 
 /** view_page：渲染页面原图（整页或单幅插图裁剪）发给模型，查看文本层没有的内容。 */
@@ -393,19 +422,31 @@ async function executeWholePageView(
     images.push({ page, mimeType: "image/png", data: reused.data });
     media.push({ page, path: reused.path });
   }
+  // 跨 run 磁盘缓存（T61 内容寻址）：命中不渲染、不扣额度，缓存路径直接作 media 引用。
+  for (const page of requested) {
+    if (budget.deliveredMedia.has(imageBudgetKey(page))) continue;
+    const cached = ctx.loadRenderedImage
+      ? await ctx.loadRenderedImage(ctx.bookId, page, undefined, WHOLE_PAGE_RENDER_SCALE)
+      : null;
+    if (!cached) continue;
+    images.push({ page, mimeType: "image/png", data: cached.data });
+    media.push({ page, path: cached.relativePath });
+    budget.deliveredMedia.set(imageBudgetKey(page), cached.relativePath);
+  }
   // 新页渲染：按剩余页数额度钳制，超出的页不渲染并附注。
   const remainingAtRequest = Math.max(0, MAX_PAGE_IMAGE_PAGES - budget.pagesDelivered);
-  const freshRequested = requested.filter((page) => !budget.deliveredMedia.has(imageBudgetKey(page)) && !images.some((image) => image.page === page));
+  const freshRequested = requested.filter((page) => !budget.deliveredMedia.has(imageBudgetKey(page)));
   const allowed = freshRequested.slice(0, remainingAtRequest);
   overBudget.push(...freshRequested.slice(allowed.length));
   for (const page of allowed) {
     try {
-      const rendered = await renderWithinHardLimits(ctx, page);
-      // 原图落盘后以同一份字节发给模型：live 与回放字节天然一致（T44）。
-      const saved = await ctx.savePageImage(ctx.bookId, page, rendered.imageData);
+      const { rendered, finalScale } = await renderWithinHardLimits(ctx, page);
+      // 原图落盘后以同一份字节发给模型：live 与回放字节天然一致（T44）；
+      // 未降采样的渲染进内容寻址缓存，跨 run 复用同一文件（T61）。
+      const relativePath = await persistRenderedImage(ctx, page, undefined, finalScale, WHOLE_PAGE_RENDER_SCALE, rendered.imageData);
       images.push({ page, mimeType: "image/png", data: rendered.imageData });
-      media.push({ page, path: saved.relativePath });
-      budget.deliveredMedia.set(imageBudgetKey(page), saved.relativePath);
+      media.push({ page, path: relativePath });
+      budget.deliveredMedia.set(imageBudgetKey(page), relativePath);
       budget.pagesDelivered += 1;
     } catch {
       // 单页渲染或落盘失败继续其余页，失败页不扣预算、在结果中说明。
@@ -458,6 +499,11 @@ async function executeFigureView(
   // 复用优先：同问同幅插图读回既有媒体字节。
   const reused = await reuseDeliveredMedia(ctx, budget, key);
   if (reused) return figureOutcome(page, figure, reused.data, reused.path);
+  // 跨 run 磁盘缓存（T61）：命中不渲染、不扣额度。
+  const cached = ctx.loadRenderedImage
+    ? await ctx.loadRenderedImage(ctx.bookId, page, figure, FIGURE_RENDER_SCALE)
+    : null;
+  if (cached) return figureOutcome(page, figure, cached.data, cached.relativePath);
   if (budget.pagesDelivered >= MAX_PAGE_IMAGE_PAGES) return quotaExhaustedOutcome();
   const bbox = ctx.bookIndex.recognizedFigureBbox(ctx.bookId, page, figure);
   if (!bbox) {
@@ -467,11 +513,11 @@ async function executeFigureView(
     };
   }
   try {
-    const rendered = await renderWithinHardLimits(ctx, page, bbox);
-    const saved = await ctx.savePageImage(ctx.bookId, page, rendered.imageData, figure);
-    budget.deliveredMedia.set(key, saved.relativePath);
+    const { rendered, finalScale } = await renderWithinHardLimits(ctx, page, bbox);
+    const relativePath = await persistRenderedImage(ctx, page, figure, finalScale, FIGURE_RENDER_SCALE, rendered.imageData);
+    budget.deliveredMedia.set(key, relativePath);
     budget.pagesDelivered += 1;
-    return figureOutcome(page, figure, rendered.imageData, saved.relativePath);
+    return figureOutcome(page, figure, rendered.imageData, relativePath);
   } catch {
     return {
       displaySummary: "插图渲染失败",

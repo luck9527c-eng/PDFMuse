@@ -336,6 +336,8 @@ app.whenReady().then(async () => {
         renderRegionImage: pageRenderer.renderRegion,
         savePageImage: toolMedia.savePageImage,
         loadPageImage: toolMedia.loadPageImage,
+        loadRenderedImage: toolMedia.loadRenderedImage,
+        saveRenderedImage: toolMedia.saveRenderedImage,
         webSearch,
       })),
     });

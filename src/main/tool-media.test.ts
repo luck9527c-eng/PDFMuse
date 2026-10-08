@@ -43,4 +43,27 @@ describe("tool media", () => {
     // 重复删除（目录已不存在）不抛错。
     await expect(media.deleteBookData(BOOK_ID)).resolves.toBeUndefined();
   });
+
+  it("stores deterministic render-cache files addressed by (book,page,figure,scale) (T61)", async () => {
+    await media.saveRenderedImage(BOOK_ID, 3, undefined, 2, PNG_BASE64);
+    await media.saveRenderedImage(BOOK_ID, 3, 1, 4, PNG_BASE64);
+
+    const whole = await media.loadRenderedImage(BOOK_ID, 3, undefined, 2);
+    expect(whole?.relativePath).toBe(`${BOOK_ID}/r-p3@2.png`);
+    expect(whole?.data).toBe(PNG_BASE64);
+    const figure = await media.loadRenderedImage(BOOK_ID, 3, 1, 4);
+    expect(figure?.relativePath).toBe(`${BOOK_ID}/r-p3-f1@4.png`);
+    expect(figure?.data).toBe(PNG_BASE64);
+
+    // 键互不串：倍率或插图编号任一不同即 miss。
+    expect(await media.loadRenderedImage(BOOK_ID, 3, undefined, 4)).toBeNull();
+    expect(await media.loadRenderedImage(BOOK_ID, 3, 2, 4)).toBeNull();
+    expect(await media.loadRenderedImage(OTHER_BOOK_ID, 3, undefined, 2)).toBeNull();
+
+    // 同键覆盖幂等；删书连缓存一起清（缓存与媒体同目录）。
+    await media.saveRenderedImage(BOOK_ID, 3, undefined, 2, PNG_BASE64);
+    expect((await media.loadRenderedImage(BOOK_ID, 3, undefined, 2))?.data).toBe(PNG_BASE64);
+    await media.deleteBookData(BOOK_ID);
+    expect(await media.loadRenderedImage(BOOK_ID, 3, undefined, 2)).toBeNull();
+  });
 });
