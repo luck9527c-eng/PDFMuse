@@ -12,6 +12,7 @@ import {
   evaluateEmbeddedOutline,
   findOutlineChapterRange,
   findOutlineSectionPath,
+  isAdmittedBodyHeading,
   locateTocPages,
   repairOutlineMonotonicity,
   traceWindowSnapshot,
@@ -342,6 +343,90 @@ describe("book outline", () => {
     expect(visited).toEqual([1, 2, 3, 4, 5, 3]);
   });
 
+  it("anchors ai_toc entries at title level via the widened evidence pool", async () => {
+    // 《高等数学》/《小学语文》实录形状：章扉页大标题被 MinerU 标 doc_title，
+    // 知识点（一、映射）与总习题为 paragraph_title，课文标题（山雨）为无序数
+    // paragraph_title——证据池应收齐全部标题类块，目录行凭键取到页内坐标；
+    // 无正文证据的条目退页级（偏移页），不硬造锚点。
+    const chapterPage: MineruBlock[] = [
+      { type: "doc_title", text: "第一章函数与极限", bbox: [0.2, 0.158, 0.8, 0.22] },
+      { type: "text", text: "初等数学的研究对象基本上是不变的量……", bbox: [0.1, 0.3, 0.9, 0.42] },
+      { type: "paragraph_title", text: "第一节映射与函数", bbox: [0.1, 0.446, 0.6, 0.48] },
+      { type: "page_number", text: "1", bbox: [0.48, 0.95, 0.52, 0.97] },
+    ];
+    const pointPage: MineruBlock[] = [
+      { type: "paragraph_title", text: "一、映射", bbox: [0.1, 0.12, 0.4, 0.16] },
+      { type: "text", text: "设 X、Y 是两个非空集合……", bbox: [0.1, 0.3, 0.9, 0.8] },
+      { type: "page_number", text: "2", bbox: [0.48, 0.95, 0.52, 0.97] },
+    ];
+    const lessonPage: MineruBlock[] = [
+      { type: "paragraph_title", text: "山雨", bbox: [0.2, 0.1, 0.5, 0.16] },
+      { type: "text", text: "来得突然——跟着一阵阵湿润的山风……", bbox: [0.1, 0.3, 0.9, 0.8] },
+      { type: "page_number", text: "3", bbox: [0.48, 0.95, 0.52, 0.97] },
+    ];
+    const summaryPage: MineruBlock[] = [
+      { type: "paragraph_title", text: "总习题一", bbox: [0.1, 0.44, 0.3, 0.48] },
+      { type: "text", text: "1. 按连续的定义证明……", bbox: [0.1, 0.5, 0.9, 0.9] },
+      { type: "page_number", text: "5", bbox: [0.48, 0.95, 0.52, 0.97] },
+    ];
+    const bodyPage = (page: number): MineruBlock[] => [
+      { type: "text", text: `第${page}页正文，长度足够参与统计。`, bbox: [0.1, 0.3, 0.9, 0.8] },
+      { type: "page_number", text: String(page - 4), bbox: [0.48, 0.95, 0.52, 0.97] },
+    ];
+    const blocks = new Map<number, MineruBlock[]>([
+      [1, [{ type: "index", text: "第一章 函数与极限……1", bbox: [0.1, 0.1, 0.9, 0.2] }, { type: "text", text: "目录占位。", bbox: [0.1, 0.3, 0.9, 0.9] }]],
+      [2, bodyPage(2)], [3, bodyPage(3)], [4, bodyPage(4)],
+      [5, chapterPage],
+      [6, pointPage],
+      [7, lessonPage],
+      [8, bodyPage(8)],
+      [9, summaryPage],
+      [10, bodyPage(10)],
+    ]);
+    const outline = createBookOutlineModule(dataHome, {
+      openDocument: async () => ({
+        pageCount: 10,
+        async getEmbeddedNodes(): Promise<BookOutlineNode[]> { return []; },
+        async getNativeLines() { return []; },
+        async getPageHeight() { return 800; },
+        async close() { return undefined; },
+      }),
+      readRecognizedBlocks: (_bookId, page) => blocks.get(page),
+      aiOutline: {
+        renderPage: async () => ({ imageData: "aW1n" }),
+        complete: async () => JSON.stringify({
+          hasToc: true,
+          tocPages: [1],
+          entries: [
+            { label: "第一章 函数与极限", level: 1, printedPage: 1 },
+            { label: "第一节 映射与函数", level: 2, printedPage: 1 },
+            { label: "一、映射", level: 3, printedPage: 2 },
+            { label: "第二节 无正文证据", level: 2, printedPage: 3 },
+            { label: "2* 山雨", level: 1, printedPage: 3 },
+            { label: "总习题一", level: 2, printedPage: 5 },
+          ],
+          continuesAt: null,
+        }),
+      },
+    });
+    closeOutline = outline.close;
+    const result = await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
+    expect(result.status).toBe("generated");
+    const flat = (function walk(list: BookOutlineNode[]): BookOutlineNode[] {
+      return list.flatMap((node) => [node, ...walk(node.children)]);
+    })(outline.get(BOOK_ID) ?? []);
+    const byLabel = (prefix: string) => flat.find((node) => node.label.startsWith(prefix));
+    // doc_title 章扉页（第一章）：标题级锚点 = (1 − 0.158) × 800。
+    expect(byLabel("第一章 函数与极限")).toMatchObject({ page: 5, anchor: { top: (1 - 0.158) * 800 } });
+    // 同形标签精确键（一、映射 / 总习题一）与剥前缀标题键（2* 山雨）都取到正文块坐标。
+    expect(byLabel("一、映射")).toMatchObject({ page: 6, anchor: { top: (1 - 0.12) * 800 } });
+    expect(byLabel("总习题一")).toMatchObject({ page: 9, anchor: { top: (1 - 0.44) * 800 } });
+    expect(byLabel("2* 山雨")).toMatchObject({ page: 7, anchor: { top: (1 - 0.1) * 800 } });
+    // 无正文证据的条目退页级（印刷页 3 + 偏移 4），不硬造锚点。
+    expect(byLabel("第二节 无正文证据")).toEqual(expect.objectContaining({ page: 7 }));
+    expect((byLabel("第二节 无正文证据") ?? {}).anchor).toBeUndefined();
+  });
+
   it("discards stale page candidates when the outline version changes", async () => {
     const visited: number[] = [];
     const pages = [1, 2].map((page) => [
@@ -650,22 +735,35 @@ describe("book outline", () => {
     expect(repairOutlineMonotonicity(nodes)).toEqual(nodes);
   });
 
-  it("admits only ordinal or known-name paragraph titles as recognized headings", () => {
+  it("collects all layout-judged title blocks as anchor evidence and gates only the tree", () => {
     const blocks = [
+      { type: "doc_title", text: "第一章函数与极限", bbox: [0.1, 0.02, 0.9, 0.08] },
+      { type: "doc_title", text: "高等数学", bbox: [0.1, 0.1, 0.9, 0.16] },
       { type: "paragraph_title", text: "1.2 计算机的硬件组成", bbox: [0.1, 0.1, 0.9, 0.16] },
       { type: "paragraph_title", text: "1.2.1 计算机的主要部件", bbox: [0.1, 0.2, 0.9, 0.26] },
       { type: "paragraph_title", text: "1. 输入设备", bbox: [0.1, 0.3, 0.9, 0.36] },
       { type: "paragraph_title", text: "（1）字编址", bbox: [0.1, 0.4, 0.9, 0.46] },
-      { type: "paragraph_title", text: "指令系统", bbox: [0.1, 0.5, 0.9, 0.56] },
+      { type: "paragraph_title", text: "山雨", bbox: [0.1, 0.5, 0.9, 0.56] },
       { type: "paragraph_title", text: "参考文献", bbox: [0.1, 0.6, 0.9, 0.66] },
       { type: "header", text: "第一章 页眉", bbox: [0.1, 0.01, 0.9, 0.05] },
       { type: "text", text: "第一章 伪装标题", bbox: [0.1, 0.7, 0.9, 0.76] },
     ];
-    expect(detectRecognizedHeadings(7, blocks)).toEqual([
-      { label: "1.2 计算机的硬件组成", page: 7, level: 2, explicit: true },
-      { label: "1.2.1 计算机的主要部件", page: 7, level: 3, explicit: true },
-      { label: "参考文献", page: 7, level: 1, explicit: true },
+    // 证据池宽收：标题类块全进（含 doc_title 章扉页与无序数裸标题），噪声类型仍整体排除。
+    const pool = detectRecognizedHeadings(7, blocks);
+    expect(pool.map((heading) => heading.label)).toEqual([
+      "第一章函数与极限",
+      "高等数学",
+      "1.2 计算机的硬件组成",
+      "1.2.1 计算机的主要部件",
+      "1. 输入设备",
+      "（1）字编址",
+      "山雨",
+      "参考文献",
     ]);
+    // 成树准入严格：只有序数与公认特名能凭自身成为第三档目录（证据池条目对不上目录行
+    // 的键时不产生任何作用，宽收无代价）。
+    const admitted = pool.map((heading) => heading.label).filter((label) => isAdmittedBodyHeading(label));
+    expect(admitted).toEqual(["第一章函数与极限", "1.2 计算机的硬件组成", "1.2.1 计算机的主要部件", "参考文献"]);
   });
 
   it("converts recognized block tops to user-space anchors when the page height is known", () => {
@@ -1682,7 +1780,7 @@ describe("outline pipeline trace", () => {
       confirmed: true,
       threshold: 2,
     });
-    expect(events[5]!.data).toEqual({ strategy: "ai_toc", calibrated: false, nodeCount: 1, version: 8 });
+    expect(events[5]!.data).toEqual({ strategy: "ai_toc", calibrated: false, nodeCount: 1, version: 9 });
 
     // 整书完成后收尾：缓存命中轻量条目 + all-blocks 臂 + 转正落库，不二次调用模型。
     await recognizeScannedBook(ocr, [8, 9, 10]);
@@ -1693,7 +1791,7 @@ describe("outline pipeline trace", () => {
     ]);
     expect(events[2]!.data).toEqual({ outcome: "cache", exchanges: [], tocPages: [2], entriesCount: 1 });
     expect(events[3]!.data).toEqual({ nativeMajority: false, allBlocks: true, hasTocConclusion: true, arm: "all-blocks" });
-    expect(events[5]!.data).toEqual({ strategy: "ai_toc", calibrated: true, nodeCount: 1, version: 8 });
+    expect(events[5]!.data).toEqual({ strategy: "ai_toc", calibrated: true, nodeCount: 1, version: 9 });
     expect(ai.completeCalls).toBe(1);
   });
 
@@ -1785,7 +1883,7 @@ describe("outline pipeline trace", () => {
     await outline.rebuild(BOOK_ID, async () => ({ bytes: new Uint8Array() }));
     expect(events.map((event) => event.kind)).toEqual(["embedded_gate", "persist"]);
     expect(events[0]!.data).toEqual({ accepted: true, entryCount: 3, resolvableCount: 3, distinctPages: 3 });
-    expect(events[1]!.data).toEqual({ strategy: "embedded", calibrated: true, nodeCount: 3, version: 8 });
+    expect(events[1]!.data).toEqual({ strategy: "embedded", calibrated: true, nodeCount: 3, version: 9 });
   });
 
   it("computes the probe window snapshot from the block store only", () => {

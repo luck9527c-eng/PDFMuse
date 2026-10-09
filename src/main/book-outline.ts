@@ -27,7 +27,7 @@ import type {
 } from "../shared/contracts.js";
 
 const BOOK_ID_PATTERN = /^[a-f0-9]{64}$/;
-const OUTLINE_VERSION = 8;
+const OUTLINE_VERSION = 9;
 const MAX_HEADINGS = 240;
 const MIN_OFFSET_VOTES = 2;
 const REPEATED_LABEL_PAGES = 3;
@@ -597,19 +597,23 @@ export function repairOutlineMonotonicity(nodes: readonly BookOutlineNode[]): Bo
   return walk(nodes);
 }
 
-/** 正文标题准入（第三档）：只收章节序数与公认特名——实测 paragraph_title 混有大量
- *  「（1）/N.」式列举项，无序数的裸标题也多为正文强调句，宁缺毋滥。 */
+/** 正文标题成树准入（第三档）：只收章节序数与公认特名——实测 paragraph_title 混有大量
+ *  「（1）/N.」式列举项，无序数的裸标题也多为正文强调句，宁缺毋滥。准入门只管
+ *  「凭自身成为目录」；锚点证据池（detectRecognizedHeadings）不受此门约束——
+ *  目录行已证明的结构来正文取坐标，宽收不采信。 */
 const KNOWN_SECTION_NAME = /^(附录|参考文献|索引|习题)/;
-const RECOGNIZED_HEADING_TYPES = new Set(["title", "paragraph_title"]);
+const RECOGNIZED_HEADING_TYPES = new Set(["title", "paragraph_title", "doc_title"]);
 
 export function isAdmittedBodyHeading(label: string): boolean {
   return explicitLevel(label) !== undefined || KNOWN_SECTION_NAME.test(label);
 }
 
-/** OCR 页标题候选：布局模型标记的标题块直接判定（T57-06），替代「块高假装字号」的比值检测；
- *  header/footer/aside_text 等噪声块按类型整体排除。anchorTop 由块顶 bbox 按页高换算——
- *  MinerU bbox 为 y 向下的归一化坐标（y0 = 距页顶比例），用户空间 Y = (1 − y0) × 页高；
- *  页高未知时不猜（无锚点，跳页顶）。 */
+/** OCR 页标题候选（锚点证据池，T58-04 修订）：布局模型标记的标题类块（title /
+ *  paragraph_title / doc_title——章扉页大标题常被标 doc_title）全部收集，键能对上
+ *  目录行的条目由此取页内坐标；能否凭自身成树另由 isAdmittedBodyHeading 把关。
+ *  header/footer/aside_text 等噪声块仍按类型整体排除。anchorTop 由块顶 bbox 按页高
+ *  换算——MinerU bbox 为 y 向下的归一化坐标（y0 = 距页顶比例），用户空间 Y =
+ *  (1 − y0) × 页高；页高未知时不猜（无锚点，跳页顶）。 */
 export function detectRecognizedHeadings(
   page: number,
   blocks: ReadonlyArray<MineruBlock> | undefined,
@@ -621,8 +625,7 @@ export function detectRecognizedHeadings(
     if (!block || typeof block.text !== "string" || !RECOGNIZED_HEADING_TYPES.has(block.type)) return [];
     const label = normalizeLabel(block.text);
     if (label.length < 2 || label.length > 100) return [];
-    const level = explicitLevel(label) ?? (KNOWN_SECTION_NAME.test(label) ? 1 : undefined);
-    if (level === undefined) return [];
+    const level = explicitLevel(label) ?? (KNOWN_SECTION_NAME.test(label) ? 1 : 3);
     const blockTop = height !== undefined && Array.isArray(block.bbox) && typeof block.bbox[1] === "number" && Number.isFinite(block.bbox[1])
       ? (1 - block.bbox[1]) * height
       : undefined;
